@@ -2329,7 +2329,7 @@ function PromptsTab({
 
           {selectedFileExists && fileLoading && !selectedFileDetail ? (
             <PromptEditorSkeleton />
-          ) : isMarkdown(selectedOrEntryFile) ? (
+          ) : isMarkdown(selectedOrEntryFile) && currentMode !== "external" ? (
             <MarkdownEditor
               key={selectedOrEntryFile}
               value={displayValue}

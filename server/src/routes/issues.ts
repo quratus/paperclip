@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, issueExecutionDecisions } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
@@ -61,6 +62,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
+import { emitAnalyticsEvent } from "../services/agent-analytics.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -2232,11 +2234,55 @@ export function issueRoutes(
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
       runId: actor.runId,
-    });
+    }, { metadata: req.body.metadata });
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
+    }
+
+    // Emit analytics for user corrections (fail-safe — must not break comment creation)
+    const metadata = req.body.metadata;
+    if (metadata && metadata.intent === "correction") {
+      try {
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, currentIssue.companyId),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${currentIssue.id}`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+
+        if (run) {
+          const maxSeqRow = await db
+            .select({ maxSeq: sql<number>`coalesce(max(${heartbeatRunEvents.seq}), 0)` })
+            .from(heartbeatRunEvents)
+            .where(eq(heartbeatRunEvents.runId, run.id));
+          const seq = (maxSeqRow[0]?.maxSeq ?? 0) + 1;
+
+          await emitAnalyticsEvent({
+            db,
+            run,
+            seq,
+            eventName: "analytics.user_correction_submitted",
+            payload: {
+              workflowType: currentIssue.projectId ?? "uncategorized",
+              triggerSource: "user_correction",
+              correctionType: (metadata.correctionType as "output_edit" | "plan_change" | "tool_override" | "context_clarification" | "task_reopened") || "output_edit",
+              targetTool: metadata.targetTool as string | undefined,
+              severity: (metadata.severity as "minor" | "major" | "critical") || "major",
+              description: (metadata.description as string) || comment.body.slice(0, 200),
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: currentIssue.id }, "user correction analytics emission failed");
+      }
     }
 
     await logActivity(db, {

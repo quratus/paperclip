@@ -2115,6 +2115,67 @@ describe("company portability", () => {
     });
   });
 
+  it("preserves an explicitly enabled timer heartbeat on import", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    companySvc.create.mockResolvedValue({
+      id: "company-imported",
+      name: "Imported Paperclip",
+    });
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
+      id: `agent-${String(input.name).toLowerCase()}`,
+      name: input.name,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    }));
+
+    // Source agent that explicitly opts into a timer heartbeat. Unlike the
+    // default (unspecified) case, an explicit `enabled: true` must survive a
+    // re-import/sync so users' configured heartbeats are not silently disabled.
+    agentSvc.list.mockResolvedValue([
+      {
+        id: "agent-hb",
+        name: "Scheduler",
+        status: "idle",
+        role: "engineer",
+        title: "Scheduler",
+        icon: "code",
+        reportsTo: null,
+        capabilities: "Runs on a timer",
+        adapterType: "claude_local",
+        adapterConfig: { promptTemplate: "You are Scheduler." },
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 1800 } },
+        budgetMonthlyCents: 0,
+        permissions: { canCreateAgents: false },
+        metadata: null,
+      },
+    ]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: true, projects: false, issues: false },
+    });
+
+    agentSvc.list.mockResolvedValue([]);
+
+    await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+      agents: "all",
+      collisionStrategy: "rename",
+    }, "user-1");
+
+    const createdScheduler = agentSvc.create.mock.calls.find(([, input]) => input.name === "Scheduler");
+    expect(createdScheduler?.[1]).toMatchObject({
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          intervalSec: 1800,
+        },
+      },
+    });
+  });
+
   it("imports only selected files and leaves unchecked company metadata alone", async () => {
     const portability = companyPortabilityService({} as any);
 

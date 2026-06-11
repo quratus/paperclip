@@ -740,7 +740,14 @@ function clonePortableRecord(value: unknown) {
 function disableImportedTimerHeartbeat(runtimeConfig: unknown) {
   const next = clonePortableRecord(runtimeConfig) ?? {};
   const heartbeat = isPlainRecord(next.heartbeat) ? { ...next.heartbeat } : {};
-  heartbeat.enabled = false;
+  // Respect an explicitly declared `enabled` flag from the package source so
+  // re-importing/syncing an existing company preserves intended timer
+  // heartbeats instead of silently switching them off on every sync. Only
+  // default to disabled when the package omits the flag (safety for fresh
+  // imports that haven't opted into timer heartbeats yet).
+  if (typeof heartbeat.enabled !== "boolean") {
+    heartbeat.enabled = false;
+  }
   next.heartbeat = heartbeat;
   return next;
 }

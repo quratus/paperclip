@@ -280,6 +280,15 @@ const dashboard: DashboardSummary = {
     pausedAgents: 0,
     pausedProjects: 0,
   },
+  analytics: {
+    runsTotal: 0,
+    runsCompleted: 0,
+    runsFailed: 0,
+    completionRate: 0,
+    correctionsTotal: 0,
+    workflows: [],
+    quadrants: { Q1: [], Q2: [], Q3: [], Q4: [] },
+  },
 };
 
 describe("inbox helpers", () => {

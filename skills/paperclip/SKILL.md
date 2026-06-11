@@ -414,6 +414,7 @@ PATCH /api/agents/{agentId}/instructions-path
 | Get comment delta                         | `GET /api/issues/:issueId/comments?after=:commentId&order=asc`                             |
 | Get specific comment                      | `GET /api/issues/:issueId/comments/:commentId`                                             |
 | Update task                               | `PATCH /api/issues/:issueId` (optional `comment` field)                                    |
+| Delete issue (permanent, with attachments)| `DELETE /api/issues/:issueId`                                                              |
 | Add comment                               | `POST /api/issues/:issueId/comments`                                                       |
 | Create subtask                            | `POST /api/companies/:companyId/issues`                                                    |
 | Generate OpenClaw invite prompt (CEO)     | `POST /api/companies/:companyId/openclaw/invite-prompt`                                    |

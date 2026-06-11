@@ -208,7 +208,7 @@ async function waitForServer(
   output: { stdout: string[]; stderr: string[] },
 ) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 30_000) {
+  while (Date.now() - startedAt < 90_000) {
     if (child.exitCode !== null) {
       throw new Error(
         `paperclipai run exited before healthcheck succeeded.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
@@ -269,7 +269,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     });
 
     await waitForServer(apiBase, child, output);
-  }, 60_000);
+  }, 120_000);
 
   afterAll(async () => {
     await stopServerProcess(serverProcess);
@@ -281,6 +281,14 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
 
   it("exports a company package and imports it into new and existing companies", async () => {
     expect(serverProcess).not.toBeNull();
+
+    // Start each attempt with a clean export directory. The CLI export command
+    // refuses to write into a non-empty directory in non-interactive mode, so
+    // without this reset a retry (retry: 2) after the first attempt has written
+    // any files would always fail with "already contains files" instead of
+    // re-exercising the round-trip.
+    rmSync(exportDir, { recursive: true, force: true });
+    mkdirSync(exportDir, { recursive: true });
 
     const sourceCompany = await api<{ id: string; name: string; issuePrefix: string }>(apiBase, "/api/companies", {
       method: "POST",

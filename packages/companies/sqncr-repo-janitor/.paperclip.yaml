@@ -11,3 +11,9 @@ agents:
         customAgentFile: /Users/JuliusHalm 1/workspace/paperclip/packages/companies/sqncr-repo-janitor/agents/repo-janitor/kimi/agent.yaml
         cwd: /Users/JuliusHalm 1/workspace/brain-platform
         timeoutSec: 1800
+    runtime:
+      heartbeat:
+        # Timer off by design — driven by the "Daily repo hygiene sweep" routine,
+        # which creates a task and wakes this agent via wakeOnDemand.
+        enabled: false
+        wakeOnDemand: true

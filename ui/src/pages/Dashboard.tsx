@@ -21,7 +21,7 @@ import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
 import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
-import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
+import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, WorkflowSuccessChart, WorkflowQuadrantChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
@@ -294,8 +294,13 @@ export function Dashboard() {
               <IssueStatusChart issues={issues ?? []} />
             </ChartCard>
             <ChartCard title="Success Rate" subtitle="Last 14 days">
-              <SuccessRateChart runs={runs ?? []} />
+              <WorkflowSuccessChart workflows={data?.analytics.workflows ?? []} />
             </ChartCard>
+            <div className="col-span-2 lg:col-span-4">
+              <ChartCard title="Quadrant Map" subtitle="Last 14 days">
+                <WorkflowQuadrantChart quadrants={data?.analytics.quadrants ?? { Q1: [], Q2: [], Q3: [], Q4: [] }} />
+              </ChartCard>
+            </div>
           </div>
 
           <PluginSlotOutlet

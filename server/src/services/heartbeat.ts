@@ -26,6 +26,7 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { emitAnalyticsEvent } from "./agent-analytics.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -3112,6 +3113,18 @@ export function heartbeatService(db: Db) {
         message: "run started",
       });
 
+      await emitAnalyticsEvent({
+        db,
+        run: currentRun,
+        seq: seq++,
+        eventName: "analytics.agent_run_started",
+        payload: {
+          workflowType: issueRef?.projectId ?? executionProjectId ?? "uncategorized",
+          intentSummary: issueRef?.title ?? undefined,
+          triggerSource: currentRun.invocationSource,
+        },
+      });
+
       handle = await runLogStore.begin({
         companyId: run.companyId,
         agentId: run.agentId,
@@ -3353,6 +3366,24 @@ export function heartbeatService(db: Db) {
               ? "timed_out"
               : "failed";
 
+      const startedAtTime = run.startedAt ? new Date(run.startedAt).getTime() : Date.now();
+      const finishedAtTime = Date.now();
+      await emitAnalyticsEvent({
+        db,
+        run,
+        seq: seq++,
+        eventName: "analytics.task_completed",
+        payload: {
+          workflowType: issueRef?.projectId ?? executionProjectId ?? "uncategorized",
+          intentSummary: issueRef?.title ?? undefined,
+          triggerSource: run.invocationSource,
+          status: outcome === "succeeded" ? "completed" : outcome === "timed_out" ? "failed" : outcome,
+          durationMs: Math.max(0, finishedAtTime - startedAtTime),
+          costUsd: adapterResult.costUsd ?? undefined,
+          outputSummary: adapterResult.summary ?? undefined,
+        },
+      });
+
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
           ? ({
@@ -3510,6 +3541,20 @@ export function heartbeatService(db: Db) {
           level: "error",
           message,
         });
+        const startedAtTime = run.startedAt ? new Date(run.startedAt).getTime() : Date.now();
+        await emitAnalyticsEvent({
+          db,
+          run: failedRun,
+          seq: seq++,
+          eventName: "analytics.task_completed",
+          payload: {
+            workflowType: issueRef?.projectId ?? executionProjectId ?? "uncategorized",
+            intentSummary: issueRef?.title ?? undefined,
+            triggerSource: run.invocationSource,
+            status: "failed",
+            durationMs: Math.max(0, Date.now() - startedAtTime),
+          },
+        });
         await finalizeIssueCommentPolicy(failedRun, agent);
         await releaseIssueExecutionAndPromote(failedRun);
 
@@ -3561,6 +3606,32 @@ export function heartbeatService(db: Db) {
               stream: "system",
               level: "error",
               message,
+            }).catch(() => undefined);
+            const startedAtTime = failedRun.startedAt ? new Date(failedRun.startedAt).getTime() : Date.now();
+            const failedContext = parseObject(failedRun.contextSnapshot);
+            const failedIssueId = readNonEmptyString(failedContext.issueId);
+            let failedIssueTitle: string | undefined;
+            if (failedIssueId) {
+              const failedIssue = await db
+                .select({ title: issues.title, projectId: issues.projectId })
+                .from(issues)
+                .where(and(eq(issues.id, failedIssueId), eq(issues.companyId, failedRun.companyId)))
+                .then((rows) => rows[0] ?? null)
+                .catch(() => null);
+              failedIssueTitle = failedIssue?.title ?? undefined;
+            }
+            await emitAnalyticsEvent({
+              db,
+              run: failedRun,
+              seq: 2,
+              eventName: "analytics.task_completed",
+              payload: {
+                workflowType: readNonEmptyString(failedContext.projectId) ?? "uncategorized",
+                intentSummary: failedIssueTitle,
+                triggerSource: failedRun.invocationSource,
+                status: "failed",
+                durationMs: Math.max(0, Date.now() - startedAtTime),
+              },
             }).catch(() => undefined);
             const failedAgent = await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {

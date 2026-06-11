@@ -213,6 +213,7 @@ describe("IssueChatThread", () => {
               authorAgentId: "agent-1",
               authorUserId: null,
               body: "Agent summary",
+              metadata: null,
               createdAt: new Date("2026-04-06T12:00:00.000Z"),
               updatedAt: new Date("2026-04-06T12:00:00.000Z"),
             }]}

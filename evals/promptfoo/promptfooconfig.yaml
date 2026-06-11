@@ -34,3 +34,4 @@ defaultTest:
 
 tests:
   - file://tests/*.yaml
+  - file://generated/*/*.yaml

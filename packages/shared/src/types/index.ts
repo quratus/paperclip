@@ -162,7 +162,14 @@ export type {
   InstanceSchedulerHeartbeatAgent,
 } from "./heartbeat.js";
 export type { LiveEvent } from "./live.js";
-export type { DashboardSummary } from "./dashboard.js";
+export type { DashboardSummary, DashboardAnalytics, WorkflowAnalytics, WorkflowQuadrant } from "./dashboard.js";
+export type {
+  AgentAnalyticsEventName,
+  AgentAnalyticsEventPayload,
+  AgentRunStartedPayload,
+  TaskCompletedPayload,
+  UserCorrectionSubmittedPayload,
+} from "./analytics.js";
 export type { ActivityEvent } from "./activity.js";
 export type { SidebarBadges } from "./sidebar-badges.js";
 export type { InboxDismissal } from "./inbox-dismissal.js";

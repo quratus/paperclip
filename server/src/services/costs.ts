@@ -1,6 +1,6 @@
 import { and, desc, eq, gte, isNotNull, lt, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, companies, costEvents, issues, projects } from "@paperclipai/db";
+import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 
@@ -135,7 +135,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
-      return db
+      const rows = await db
         .select({
           agentId: costEvents.agentId,
           agentName: agents.name,
@@ -160,6 +160,30 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         .where(and(...conditions))
         .groupBy(costEvents.agentId, agents.name, agents.status)
         .orderBy(desc(sql`coalesce(sum(${costEvents.costCents}), 0)::int`));
+
+      // Fetch estimated cost from heartbeat_runs.usage_json for subscription billing
+      const runConditions: ReturnType<typeof eq>[] = [
+        eq(heartbeatRuns.companyId, companyId),
+        isNotNull(heartbeatRuns.usageJson),
+      ];
+      if (range?.from) runConditions.push(gte(heartbeatRuns.startedAt, range.from));
+      if (range?.to) runConditions.push(lte(heartbeatRuns.startedAt, range.to));
+
+      const estimatedByAgent = await db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          estimatedCostUsd: sql<number>`coalesce(sum((${heartbeatRuns.usageJson}->>'costUsd')::float), 0)`,
+        })
+        .from(heartbeatRuns)
+        .where(and(...runConditions))
+        .groupBy(heartbeatRuns.agentId);
+
+      const estimatedMap = new Map(estimatedByAgent.map((r) => [r.agentId, r.estimatedCostUsd ?? 0]));
+
+      return rows.map((row) => ({
+        ...row,
+        estimatedCostUsd: estimatedMap.get(row.agentId) ?? 0,
+      }));
     },
 
     byProvider: async (companyId: string, range?: CostDateRange) => {

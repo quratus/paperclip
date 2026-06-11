@@ -13,7 +13,6 @@ const manifest: PaperclipPluginManifestV1 = {
   categories: ["automation", "connector"],
   capabilities: [
     "agent.tools.register",
-    "ui.dashboardWidget.register",
     "issues.create",
   ],
   entrypoints: {
@@ -140,16 +139,11 @@ const manifest: PaperclipPluginManifestV1 = {
       },
     },
   ],
-  ui: {
-    slots: [
-      {
-        type: "dashboardWidget",
-        id: "knowledge-tree-health",
-        displayName: "Knowledge Graph Health",
-        exportName: "KnowledgeTreeHealthWidget",
-      },
-    ],
-  },
+  // Dashboard widget disabled: Neo4j/Golem XIV is Stage 4 and currently unavailable.
+  // The `ui` block must be omitted entirely (not `slots: []`) — the manifest
+  // validator requires `ui.slots` to contain at least one element when present.
+  // Re-enable by restoring the `ui.slots` dashboardWidget entry (and the
+  // `ui.dashboardWidget.register` capability) when the graph backend is back online.
 };
 
 export default manifest;

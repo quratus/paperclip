@@ -21,6 +21,9 @@ import {
   labels,
   projectWorkspaces,
   projects,
+  costEvents,
+  financeEvents,
+  feedbackVotes,
 } from "@paperclipai/db";
 import type { IssueRelationIssueSummary } from "@paperclipai/shared";
 import { extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
@@ -1707,6 +1710,17 @@ export function issueService(db: Db) {
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
 
+        // Null out optional FK references before delete (no cascade configured)
+        await tx.update(costEvents).set({ issueId: null }).where(eq(costEvents.issueId, id));
+        await tx.update(financeEvents).set({ issueId: null }).where(eq(financeEvents.issueId, id));
+        // Orphan child issues rather than cascade-delete them
+        await tx.update(issues).set({ parentId: null }).where(eq(issues.parentId, id));
+        // Delete non-cascading child records
+        await tx.delete(feedbackVotes).where(eq(feedbackVotes.issueId, id));
+        await tx.delete(issueComments).where(eq(issueComments.issueId, id));
+        await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.issueId, id));
+        await tx.delete(issueReadStates).where(eq(issueReadStates.issueId, id));
+
         const removedIssue = await tx
           .delete(issues)
           .where(eq(issues.id, id))
@@ -2116,6 +2130,7 @@ export function issueService(db: Db) {
       issueId: string,
       body: string,
       actor: { agentId?: string; userId?: string; runId?: string | null },
+      opts?: { metadata?: Record<string, unknown> | null },
     ) => {
       const issue = await db
         .select({ companyId: issues.companyId })
@@ -2138,6 +2153,7 @@ export function issueService(db: Db) {
           authorUserId: actor.userId ?? null,
           createdByRunId: actor.runId ?? null,
           body: redactedBody,
+          metadata: opts?.metadata ?? null,
         })
         .returning();
 

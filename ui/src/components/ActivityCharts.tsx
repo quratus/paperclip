@@ -1,4 +1,4 @@
-import type { HeartbeatRun } from "@paperclipai/shared";
+import type { HeartbeatRun, WorkflowAnalytics } from "@paperclipai/shared";
 
 /* ---- Utilities ---- */
 
@@ -220,6 +220,84 @@ export function IssueStatusChart({ issues }: { issues: { status: string; created
       </div>
       <DateLabels days={days} />
       <ChartLegend items={statusOrder.map(s => ({ color: statusColors[s] ?? "#6b7280", label: statusLabels[s] ?? s }))} />
+    </div>
+  );
+}
+
+export function WorkflowSuccessChart({ workflows }: { workflows: WorkflowAnalytics[] }) {
+  const hasData = workflows.length > 0;
+  if (!hasData) return <p className="text-xs text-muted-foreground">No workflow data yet</p>;
+
+  return (
+    <div className="space-y-2">
+      {workflows.slice(0, 5).map(wf => {
+        const ratePct = Math.round(wf.completionRate * 100);
+        const color = ratePct >= 80 ? "#10b981" : ratePct >= 50 ? "#eab308" : "#ef4444";
+        return (
+          <div key={wf.workflowType} className="space-y-1">
+            <div className="flex items-center justify-between text-[10px]">
+              <span className="truncate text-muted-foreground max-w-[70%]" title={wf.workflowType}>
+                {wf.workflowType}
+              </span>
+              <span className="tabular-nums text-muted-foreground">
+                {ratePct}% ({wf.runsCompleted}/{wf.runsTotal}){wf.correctionsTotal > 0 ? ` · ${wf.correctionsTotal} corrections` : ""}
+              </span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-muted/50 overflow-hidden">
+              <div
+                className="h-full rounded-full"
+                style={{ width: `${ratePct}%`, backgroundColor: color, minWidth: 2 }}
+              />
+            </div>
+          </div>
+        );
+      })}
+      <div className="pt-1 text-[9px] text-muted-foreground/60">
+        Last 14 days · by project
+      </div>
+    </div>
+  );
+}
+
+const quadrantMeta: Record<string, { label: string; color: string; description: string }> = {
+  Q1: { label: "Healthy", color: "#10b981", description: "High completion, low corrections" },
+  Q2: { label: "Polishing", color: "#eab308", description: "High completion, high corrections" },
+  Q3: { label: "Underutilized", color: "#3b82f6", description: "Low completion, low corrections" },
+  Q4: { label: "Broken", color: "#ef4444", description: "Low completion, high corrections" },
+};
+
+export function WorkflowQuadrantChart({ quadrants }: { quadrants: Record<string, string[]> }) {
+  const order = ["Q1", "Q2", "Q3", "Q4"] as const;
+  const hasData = order.some(q => (quadrants[q] ?? []).length > 0);
+  if (!hasData) return <p className="text-xs text-muted-foreground">No quadrant data yet</p>;
+
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      {order.map(q => {
+        const meta = quadrantMeta[q];
+        const items = quadrants[q] ?? [];
+        return (
+          <div key={q} className="rounded-md border border-border/60 p-2 space-y-1">
+            <div className="flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: meta.color }} />
+              <span className="text-[10px] font-medium text-muted-foreground">{q} — {meta.label}</span>
+            </div>
+            <p className="text-[9px] text-muted-foreground/60 leading-tight">{meta.description}</p>
+            <div className="space-y-0.5">
+              {items.length === 0 ? (
+                <span className="text-[9px] text-muted-foreground/40 italic">None</span>
+              ) : (
+                items.slice(0, 4).map(wf => (
+                  <span key={wf} className="block text-[9px] text-muted-foreground truncate" title={wf}>{wf}</span>
+                ))
+              )}
+              {items.length > 4 && (
+                <span className="text-[9px] text-muted-foreground/40">+{items.length - 4} more</span>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -237,6 +237,7 @@ export interface IssueComment {
   authorAgentId: string | null;
   authorUserId: string | null;
   body: string;
+  metadata: Record<string, unknown> | null;
   createdAt: Date;
   updatedAt: Date;
 }

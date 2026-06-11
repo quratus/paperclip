@@ -197,7 +197,7 @@ interface IssueChatThreadProps {
     vote: FeedbackVoteValue,
     options?: { allowSharing?: boolean; reason?: string },
   ) => Promise<void>;
-  onAdd: (body: string, reopen?: boolean, reassignment?: CommentReassignment) => Promise<void>;
+  onAdd: (body: string, reopen?: boolean, reassignment?: CommentReassignment, metadata?: Record<string, unknown>) => Promise<void>;
   onCancelRun?: () => Promise<void>;
   imageUploadHandler?: (file: File) => Promise<string>;
   onAttachImage?: (file: File) => Promise<void>;
@@ -1558,6 +1558,7 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
   const api = useAui();
   const [body, setBody] = useState("");
   const [reopen, setReopen] = useState(issueStatus === "done" || issueStatus === "cancelled");
+  const [isCorrection, setIsCorrection] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const effectiveSuggestedAssigneeValue = suggestedAssigneeValue ?? currentAssigneeValue;
@@ -1620,11 +1621,13 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
           custom: {
             ...(reopen ? { reopen: true } : {}),
             ...(reassignment ? { reassignment } : {}),
+            ...(isCorrection ? { metadata: { intent: "correction", correctionType: "output_edit", severity: "major" } } : {}),
           },
         },
       });
       if (draftKey) clearDraft(draftKey);
       setReopen(issueStatus === "done" || issueStatus === "cancelled");
+      setIsCorrection(false);
       setReassignTarget(effectiveSuggestedAssigneeValue);
     } catch {
       setBody((current) =>
@@ -1715,6 +1718,17 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
             className="rounded border-border"
           />
           Re-open
+        </label>
+
+        <label className="flex items-center gap-1.5 text-xs text-amber-600 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={isCorrection}
+            onChange={(event) => setIsCorrection(event.target.checked)}
+            className="rounded border-border"
+          />
+          <AlertTriangle className="h-3 w-3" />
+          Correction
         </label>
 
         {enableReassign && reassignOptions.length > 0 ? (
@@ -1886,7 +1900,7 @@ export function IssueChatThread({
   const runtime = usePaperclipIssueRuntime({
     messages,
     isRunning,
-    onSend: ({ body, reopen, reassignment }) => onAdd(body, reopen, reassignment),
+    onSend: ({ body, reopen, reassignment, metadata }) => onAdd(body, reopen, reassignment, metadata),
     onCancel: onCancelRun,
   });
 

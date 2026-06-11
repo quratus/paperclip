@@ -1,7 +1,8 @@
 version: 1
 agent:
   name: "Watchdog"
-  system_prompt_path: ./system.md
+  # Single source of truth: the agent's canonical AGENTS.md (claude_local reads the same file).
+  system_prompt_path: ../AGENTS.md
   tools:
     - "kimi_cli.tools.shell:Shell"
     - "kimi_cli.tools.file:ReadFile"

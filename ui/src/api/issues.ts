@@ -117,13 +117,14 @@ export const issuesApi = {
       allowSharing?: boolean;
     },
   ) => api.post<FeedbackVote>(`/issues/${id}/feedback-votes`, data),
-  addComment: (id: string, body: string, reopen?: boolean, interrupt?: boolean) =>
+  addComment: (id: string, body: string, reopen?: boolean, interrupt?: boolean, metadata?: Record<string, unknown>) =>
     api.post<IssueComment>(
       `/issues/${id}/comments`,
       {
         body,
         ...(reopen === undefined ? {} : { reopen }),
         ...(interrupt === undefined ? {} : { interrupt }),
+        ...(metadata ? { metadata } : {}),
       },
     ),
   listDocuments: (id: string) => api.get<IssueDocument[]>(`/issues/${id}/documents`),

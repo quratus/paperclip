@@ -11,3 +11,10 @@ agents:
         customAgentFile: /Users/JuliusHalm 1/workspace/paperclip/packages/companies/sqncr-watchdog/agents/watchdog/kimi/agent.yaml
         cwd: /Users/JuliusHalm 1/workspace/brain-platform
         timeoutSec: 1800
+    runtime:
+      heartbeat:
+        enabled: true
+        intervalSec: 60000
+        wakeOnDemand: true
+        sessionCompaction:
+          maxRawInputTokens: 150000

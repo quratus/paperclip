@@ -9,6 +9,7 @@ export interface PaperclipIssueRuntimeSendOptions {
   body: string;
   reopen?: boolean;
   reassignment?: PaperclipIssueRuntimeReassignment;
+  metadata?: Record<string, unknown>;
 }
 
 interface UsePaperclipIssueRuntimeOptions {
@@ -61,6 +62,7 @@ export function usePaperclipIssueRuntime({
         body,
         reopen: custom?.reopen === true ? true : undefined,
         reassignment,
+        metadata: asRecord(custom?.metadata) ?? undefined,
       });
     },
     ...(onCancel ? { onCancel } : {}),

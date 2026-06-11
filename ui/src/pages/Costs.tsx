@@ -531,6 +531,12 @@ export function Costs() {
       0,
     );
 
+  const estimatedCostUsdTotal =
+    (spendData?.byAgent ?? []).reduce(
+      (sum, row) => sum + (row.estimatedCostUsd ?? 0),
+      0,
+    );
+
   const topFinanceEvents = (financeData?.events ?? []) as FinanceEvent[];
   const budgetPolicies = budgetData?.policies ?? [];
   const activeBudgetIncidents = budgetData?.activeIncidents ?? [];
@@ -594,8 +600,16 @@ export function Costs() {
           <div className="grid gap-3 lg:grid-cols-4 xl:grid-cols-5">
             <MetricTile
               label="Inference spend"
-              value={formatCents(spendData?.summary.spendCents ?? 0)}
-              subtitle={`${formatTokens(inferenceTokenTotal)} tokens across request-scoped events`}
+              value={
+                estimatedCostUsdTotal > 0 && (spendData?.summary.spendCents ?? 0) === 0
+                  ? `~$${estimatedCostUsdTotal.toFixed(2)}`
+                  : formatCents(spendData?.summary.spendCents ?? 0)
+              }
+              subtitle={
+                estimatedCostUsdTotal > 0 && (spendData?.summary.spendCents ?? 0) === 0
+                  ? `Estimated · ${formatTokens(inferenceTokenTotal)} tokens`
+                  : `${formatTokens(inferenceTokenTotal)} tokens across request-scoped events`
+              }
               icon={DollarSign}
             />
             <MetricTile
@@ -763,7 +777,14 @@ export function Costs() {
                                 {row.agentStatus === "terminated" ? <StatusBadge status="terminated" /> : null}
                               </div>
                               <div className="text-right text-sm tabular-nums">
-                                <div className="font-medium">{formatCents(row.costCents)}</div>
+                                {row.estimatedCostUsd > 0 ? (
+                                  <div className="font-medium">
+                                    ~${row.estimatedCostUsd.toFixed(2)}
+                                    <span className="ml-1 text-xs font-normal text-muted-foreground">est.</span>
+                                  </div>
+                                ) : (
+                                  <div className="font-medium">{formatCents(row.costCents)}</div>
+                                )}
                                 <div className="text-xs text-muted-foreground">
                                   in {formatTokens(row.inputTokens + row.cachedInputTokens)} · out {formatTokens(row.outputTokens)}
                                 </div>

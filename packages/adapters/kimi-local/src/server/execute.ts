@@ -118,6 +118,52 @@ async function kimiHasSessionForCwd(cwd: string): Promise<boolean> {
   }
 }
 
+// Read the last_session_id for a given cwd from ~/.kimi/kimi.json.
+async function kimiSessionIdForCwd(cwd: string): Promise<string | undefined> {
+  try {
+    const raw = await fs.readFile(path.join(os.homedir(), ".kimi", "kimi.json"), "utf-8");
+    const data = JSON.parse(raw) as {
+      work_dirs?: Array<{ path: string; last_session_id: string | null }>;
+    };
+    const resolved = path.resolve(cwd);
+    const entry = (data.work_dirs ?? []).find((d) => path.resolve(d.path) === resolved);
+    return entry?.last_session_id ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Parse token usage from ~/.kimi/logs/kimi.log.
+// Reads only lines appended after `startOffset` bytes to isolate this run.
+// Filters by sessionUuid when available; sums per-step input + output counts.
+async function parseKimiLogUsage(
+  startOffset: number,
+  sessionUuid?: string,
+): Promise<UsageSummary | undefined> {
+  const logPath = path.join(os.homedir(), ".kimi", "logs", "kimi.log");
+  try {
+    const buffer = await fs.readFile(logPath);
+    if (buffer.length <= startOffset) return undefined;
+    const content = buffer.slice(startOffset).toString("utf-8");
+    const uuidPrefix = sessionUuid ? `${sessionUuid} - ` : "";
+    const pattern = new RegExp(
+      `${uuidPrefix}LLM step completed in [\\d.]+s \\(input=(\\d+), output=(\\d+)\\)`,
+      "g",
+    );
+    let totalInput = 0;
+    let totalOutput = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      totalInput += Number.parseInt(match[1], 10);
+      totalOutput += Number.parseInt(match[2], 10);
+    }
+    if (totalInput === 0 && totalOutput === 0) return undefined;
+    return { inputTokens: totalInput, outputTokens: totalOutput, cachedInputTokens: 0 };
+  } catch {
+    return undefined;
+  }
+}
+
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -427,6 +473,14 @@ When working: read the issue description completely first, then the project's AG
 
   await onLog("stdout", `[kimi] Starting Kimi Code CLI with ${agentPreset} agent preset\n`);
 
+  // Snapshot log file size so we only parse lines appended during this run.
+  const kimiLogPath = path.join(os.homedir(), ".kimi", "logs", "kimi.log");
+  let logStartOffset = 0;
+  try {
+    const stat = await fs.stat(kimiLogPath);
+    logStartOffset = stat.size;
+  } catch { /* log may not exist on first run */ }
+
   const proc = await runChildProcess(runId, command, args, {
     cwd,
     env,
@@ -436,6 +490,10 @@ When working: read the issue description completely first, then the project's AG
     onSpawn,
     onLog,
   });
+
+  // Read session UUID from kimi.json after the run (updated by Kimi on exit).
+  const kimiSessionUuid = await kimiSessionIdForCwd(resolvedCwd);
+  const logUsage = await parseKimiLogUsage(logStartOffset, kimiSessionUuid);
 
   const parsed = parseKimiStreamJson(proc.stdout);
 
@@ -463,6 +521,10 @@ When working: read the issue description completely first, then the project's AG
   const sessionParams = { cwd: resolvedCwd };
   const sessionDisplayId = `kimi-${resolvedCwd}`;
 
+  // Prefer log-based token counts (accurate per-step sums) over stream-json
+  // which never emits usage fields in Kimi's current output format.
+  const resolvedUsage = logUsage ?? parsed.usage;
+
   return {
     exitCode: proc.exitCode,
     signal: proc.signal,
@@ -475,7 +537,8 @@ When working: read the issue description completely first, then the project's AG
     summary: parsed.finalText || "(no output from Kimi)",
     provider: parsed.provider || "kimi",
     model: parsed.model || model || "default",
-    usage: parsed.usage,
+    usage: resolvedUsage,
+    billingType: resolvedUsage ? "subscription_included" : undefined,
     sessionId: sessionDisplayId,
     sessionParams,
     sessionDisplayId,

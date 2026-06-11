@@ -14,3 +14,8 @@ agents:
       config:
         url: ${GOLEM_XIV_URL}
         authPassword: ${GOLEM_XIV_PASSWORD}
+    runtime:
+      heartbeat:
+        # Knowledge agent — answers on demand/delegation, no proactive timer.
+        enabled: false
+        wakeOnDemand: true

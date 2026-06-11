@@ -263,6 +263,7 @@ describe("CommentThread", () => {
               authorAgentId: null,
               authorUserId: "user-1",
               body: "Hello from the comment body",
+              metadata: null,
               createdAt: new Date("2026-03-11T11:00:00.000Z"),
               updatedAt: new Date("2026-03-11T11:00:00.000Z"),
             }]}

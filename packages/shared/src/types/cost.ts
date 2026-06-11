@@ -33,6 +33,7 @@ export interface CostByAgent {
   agentName: string | null;
   agentStatus: string | null;
   costCents: number;
+  estimatedCostUsd: number;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;

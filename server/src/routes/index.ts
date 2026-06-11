@@ -11,6 +11,7 @@ export { secretRoutes } from "./secrets.js";
 export { costRoutes } from "./costs.js";
 export { activityRoutes } from "./activity.js";
 export { dashboardRoutes } from "./dashboard.js";
+export { analyticsRoutes } from "./analytics.js";
 export { sidebarBadgeRoutes } from "./sidebar-badges.js";
 export { inboxDismissalRoutes } from "./inbox-dismissals.js";
 export { llmRoutes } from "./llms.js";
