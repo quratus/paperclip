@@ -210,6 +210,10 @@ export interface RoutineRun {
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  cachedInputTokens?: number | null;
+  costCents?: number | null;
 }
 
 export interface RoutineTriggerSecretMaterial {

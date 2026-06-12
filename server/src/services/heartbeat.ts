@@ -1754,6 +1754,25 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
+export interface ProjectedUsage {
+  tokensIn: number | null;
+  tokensOut: number | null;
+  cachedInputTokens: number | null;
+  costCents: number | null;
+}
+
+export function projectUsage(usageJson: Record<string, unknown> | null | undefined): ProjectedUsage {
+  if (!usageJson) return { tokensIn: null, tokensOut: null, cachedInputTokens: null, costCents: null };
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const costUsd = num(usageJson.costUsd);
+  return {
+    tokensIn: num(usageJson.inputTokens),
+    tokensOut: num(usageJson.outputTokens),
+    cachedInputTokens: num(usageJson.cachedInputTokens),
+    costCents: costUsd != null ? Math.round(costUsd * 100) : null,
+  };
+}
+
 const heartbeatRunListColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
@@ -16870,6 +16889,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return {
           ...rest,
+          ...projectUsage(rest.usageJson),
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
             taskId: contextTaskId,
