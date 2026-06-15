@@ -203,8 +203,10 @@ export function agentService(db: Db) {
     };
   }
 
-  function normalizeAgentRow(row: typeof agents.$inferSelect) {
+  function normalizeAgentRow<T extends typeof agents.$inferSelect>(row: T) {
     return withUrlKey({
+      // Default for mutators that don't hydrate spend; hydrated rows override via the spread.
+      estimatedMonthlyCents: 0,
       ...row,
       permissions: normalizeAgentPermissions(row.permissions, row.role),
     });
@@ -231,14 +233,46 @@ export function agentService(db: Db) {
     return new Map(rows.map((row) => [row.agentId, Number(row.spentMonthlyCents ?? 0)]));
   }
 
+  // Estimated cost = the dollar value of token usage (heartbeat_runs.usageJson.costUsd),
+  // independent of billing. Under a Claude subscription the *billed* marginal cost is $0
+  // (see normalizeBilledCostCents in heartbeat.ts), so cost_events.costCents — and therefore
+  // spentMonthlyCents — reads $0 org-wide even though tokens are flowing. This surfaces the
+  // measured estimate so the UI shows real cost rather than the subscription's $0 (SQN-699).
+  async function getMonthlyEstimateByAgentIds(companyId: string, agentIds: string[]) {
+    if (agentIds.length === 0) return new Map<string, number>();
+    const { start, end } = currentUtcMonthWindow();
+    const rows = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        estimatedMonthlyCents: sql<number>`coalesce(round(sum((${heartbeatRuns.usageJson} ->> 'costUsd')::numeric) * 100), 0)::int`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.agentId, agentIds),
+          gte(heartbeatRuns.createdAt, start),
+          lt(heartbeatRuns.createdAt, end),
+        ),
+      )
+      .groupBy(heartbeatRuns.agentId);
+    return new Map(rows.map((row) => [row.agentId, Number(row.estimatedMonthlyCents ?? 0)]));
+  }
+
   async function hydrateAgentSpend<T extends { id: string; companyId: string; spentMonthlyCents: number }>(rows: T[]) {
     const agentIds = rows.map((row) => row.id);
     const companyId = rows[0]?.companyId;
-    if (!companyId || agentIds.length === 0) return rows;
-    const spendByAgentId = await getMonthlySpendByAgentIds(companyId, agentIds);
+    if (!companyId || agentIds.length === 0) {
+      return rows.map((row) => ({ ...row, estimatedMonthlyCents: 0 }));
+    }
+    const [spendByAgentId, estimateByAgentId] = await Promise.all([
+      getMonthlySpendByAgentIds(companyId, agentIds),
+      getMonthlyEstimateByAgentIds(companyId, agentIds),
+    ]);
     return rows.map((row) => ({
       ...row,
       spentMonthlyCents: spendByAgentId.get(row.id) ?? 0,
+      estimatedMonthlyCents: estimateByAgentId.get(row.id) ?? 0,
     }));
   }
 

@@ -87,4 +87,40 @@ describe("monthly spend hydration", () => {
 
     expect(agent?.spentMonthlyCents).toBe(175);
   });
+
+  it("surfaces estimatedMonthlyCents from heartbeat usage even when billed spend is zero (subscription)", async () => {
+    const dbStub = createSelectSequenceDb([
+      [{
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Subscription Agent",
+        role: "general",
+        title: null,
+        reportsTo: null,
+        capabilities: null,
+        adapterType: "claude-local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        budgetMonthlyCents: 0,
+        spentMonthlyCents: 0,
+        metadata: null,
+        permissions: null,
+        status: "idle",
+        pauseReason: null,
+        pausedAt: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }],
+      // billed spend (cost_events) — $0 under subscription
+      [{ agentId: "agent-1", spentMonthlyCents: 0 }],
+      // estimated cost (heartbeat_runs.usageJson.costUsd) — the real measured value
+      [{ agentId: "agent-1", estimatedMonthlyCents: 312 }],
+    ]);
+
+    const agents = agentService(dbStub.db as any);
+    const agent = await agents.getById("agent-1");
+
+    expect(agent?.spentMonthlyCents).toBe(0);
+    expect(agent?.estimatedMonthlyCents).toBe(312);
+  });
 });

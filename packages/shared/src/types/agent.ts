@@ -75,6 +75,9 @@ export interface Agent {
   runtimeConfig: Record<string, unknown>;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
+  /** Estimated token cost (usageJson.costUsd) for the current UTC month — non-zero even under
+   * subscription billing, where spentMonthlyCents (billed marginal cost) reads $0. */
+  estimatedMonthlyCents?: number;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   permissions: AgentPermissions;

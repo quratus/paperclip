@@ -13,7 +13,7 @@ import { agentStatusDot, agentStatusDotDefault } from "../lib/status-colors";
 import { EntityRow } from "../components/EntityRow";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
-import { relativeTime, cn, agentRouteRef, agentUrl } from "../lib/utils";
+import { relativeTime, cn, agentRouteRef, agentUrl, formatCents } from "../lib/utils";
 import { PageTabBar } from "../components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -255,6 +255,12 @@ export function Agents() {
                       )}
                       <span className="text-xs text-muted-foreground font-mono w-14 text-right">
                         {getAdapterLabel(agent.adapterType)}
+                      </span>
+                      <span
+                        className="text-xs text-muted-foreground font-mono w-16 text-right tabular-nums"
+                        title="Estimated token cost this month"
+                      >
+                        {(agent.estimatedMonthlyCents ?? 0) > 0 ? `~${formatCents(agent.estimatedMonthlyCents as number)}` : "—"}
                       </span>
                       <span className="text-xs text-muted-foreground w-16 text-right">
                         {agent.lastHeartbeatAt ? relativeTime(agent.lastHeartbeatAt) : "—"}
