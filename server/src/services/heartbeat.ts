@@ -2587,6 +2587,24 @@ export function heartbeatService(db: Db) {
         costCents: additionalCostCents,
         occurredAt: new Date(),
       });
+
+      // Surface measured token/cost on the run log so a ledger audit can read
+      // it from stdout without joining cost_events (SQN-699).
+      logger.info(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          provider,
+          biller,
+          billingType,
+          model: result.model ?? "unknown",
+          inputTokens,
+          cachedInputTokens,
+          outputTokens,
+          costCents: additionalCostCents,
+        },
+        "heartbeat run usage",
+      );
     }
   }
 

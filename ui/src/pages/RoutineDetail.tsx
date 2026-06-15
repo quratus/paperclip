@@ -26,6 +26,7 @@ import { useToast } from "../context/ToastContext";
 import { queryKeys } from "../lib/queryKeys";
 import { buildRoutineTriggerPatch } from "../lib/routine-trigger-patch";
 import { timeAgo } from "../lib/timeAgo";
+import { formatTokens, formatCents } from "../lib/utils";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -1074,7 +1075,21 @@ export function RoutineDetail() {
                       </Link>
                     )}
                   </div>
-                  <span className="text-xs text-muted-foreground shrink-0 ml-2">{timeAgo(run.triggeredAt)}</span>
+                  <div className="flex items-center gap-3 shrink-0 ml-2 text-xs text-muted-foreground tabular-nums">
+                    {(() => {
+                      const tokens = (run.tokensIn ?? 0) + (run.tokensOut ?? 0);
+                      const hasTokens = tokens > 0;
+                      const hasCost = run.costCents != null && run.costCents > 0;
+                      if (!hasTokens && !hasCost) return null;
+                      return (
+                        <span className="flex items-center gap-2">
+                          {hasTokens && <span>{formatTokens(tokens)} tok</span>}
+                          {hasCost && <span>{formatCents(run.costCents as number)}</span>}
+                        </span>
+                      );
+                    })()}
+                    <span>{timeAgo(run.triggeredAt)}</span>
+                  </div>
                 </div>
               ))}
             </div>
