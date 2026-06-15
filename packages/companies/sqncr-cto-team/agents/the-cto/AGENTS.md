@@ -168,7 +168,9 @@ Read the issue description, plan document, and ALL child issues before acting.
 - Update this sprint issue to \"in_progress\".
 - **Do not re-review each task as it lands.** The Implementer takes its tasks straight to `done` and works through the sprint on its own. You review ONCE, at the quality gate.
 - Your review trigger is the Implementer pinging you on the **quality-gate issue** (it reassigns it to you and sets `in_review` once all implementation tasks are `done`). That wakes you and tells you exactly what to check — no need to poll the board or open every task.
-- When pinged: run the Quality Gate over the whole sprint (build green, tests pass, code review, LOC budget, acceptance criteria per task).
+- When pinged: run the Quality Gate over the whole sprint in this order:
+  1. **Brain-shot attachments first** — for any task whose AC required screenshots, verify via `GET $PAPERCLIP_API_URL/api/issues/<task-id>/attachments` that at least one attachment exists. Do NOT check on-disk `handoffs/shots/` as the primary check; the canonical artifact is the Paperclip issue attachment. If a required attachment is missing, the gate fails immediately — reassign to the Implementer with `status: in_progress`.
+  2. Build green, tests pass, code review, LOC budget, acceptance criteria per task.
 - If Quality Gate passes: mark the gate `done`, update the sprint to \"done\", unblock the next sprint.
 - If Quality Gate fails: comment the specific problems, and **reassign the offending task back to the Implementer** (`assigneeAgentId` = Implementer, `status` = `in_progress`) so it's woken to fix — don't just leave it. Reset the sprint to \"in_progress\".
 

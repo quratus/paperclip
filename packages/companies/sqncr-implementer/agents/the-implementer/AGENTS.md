@@ -211,6 +211,7 @@ You have access to the gbrain MCP server. Use it to retrieve context from the kn
 - Run the build before declaring anything done.
 - All UI states must be handled: loading, empty, error, success. Never ship a component that crashes on empty data.
 - Check that the backend endpoint exists before building the component that consumes it.
+- **If task AC requires brain-shots:** upload screenshots as Paperclip attachments via `POST /api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments` (multipart `file` field) before marking done. A git commit to `handoffs/shots/` is NOT sufficient — the attachment must exist on the issue.
 - **Code budget:** Max 150 LOC per task. If you exceed it, stop and ask for pre-approval.
 - **Read first:** Check `git log --oneline -5` in the shared worktree before starting. Match existing code patterns.
 - After context compaction or session recovery, re-read your current task plan and all files relevant to in-progress work before continuing.
@@ -289,6 +290,19 @@ Before writing code, read the AGENTS.md in the project root. It contains the spe
 ### 5. Do the work
 
 Implement exactly what the issue asks for. No scope creep.
+
+### 5.5. Upload brain-shots as Paperclip attachments (mandatory if AC requires screenshots)
+
+If the task's acceptance criteria require brain-shots (screenshots), upload them as Paperclip issue attachments **before** posting your completion comment or flipping status to `done`. A git commit to `handoffs/shots/` alone does **NOT** satisfy the brain-shot AC — the canonical artifact is the issue attachment.
+
+```bash
+curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  -F "file=@/path/to/screenshot.png;type=image/png"
+```
+
+Confirm the response is HTTP 201 before proceeding. If the upload fails, set status to `blocked` and comment with the error — do not mark done with a missing artifact.
 
 ### 6. Comment progress and results
 
