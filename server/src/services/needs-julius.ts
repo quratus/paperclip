@@ -1,8 +1,8 @@
 import type { Db } from "@paperclipai/db";
-import { issues as issuesTable, issueComments } from "@paperclipai/db";
+import { issues as issuesTable, issueComments, labels, issueLabels } from "@paperclipai/db";
 import { and, eq, ilike, inArray, isNull, or } from "drizzle-orm";
 
-export type NeedsJuliusReason = "mention" | "parked" | "blocked";
+export type NeedsJuliusReason = "mention" | "parked" | "blocked" | "labeled";
 
 export type NeedsJuliusItem = {
   issueId: string;
@@ -50,6 +50,22 @@ export async function needsJulius(
   if (tokens.length === 0) return [];
   const mentionFilter = or(...tokens.map((t) => ilike(issueComments.body, `%${escapeLike(t)}%`)));
 
+  // Phase 0 — build labelAppliedAt map from the "needs-julius" label.
+  const labelAppliedAt = new Map<string, Date>();
+  const labelRow = await db
+    .select({ id: labels.id })
+    .from(labels)
+    .where(and(eq(labels.companyId, companyId), eq(labels.name, "needs-julius")))
+    .limit(1);
+  const njLabelId = labelRow[0]?.id ?? null;
+  if (njLabelId) {
+    const labelRows = await db
+      .select({ issueId: issueLabels.issueId, createdAt: issueLabels.createdAt })
+      .from(issueLabels)
+      .where(and(eq(issueLabels.companyId, companyId), eq(issueLabels.labelId, njLabelId)));
+    for (const r of labelRows) labelAppliedAt.set(r.issueId, r.createdAt);
+  }
+
   // Phase 1 — discover candidate issues (assignee-parked + any mention of owner).
   const assigneeRows = await db
     .select()
@@ -83,6 +99,16 @@ export async function needsJulius(
         ),
       );
     candidateRows.push(...mentionRows);
+  }
+
+  const labelOnlyIds = [...labelAppliedAt.keys()].filter((id) => !seenIds.has(id));
+  if (labelOnlyIds.length > 0) {
+    const labeledIssues = await db
+      .select()
+      .from(issuesTable)
+      .where(and(eq(issuesTable.companyId, companyId), inArray(issuesTable.id, labelOnlyIds), isNull(issuesTable.hiddenAt)));
+    candidateRows.push(...labeledIssues);
+    labelOnlyIds.forEach((id) => seenIds.add(id));
   }
 
   if (candidateRows.length === 0) return [];
@@ -140,6 +166,14 @@ export async function needsJulius(
         triggerAt: lc ? lc.createdAt : issue.updatedAt,
         commentId: lc ? lc.id : null,
         snippet: lc ? snippetFromBody(lc.body) : null,
+      });
+    }
+    if (labelAppliedAt.has(issue.id)) {
+      branches.push({
+        reason: "labeled",
+        triggerAt: labelAppliedAt.get(issue.id)!,
+        commentId: null,
+        snippet: null,
       });
     }
     if (branches.length === 0) continue;

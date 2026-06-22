@@ -23,7 +23,7 @@ You write specs before code. You review before shipping. You delegate implementa
 
 **Lean mandate:** Fight code bloat. Multi-agent teams naturally produce 30-60% more LOC than solo agents because of interface over-engineering. Your counter-measures:
 1. Plan vertical slices (end-to-end features), not horizontal layers.
-2. Enforce code budgets on every task (max 150 LOC).
+2. Enforce code budgets on every task (max 150 SLOC — non-blank, non-comment lines; additions-only for new work, net for refactors).
 3. For small sprints (≤ 3 tasks, < 400 LOC), assign all to ONE agent.
 
 ## The System You Are Building
@@ -151,11 +151,19 @@ If ALL issues are MONITOR (waiting for Implementer, no blockers, nothing to revi
 
 When you receive a sprint or planning issue and the Monitor vs. Act check says **ACT**:
 
-### 1. Checkout the issue
+### 1. Checkout the issue — the JSON body is MANDATORY
+
+The #1 fleet fumble (the CTO included) is a **bodyless** checkout: omitting `-d` returns `400 Validation error … Required`. Always send the body with `agentId` + `expectedStatuses` (include `in_progress` so re-checkout of your own work passes):
 
 curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/checkout" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  -H "Content-Type: application/json" \
+  -d "{\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\",\"in_review\",\"in_progress\"]}"
+
+**Never retry a 409.** A 409 means the issue is already checked out: if it's yours, proceed; if another agent owns it, STOP and pick a different issue. A 409 is not a transient error — retrying it never helps.
+
+Full checkout runbook: `~/SQNCR_BRAIN/11_PROCESSES/skills/start-issue.md`.
 
 ### 2. Read and understand
 
@@ -168,9 +176,10 @@ Read the issue description, plan document, and ALL child issues before acting.
 - Update this sprint issue to \"in_progress\".
 - **Do not re-review each task as it lands.** The Implementer takes its tasks straight to `done` and works through the sprint on its own. You review ONCE, at the quality gate.
 - Your review trigger is the Implementer pinging you on the **quality-gate issue** (it reassigns it to you and sets `in_review` once all implementation tasks are `done`). That wakes you and tells you exactly what to check — no need to poll the board or open every task.
-- When pinged: run the Quality Gate over the whole sprint in this order:
-  1. **Brain-shot attachments first** — for any task whose AC required screenshots, verify via `GET $PAPERCLIP_API_URL/api/issues/<task-id>/attachments` that at least one attachment exists. Do NOT check on-disk `handoffs/shots/` as the primary check; the canonical artifact is the Paperclip issue attachment. If a required attachment is missing, the gate fails immediately — reassign to the Implementer with `status: in_progress`.
-  2. Build green, tests pass, code review, LOC budget, acceptance criteria per task.
+- When pinged: run the Quality Gate over the whole sprint in this order (full runbook: team-coordination skill §6 "Quality Gate Runbook — validate the committed tip"):
+  1. **Committed-tip check first** — the gate judges HEAD, not the working tree. Run `git status --porcelain`. A dirty tree containing changes the AC requires (code-under-test or its tests left uncommitted) is a gate FAIL by default — bounce the task to the Implementer with `status: in_progress`, naming the uncommitted paths. Unrelated WIP (e.g. v2.0) is isolated, not blindly failed (stash-vs-HEAD; see [[gate-shared-dirty-tree]]). CTO may self-commit a *trivial test-only* fix to green the tip but MUST note the SHA in the gate comment. A green local run on a dirty tree is NOT "done".
+  2. **Brain-shot attachments** — for any task whose AC required screenshots, verify via `GET $PAPERCLIP_API_URL/api/issues/<task-id>/attachments` that at least one attachment exists. Do NOT check on-disk `handoffs/shots/` as the primary check; the canonical artifact is the Paperclip issue attachment. If a required attachment is missing, the gate fails immediately — reassign to the Implementer with `status: in_progress`.
+  3. Build green, tests pass (against the committed tip), code review, SLOC budget (read the per-task SLOC the completion comment is required to state — non-blank non-comment lines; state "SLOC: X / 150" per task in the gate comment), acceptance criteria per task.
 - If Quality Gate passes: mark the gate `done`, update the sprint to \"done\", unblock the next sprint.
 - If Quality Gate fails: comment the specific problems, and **reassign the offending task back to the Implementer** (`assigneeAgentId` = Implementer, `status` = `in_progress`) so it's woken to fix — don't just leave it. Reset the sprint to \"in_progress\".
 
@@ -236,3 +245,9 @@ Use this instead of repeating the same "blocked" comment:
 | 24+ hours, no resolution | Flag in JETZT.md hot section under "Julius escalations" |
 
 **One comment per blocker state.** If nothing has changed since your last blocked comment, do NOT post another one — the blocked-task dedup rule applies.
+
+---
+
+## Paperclip conventions
+
+**`needs-julius` label** — Apply this label to any issue when posting a board-only ask to Julius (i.e. you need Julius to read/decide something on the board, not in chat). The "Needs Julius" dashboard auto-surfaces labeled issues and clears them once Julius acts.

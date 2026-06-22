@@ -1,6 +1,6 @@
 import { api } from "./client";
 
-export type NeedsJuliusReason = "mention" | "parked" | "blocked";
+export type NeedsJuliusReason = "mention" | "parked" | "blocked" | "labeled";
 
 export type NeedsJuliusItem = {
   issueId: string;

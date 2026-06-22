@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, issueComments, issues } from "@paperclipai/db";
+import { agents, companies, createDb, issueComments, issues, labels, issueLabels } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -150,6 +150,87 @@ describeEmbeddedPostgres("needsJulius detection", () => {
     });
 
     expect(result.some((r) => r.issueId === resolvedIssueId)).toBe(false);
+  });
+
+  it("labeled-surfaces: issue tagged needs-julius surfaces with reason=labeled", async () => {
+    await seedCompanyAndAgent();
+
+    const labeledIssueId = randomUUID();
+    const labelId = randomUUID();
+    const labelAppliedAt = new Date("2026-06-20T10:00:00.000Z");
+
+    await db.insert(issues).values({
+      id: labeledIssueId,
+      companyId,
+      title: "Needs Julius label test",
+      identifier: "SQN-20",
+      status: "todo",
+      priority: "medium",
+      updatedAt: new Date("2026-06-19T08:00:00.000Z"),
+    });
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: "needs-julius",
+      color: "#ff0000",
+    });
+    await db.insert(issueLabels).values({
+      issueId: labeledIssueId,
+      labelId,
+      companyId,
+      createdAt: labelAppliedAt,
+    });
+
+    const result = await needsJulius(db, companyId, OWNER);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      issueId: labeledIssueId,
+      reason: "labeled",
+      commentId: null,
+      snippet: null,
+    });
+  });
+
+  it("labeled-clears: issue auto-clears when Julius replies after label applied", async () => {
+    await seedCompanyAndAgent();
+
+    const labeledIssueId = randomUUID();
+    const labelId = randomUUID();
+    const labelAppliedAt = new Date("2026-06-20T10:00:00.000Z");
+
+    await db.insert(issues).values({
+      id: labeledIssueId,
+      companyId,
+      title: "Labeled but answered",
+      identifier: "SQN-21",
+      status: "todo",
+      priority: "low",
+      updatedAt: new Date("2026-06-19T08:00:00.000Z"),
+    });
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: "needs-julius",
+      color: "#ff0000",
+    });
+    await db.insert(issueLabels).values({
+      issueId: labeledIssueId,
+      labelId,
+      companyId,
+      createdAt: labelAppliedAt,
+    });
+    // Julius replies after the label was applied — should clear the item.
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId: labeledIssueId,
+      authorUserId: OWNER,
+      body: "On it.",
+      createdAt: new Date("2026-06-20T11:00:00.000Z"),
+    });
+
+    const result = await needsJulius(db, companyId, OWNER);
+    expect(result.some((r) => r.issueId === labeledIssueId)).toBe(false);
   });
 
   it("flags a blocked issue assigned to the owner", async () => {

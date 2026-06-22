@@ -9,12 +9,14 @@ const REASON_LABEL: Record<NeedsJuliusReason, string> = {
   mention: "Mention",
   parked: "Parked",
   blocked: "Blocked",
+  labeled: "Labeled",
 };
 
 const REASON_CLASS: Record<NeedsJuliusReason, string> = {
   mention: "bg-blue-500/15 text-blue-600 dark:text-blue-300",
   parked: "bg-amber-500/15 text-amber-600 dark:text-amber-300",
   blocked: "bg-red-500/15 text-red-600 dark:text-red-300",
+  labeled: "bg-purple-500/15 text-purple-600 dark:text-purple-300",
 };
 
 export function NeedsJuliusPanel({ companyId }: { companyId: string | null }) {
