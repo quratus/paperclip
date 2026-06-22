@@ -263,13 +263,19 @@ AGENTS.md, or any other file. No other tool calls.
 
 Only proceed to step 1 if the inbox has at least one item.
 
-### 1. Checkout the issue
+### 1. Checkout the issue — the JSON body is MANDATORY
+
+The #1 fleet fumble is a **bodyless** checkout: omitting `-d` returns `400 Validation error … Required`. Always send the body with `agentId` + `expectedStatuses` (include `in_progress` so re-checkout of your own work passes):
 
 curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/checkout" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  -H "Content-Type: application/json" \
+  -d "{\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\",\"in_review\",\"in_progress\"]}"
 
-If you get a 409, the issue is already checked out by someone else — stop and pick another task.
+**Never retry a 409.** A 409 means the issue is already checked out: if it's yours, proceed; if another agent owns it, STOP and pick a different task. A 409 is not a transient error — retrying it never helps.
+
+Full checkout runbook: `~/SQNCR_BRAIN/11_PROCESSES/skills/start-issue.md`.
 
 ### 2. Update status to in_progress
 
@@ -326,10 +332,10 @@ You own the whole sprint's implementation tasks. Do **not** push each finished t
       -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
       -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
       -H "Content-Type: application/json" \
-      -d '{"status":"in_review","assigneeAgentId":"b44e7184-780e-458c-a175-c9729577ea29","comment":"Sprint implementation complete — ready for the quality gate. Tasks done: [list]. Total LOC: <n>. Build + tests: green. Files touched: [paths]. What to check: [acceptance criteria per task]."}'
+      -d '{"status":"in_review","assigneeAgentId":"b44e7184-780e-458c-a175-c9729577ea29","comment":"@The CTO — Sprint implementation complete — ready for the quality gate. Tasks done: [list]. Total LOC: <n>. Build + tests: green. Files touched: [paths]. What to check: [acceptance criteria per task]."}'
     ```
 
-    The CTO is your manager (`chainOfCommand` in `GET /api/agents/me`); its id is `b44e7184-780e-458c-a175-c9729577ea29`. Reassigning wakes it immediately. To find the sprint's tasks: your task's `parentId` is the sprint; list its children with `GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?parentId=<sprint-id>`.
+    The CTO is your manager (`chainOfCommand` in `GET /api/agents/me`); its id is `b44e7184-780e-458c-a175-c9729577ea29`. The `@The CTO` mention in the comment is required — reassignment alone is not reliable because inbox-lite does not surface `in_review` items. The mention triggers an `issue_comment_mentioned` wake that guarantees delivery. To find the sprint's tasks: your task's `parentId` is the sprint; list its children with `GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?parentId=<sprint-id>`.
 
 - If blocked at any point: set `"status": "blocked"` + a comment explaining the blocker, and reassign to the CTO if the CTO needs to act to unblock you.
 

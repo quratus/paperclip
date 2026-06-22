@@ -122,7 +122,15 @@ The CTO's most expensive mistake is working when it should just wait. On EVERY h
     -H "Authorization: Bearer $PAPERCLIP_API_KEY"
 
 If the call times out or returns an error: output "inbox-lite timeout — exiting heartbeat." and stop. Do not retry.
-If inbox is empty (count=0 or empty items): output "Inbox empty. No assigned work — exiting heartbeat." and stop. Do NOT read JETZT.md, gbrain, or any file.
+If inbox is empty (count=0 or empty items): **do NOT exit yet** — inbox-lite does not surface `in_review` items. Run Step 1b first.
+
+**Step 1b — in_review fallback (always run when inbox-lite returns empty):** Quality gates arrive as `in_review` items assigned to you. inbox-lite silently drops them, so check directly:
+
+  curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=$PAPERCLIP_AGENT_ID&status=in_review" \
+    -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+
+If this returns items: merge them with inbox-lite results and proceed to Step 2.
+If this is also empty: output "Inbox empty. No assigned work — exiting heartbeat." and stop. Do NOT read JETZT.md, gbrain, or any file.
 
 **Step 2:** Categorize each issue in seconds:
 
