@@ -39,6 +39,7 @@ import {
   heartbeatService,
   issueApprovalService,
   issueService,
+  needsJulius,
   logActivity,
   secretService,
   syncInstructionsBundleConfigFromFilePath,
@@ -1114,6 +1115,21 @@ export function agentRoutes(db: Db) {
         activeRun: issue.activeRun,
       })),
     );
+  });
+
+  router.get("/agents/me/needs-julius", async (req, res) => {
+    if (req.actor.type !== "board" || !req.actor.userId) {
+      res.status(401).json({ error: "Board authentication required" });
+      return;
+    }
+    const companyId = typeof req.query.companyId === "string" ? req.query.companyId.trim() : "";
+    if (!companyId) {
+      res.status(400).json({ error: "companyId query parameter is required" });
+      return;
+    }
+    assertCompanyAccess(req, companyId);
+    const items = await needsJulius(db, companyId, req.actor.userId);
+    res.json(items);
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {

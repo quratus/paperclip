@@ -21,6 +21,7 @@ import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
 import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
+import { NeedsJuliusPanel } from "../components/NeedsJuliusPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, WorkflowSuccessChart, WorkflowQuadrantChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
 import type { Agent, Issue } from "@paperclipai/shared";
@@ -207,6 +208,8 @@ export function Dashboard() {
       )}
 
       <ActiveAgentsPanel companyId={selectedCompanyId!} />
+
+      <NeedsJuliusPanel companyId={selectedCompanyId} />
 
       {data && (
         <>
