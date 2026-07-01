@@ -656,7 +656,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues).toHaveLength(1);
   });
 
-  it("fails the run and cleans up the execution issue when wakeup queueing fails", async () => {
+  it("preserves the execution issue and marks run issue_created when wakeup queueing fails", async () => {
     const { routine, svc } = await seedFixture({
       wakeup: async () => {
         throw new Error("queue unavailable");
@@ -665,16 +665,15 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     const run = await svc.runRoutine(routine.id, { source: "manual" });
 
-    expect(run.status).toBe("failed");
-    expect(run.failureReason).toContain("queue unavailable");
-    expect(run.linkedIssueId).toBeNull();
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).toBeTruthy();
 
     const routineIssues = await db
       .select({ id: issues.id })
       .from(issues)
       .where(eq(issues.originId, routine.id));
 
-    expect(routineIssues).toHaveLength(0);
+    expect(routineIssues).toHaveLength(1);
   });
 
   it("accepts standard second-precision webhook timestamps for HMAC triggers", async () => {

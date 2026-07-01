@@ -640,6 +640,27 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  // Finds any open routine execution issue for the given routine, even without an
+  // active heartbeat run. Used as a fallback when the unique constraint fires but
+  // the agent was not invokable at dispatch time (so the issue has no heartbeat run).
+  async function findOrphanedExecutionIssue(routine: typeof routines.$inferSelect, executor: Db = db) {
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, "routine_execution"),
+          eq(issues.originId, routine.id),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -801,7 +822,9 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb);
+          const existingIssue =
+            await findLiveExecutionIssue(input.routine, txDb) ??
+            await findOrphanedExecutionIssue(input.routine, txDb);
           if (!existingIssue) throw error;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           const updated = await finalizeRun(createdRun.id, {
@@ -829,7 +852,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
           mutation: "create",
           contextSource: "routine.dispatch",
           requestedByActorType: input.source === "schedule" ? "system" : undefined,
-          rethrowOnError: true,
+          rethrowOnError: false,
         });
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
