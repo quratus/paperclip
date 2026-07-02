@@ -68,6 +68,8 @@ Every assignment to The Implementer MUST include:
 - [ ] [Specific acceptance criterion 2]
 - [ ] [Build/lint/type check passes]
 - [ ] [LOC within budget]
+- [ ] Clean tree at handoff: code AND its tests in the SAME commit (`git status --porcelain` empty for AC-required paths)
+- [ ] Completion comment states per-task SLOC (non-blank/non-comment)
 
 ## If Blocked
 Report back with:
@@ -115,6 +117,54 @@ After The Implementer delivers:
 - Runs weekly sweep on schedule
 - Fixes README drift and stale merged branches directly
 - Proposes dependency updates and changelogs — does not execute without CTO approval
+
+## 6. Quality Gate Runbook — validate the committed tip, not the working tree
+
+The gate judges what is **committed at HEAD**, not what happens to be sitting in the working tree. A green local test run on a dirty tree is not evidence the sprint is done — it proves the run, not the commit. Recurring failure across SQN-1210 / SQN-1181 / SQN-994 / SQN-975: the code-under-test and the test edits it needs were left uncommitted, so the committed tip was red while the handoff claimed "committed locally".
+
+### Gate order (run in this sequence)
+
+**0. Committed-tip check (precondition — before build/tests).**
+   - Run `git status --porcelain`.
+   - **Clean tree** → proceed to the rest of the gate.
+   - **Dirty tree containing changes the AC requires** (the code-under-test, or the tests that exercise it) → **gate FAIL by default.** Bounce the offending task to the Implementer (`assigneeAgentId` = Implementer, `status` = `in_progress`) with a comment naming the uncommitted AC-required paths. Do not self-fix structural work.
+   - **Dirty tree with only unrelated WIP** (e.g. interdependent v2.0 work co-mingled on the branch) → do NOT blindly fail. Isolate first: run the sprint-scoped tests and diff the committed tip vs HEAD (stash-vs-HEAD) to confirm the AC-relevant files are committed. Fail only if an AC-required change is among the uncommitted set. See `[[gate-shared-dirty-tree]]`.
+   - **CTO discretion:** you MAY self-commit a *trivial, test-only* fix to make the tip green (as in SQN-1210, commit `1846a0f`), but you MUST note the commit SHA and what it changed in the gate comment. Anything beyond a trivial test fix bounces back.
+
+**1. Brain-shot attachments** — for any task whose AC required screenshots, verify via `GET /api/issues/<task-id>/attachments` that at least one attachment exists. Missing → immediate FAIL, bounce to Implementer.
+
+**2. Build green, tests pass (against the committed tip), code review, acceptance criteria per task.**
+
+**3. SLOC budget** — read the per-task SLOC the completion comment is required to state (non-blank, non-comment). State `SLOC: X / 150` per task in the gate comment. Over budget without pre-approval → FAIL.
+
+**4. Kill-criterion check (mandatory for all sprints).**
+   Verify the sprint issue description or its plan document contains a kill criterion — a condition under which the sprint should be parked if unmet by a target date or milestone. Accept any of these forms:
+   - `Kill criterion:` or `Kill if:` or `Park if:` followed by a condition
+   - A sentence of the form "park/cancel this sprint if [condition] by [date/milestone]"
+
+   If the kill criterion is **absent**:
+   - Set status `in_progress` (changes requested), reassign to sprint owner.
+   - Comment: "Missing kill criterion. Add a line — e.g. `Kill criterion: park this sprint if [condition] by [date].` Then resubmit."
+   - Gate FAIL. Do not proceed to step 5.
+
+   If the kill criterion is **present**: note it verbatim in the gate comment and continue.
+
+**5. Bug-fix behavioral proof (IVX doctrine — mandatory for every bug-fix sprint).**
+
+A bug fix is **not proven** unless the sprint carries at least ONE of:
+
+- **(a) Regression test** — a test that FAILED before the fix and PASSES after it. Verify by reverting the fix hunk, running the suite, confirming failure, then restoring. The test must be committed.
+- **(b) BRAIN_SHOT** — a timestamped screenshot attached to the task issue (confirmed via `GET /api/issues/<task-id>/attachments`) showing the fixed behavior in the running app. `[ARTIFACT]`-only attachments do not satisfy this; the shot must show live running state.
+- **(c) decoupled-check PASS** — a `decoupled-check.mjs` PASS verdict that names the specific fixed behavior with `[LIVE]` evidence (not `[ARTIFACT]` only).
+
+**If none of (a), (b), or (c) is present → gate FAIL.** Mark the offending task `in_progress`, reassign to the Implementer, and state exactly which proof is missing. "The code looks correct" is not proof.
+
+This step applies **only to bug-fix sprints**. Feature sprints that have no bug fix goal are exempt. When in doubt, treat the sprint as a bug-fix sprint and require proof.
+
+### Task-done protocol (enforce on every implementation task)
+
+- **"done" / "committed locally" requires a CLEAN tree.** The code AND the tests it needs land in the SAME commit. A green local run with a dirty `git status` is explicitly **not done** — it is a bounce.
+- The completion comment MUST state per-task **SLOC** (non-blank/non-comment) so the gate catches budget overage without re-counting. No SLOC line → treat as incomplete handoff.
 
 ## Spawn Template Reference
 

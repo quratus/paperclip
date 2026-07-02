@@ -79,6 +79,8 @@ The `knowledge-tree` plugin exposes these tools to you via Paperclip:
 
 ## Rules
 
+- Before any strategic/planning/decomposition work, read `00_CORE/COMPANY_STATE.md` (single source of truth) via `gbrain get_page 00_core/company_state`. If two surfaces disagree, COMPANY_STATE + the Paperclip board win.
+- Org structure = the Julius+Costa 50/50 fusion agreement in `00_CORE/ORG_MANIFEST.md` (`gbrain get_page 00_core/org_manifest`; ratified verbal 2026-07-02, term sheet pending). Enforce lane discipline (§3: product/platform = us, GTM/sales/marketing/funding = Costa). §7 (cap-table, top-level CEO/CTO split, anchor-creator equity, coach pricing) is OPEN — escalate, never decide.
 - Do not deploy to production or push to git without Julius's explicit approval.
 - Do not merge PRs — review and create PRs. Julius approves merges.
 - Do not use em dashes.
@@ -86,7 +88,7 @@ The `knowledge-tree` plugin exposes these tools to you via Paperclip:
 - Verify before claiming complete. Partial evidence: say so.
 - Read active plans from `/Users/JuliusHalm 1/workspace/brain-platform/plans/` before starting any task.
 - Check current Neo4j state via query_graph before making schema recommendations.
-- When breaking work into sprints/issues, use the `sqncr-sprint-planning` skill — it carries the guardrails (vertical value-slices; sprints ≤3 tasks / <400 LOC; tasks ≤150 LOC; one agent per sprint; no integration sprints; quality gate per sprint; acceptance criteria on every issue; `parentId`+`goalId`; blocker chains). It wraps `plan-to-paperclip` for the mechanical plan→issues conversion. Never open a sprint that fails the guardrails.
+- When breaking work into sprints/issues, use the `sqncr-sprint-planning` skill — it carries the guardrails (vertical value-slices; sprints ≤3 tasks / <400 LOC; tasks ≤150 LOC; one agent per sprint; no integration sprints; quality gate per sprint; acceptance criteria on every issue; `parentId`+`goalId`; blocker chains; **kill criterion required: every sprint must state a condition under which it will be parked, e.g. `Kill criterion: park if [condition] by [date]`**). It wraps `plan-to-paperclip` for the mechanical plan→issues conversion. Never open a sprint that fails the guardrails.
 
 ## Brain Search (gbrain MCP)
 
@@ -188,6 +190,11 @@ Read the issue description, plan document, and ALL child issues before acting.
   1. **Committed-tip check first** — the gate judges HEAD, not the working tree. Run `git status --porcelain`. A dirty tree containing changes the AC requires (code-under-test or its tests left uncommitted) is a gate FAIL by default — bounce the task to the Implementer with `status: in_progress`, naming the uncommitted paths. Unrelated WIP (e.g. v2.0) is isolated, not blindly failed (stash-vs-HEAD; see [[gate-shared-dirty-tree]]). CTO may self-commit a *trivial test-only* fix to green the tip but MUST note the SHA in the gate comment. A green local run on a dirty tree is NOT "done".
   2. **Brain-shot attachments** — for any task whose AC required screenshots, verify via `GET $PAPERCLIP_API_URL/api/issues/<task-id>/attachments` that at least one attachment exists. Do NOT check on-disk `handoffs/shots/` as the primary check; the canonical artifact is the Paperclip issue attachment. If a required attachment is missing, the gate fails immediately — reassign to the Implementer with `status: in_progress`.
   3. Build green, tests pass (against the committed tip), code review, SLOC budget (read the per-task SLOC the completion comment is required to state — non-blank non-comment lines; state "SLOC: X / 150" per task in the gate comment), acceptance criteria per task.
+  4. **Bug-fix proof (IVX doctrine — mandatory for all bug-fix sprints):** A bug fix is NOT proven unless it carries at least ONE of:
+     - (a) A regression test that FAILED before the fix and PASSES after it — verify by reverting the fix hunk, running the test suite, confirming failure, then restoring.
+     - (b) A timestamped BRAIN_SHOT attached to the task issue (confirmed via `GET .../issues/<id>/attachments`) showing the fixed behavior in the running app.
+     - (c) A `decoupled-check.mjs` PASS verdict that names the specific fixed behavior with `[LIVE]` evidence (not `[ARTIFACT]` only).
+     Without at least one of (a), (b), or (c), the gate MUST reject the sprint as unproven — mark the offending task `in_progress`, reassign to Implementer, state exactly which proof is missing. "The code looks correct" is not proof. See [[ivx-doctrine]].
 - If Quality Gate passes: mark the gate `done`, update the sprint to \"done\", unblock the next sprint.
 - If Quality Gate fails: comment the specific problems, and **reassign the offending task back to the Implementer** (`assigneeAgentId` = Implementer, `status` = `in_progress`) so it's woken to fix — don't just leave it. Reset the sprint to \"in_progress\".
 
