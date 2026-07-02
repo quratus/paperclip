@@ -8,6 +8,8 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  goals,
+  heartbeatRuns,
   instanceSettings,
   issueComments,
   issueInboxArchives,
@@ -1180,5 +1182,201 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       assigneeAgentId,
       childIssueIds: [childA, childB],
     });
+  });
+});
+
+describeEmbeddedPostgres("issueService stale-lock recovery", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-stale-lock-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("allows checkout when executionLockedAt is older than 2h even if the run is still running", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const orphanRunId = randomUUID();
+    const newRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      { id: orphanRunId, companyId, agentId, status: "running" },
+      { id: newRunId, companyId, agentId, status: "running" },
+    ]);
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Orphan-locked issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: orphanRunId,
+      executionRunId: orphanRunId,
+    });
+    // Backdate the lock so the TTL (2h) is exceeded
+    await db.execute(
+      sql`update issues set execution_locked_at = now() - interval '3 hours' where id = ${issueId}`,
+    );
+
+    const result = await svc.checkout(issueId, agentId, ["in_progress"], newRunId);
+    expect(result).not.toBeNull();
+    expect(result!.checkoutRunId).toBe(newRunId);
+    expect(result!.executionRunId).toBe(newRunId);
+  });
+
+  it("clears all lock fields when forceReleaseLock is called", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const lockRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: lockRunId, companyId, agentId, status: "running" });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Locked issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: lockRunId,
+      executionRunId: lockRunId,
+      executionAgentNameKey: "test-agent",
+      executionLockedAt: new Date(),
+    });
+
+    const released = await svc.forceReleaseLock(issueId);
+    expect(released).not.toBeNull();
+    expect(released!.checkoutRunId).toBeNull();
+    expect(released!.executionRunId).toBeNull();
+    expect(released!.executionLockedAt).toBeNull();
+    expect(released!.executionAgentNameKey).toBeNull();
+  });
+});
+
+describeEmbeddedPostgres("issueService.list goalId filter", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-goalid-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(goals);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("returns only issues belonging to the specified goalId — no cross-goal leakage", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "GoalFilterCo",
+      issuePrefix: `GF${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const goalA = randomUUID();
+    const goalB = randomUUID();
+    await db.insert(goals).values([
+      { id: goalA, companyId, title: "Goal A", level: "objective", status: "active" },
+      { id: goalB, companyId, title: "Goal B", level: "objective", status: "active" },
+    ]);
+
+    const issueOnA1 = randomUUID();
+    const issueOnA2 = randomUUID();
+    const issueOnB = randomUUID();
+    const issueNoGoal = randomUUID();
+    await db.insert(issues).values([
+      { id: issueOnA1, companyId, title: "A-issue-1", status: "todo", priority: "medium", goalId: goalA },
+      { id: issueOnA2, companyId, title: "A-issue-2", status: "done", priority: "low", goalId: goalA },
+      { id: issueOnB, companyId, title: "B-issue", status: "blocked", priority: "high", goalId: goalB },
+      { id: issueNoGoal, companyId, title: "No-goal issue", status: "todo", priority: "medium" },
+    ]);
+
+    const result = await svc.list(companyId, { goalId: goalA });
+    const ids = result.map((i) => i.id);
+
+    expect(ids).toContain(issueOnA1);
+    expect(ids).toContain(issueOnA2);
+    expect(ids).not.toContain(issueOnB);
+    expect(ids).not.toContain(issueNoGoal);
   });
 });

@@ -78,6 +78,7 @@ export interface IssueFilters {
   projectId?: string;
   executionWorkspaceId?: string;
   parentId?: string;
+  goalId?: string;
   labelId?: string;
   originKind?: string;
   originId?: string;
@@ -968,6 +969,7 @@ export function issueService(db: Db) {
         conditions.push(eq(issues.executionWorkspaceId, filters.executionWorkspaceId));
       }
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
+      if (filters?.goalId) conditions.push(eq(issues.goalId, filters.goalId));
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
       if (filters?.labelId) {
@@ -1755,34 +1757,55 @@ export function issueService(db: Db) {
 
       const now = new Date();
 
-      // Fix C: staleness detection — if executionRunId references a run that is no
-      // longer queued or running, clear it before applying the execution lock condition
-      // so a dead lock can't produce a spurious 409.
-      // Wrapped in a transaction with SELECT FOR UPDATE to make the read + clear atomic,
-      // matching the existing pattern in enqueueWakeup().
+      // Fix C: staleness detection — clear stale execution+checkout locks before
+      // applying the execution lock condition so a dead lock can't produce a spurious 409.
+      // Two eviction criteria: (1) the lock run is terminal/missing, or (2) the lock is
+      // older than LOCK_TTL_MS (covers orphan runs still recorded as "running" in the DB).
+      const LOCK_TTL_MS = 2 * 60 * 60 * 1000; // 2h
       await db.transaction(async (tx) => {
         await tx.execute(
           sql`select id from issues where id = ${id} for update`,
         );
         const preCheckRow = await tx
-          .select({ executionRunId: issues.executionRunId })
+          .select({
+            executionRunId: issues.executionRunId,
+            checkoutRunId: issues.checkoutRunId,
+            executionLockedAt: issues.executionLockedAt,
+          })
           .from(issues)
           .where(eq(issues.id, id))
           .then((rows) => rows[0] ?? null);
-        if (!preCheckRow?.executionRunId) return;
-        const lockRun = await tx
-          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, preCheckRow.executionRunId))
-          .then((rows) => rows[0] ?? null);
-        if (!lockRun || (lockRun.status !== "queued" && lockRun.status !== "running")) {
+        if (!preCheckRow?.executionRunId && !preCheckRow?.checkoutRunId) return;
+
+        const lockRun = preCheckRow.executionRunId
+          ? await tx
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, preCheckRow.executionRunId))
+              .then((rows) => rows[0] ?? null)
+          : null;
+
+        const isTerminated = !lockRun || (lockRun.status !== "queued" && lockRun.status !== "running");
+        const isExpired =
+          preCheckRow.executionLockedAt != null &&
+          now.getTime() - preCheckRow.executionLockedAt.getTime() > LOCK_TTL_MS;
+
+        if (isTerminated || isExpired) {
           await tx
             .update(issues)
-            .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: now })
+            .set({
+              executionRunId: null,
+              checkoutRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: now,
+            })
             .where(
               and(
                 eq(issues.id, id),
-                eq(issues.executionRunId, preCheckRow.executionRunId),
+                preCheckRow.executionRunId
+                  ? eq(issues.executionRunId, preCheckRow.executionRunId)
+                  : isNull(issues.executionRunId),
               ),
             );
         }
@@ -1994,6 +2017,24 @@ export function issueService(db: Db) {
           status: "todo",
           assigneeAgentId: null,
           checkoutRunId: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) return null;
+      const [enriched] = await withIssueLabels(db, [updated]);
+      return enriched;
+    },
+
+    forceReleaseLock: async (id: string) => {
+      const updated = await db
+        .update(issues)
+        .set({
+          executionRunId: null,
+          checkoutRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
           updatedAt: new Date(),
         })
         .where(eq(issues.id, id))

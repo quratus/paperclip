@@ -586,6 +586,7 @@ export function issueRoutes(
       projectId: req.query.projectId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
       parentId: req.query.parentId as string | undefined,
+      goalId: req.query.goalId as string | undefined,
       labelId: req.query.labelId as string | undefined,
       originKind: req.query.originKind as string | undefined,
       originId: req.query.originId as string | undefined,
@@ -2017,6 +2018,37 @@ export function issueRoutes(
       entityId: released.id,
     });
 
+    res.json(released);
+  });
+
+  router.post("/issues/:id/force-release", async (req, res) => {
+    if (req.actor.type !== "board") {
+      res.status(403).json({ error: "Board users only" });
+      return;
+    }
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const released = await svc.forceReleaseLock(id);
+    if (!released) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: released.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.force_lock_released",
+      entityType: "issue",
+      entityId: released.id,
+    });
     res.json(released);
   });
 
