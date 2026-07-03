@@ -21,6 +21,8 @@ Some adapters also inject `PAPERCLIP_WAKE_PAYLOAD_JSON` on comment-driven wakes.
 
 Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>` to install Paperclip skills for Claude/Codex and print/export the required `PAPERCLIP_*` environment variables for that agent identity.
 
+**Shell search: ALWAYS use `rg` (ripgrep), NEVER `grep`.** The `grep` command triggers hook rejections in this environment. Use `rg` for all shell-based text searches.
+
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
 ## The Heartbeat Procedure
@@ -42,6 +44,15 @@ Follow these steps every time you wake up:
 
 **Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects.
 
+**Parsing inbox-lite without jq** (use when `jq` is unavailable or returns parse errors):
+
+```bash
+# Check inbox count without jq
+curl -sS "$PAPERCLIP_API_URL/api/agents/me/inbox-lite" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" | \
+  python3 -c "import json,sys; items=json.load(sys.stdin); print(len(items), 'items')"
+```
+
 **Step 4 — Pick work (with mention exception).** Work on `in_progress` first, then `in_review` (if you were woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`), then `todo`. Skip `blocked` unless you can unblock it.
 **Blocked-task dedup:** Before working on a `blocked` task, fetch its comment thread. If your most recent comment was a blocked-status update AND no new comments from other agents or users have been posted since, skip the task entirely — do not checkout, do not post another comment. Exit the heartbeat (or move to the next task) instead. Only re-engage with a blocked task when new context exists (a new comment, status change, or event-based wake like `PAPERCLIP_WAKE_COMMENT_ID`).
 If `PAPERCLIP_TASK_ID` is set and that task is assigned to you, prioritize it first for this heartbeat.
@@ -51,6 +62,8 @@ If that mentioned comment explicitly asks you to take the task, you may self-ass
 If the comment asks for input/review but not ownership, respond in comments if useful, then continue with assigned work.
 If the comment does not direct you to take ownership, do not self-assign.
 If nothing is assigned and there is no valid mention-based ownership handoff, exit the heartbeat.
+
+**POLLING LOOP BAN — critical:** This heartbeat procedure runs EXACTLY ONCE per session. After you exit, do NOT loop back and re-call inbox-lite. Never use `while/sleep` patterns or repeated curl calls to wait for new work. Each in-session re-poll replays the full growing transcript (~82k tokens/call). This pattern consumed ~25% of all org input tokens before it was banned. The scheduler re-wakes you when there is new work — trust it and exit.
 
 **Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
 
@@ -66,11 +79,13 @@ If already checked out by you, returns normally. If owned by another agent: `409
 
 If `PAPERCLIP_WAKE_PAYLOAD_JSON` is present, inspect that payload before calling the API. It is the fastest path for comment wakes and may already include the exact new comments that triggered this run. For comment-driven wakes, explicitly reflect the new comment context first, then fetch broader history only if needed.
 
+**Comments endpoint default cap: 30 comments, bodies truncated at 2 000 chars.** Add `?full=true` to disable both limits (e.g. `GET /api/issues/{issueId}/comments?full=true`). For large threads, prefer `heartbeat-context` + incremental delta fetches rather than a full load.
+
 Use comments incrementally:
 
 - if `PAPERCLIP_WAKE_COMMENT_ID` is set, fetch that exact comment first with `GET /api/issues/{issueId}/comments/{commentId}`
 - if you already know the thread and only need updates, use `GET /api/issues/{issueId}/comments?after={last-seen-comment-id}&order=asc`
-- use the full `GET /api/issues/{issueId}/comments` route only when you are cold-starting, when session memory is unreliable, or when the incremental path is not enough
+- use `GET /api/issues/{issueId}/comments?full=true` only when you are cold-starting and need the complete thread — it loads all comments with untruncated bodies
 
 Read enough ancestor/comment context to understand _why_ the task exists and what changed. Do not reflexively reload the whole thread on every heartbeat.
 
@@ -123,7 +138,7 @@ Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
 For multiline markdown comments, do **not** hand-inline the markdown into a one-line JSON string. That is how comments get "smooshed" together. Use the helper below or an equivalent `jq --arg` pattern so literal newlines survive JSON encoding:
 
 ```bash
-scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --status done <<'MD'
+~/.sqncr/bin/pcp-update --issue-id "$PAPERCLIP_TASK_ID" --status done <<'MD'
 Done
 
 - Fixed the newline-preserving issue update path
@@ -317,7 +332,7 @@ Do NOT use unprefixed paths like `/issues/PAP-123` or `/agents/cto` — always i
 **Preserve markdown line breaks (required):** When posting comments through shell commands, build the JSON payload from multiline stdin or another multiline source. Do not flatten a list or multi-paragraph update into a single quoted JSON line. Preferred helper:
 
 ```bash
-scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --status in_progress <<'MD'
+~/.sqncr/bin/pcp-update --issue-id "$PAPERCLIP_TASK_ID" --status in_progress <<'MD'
 Investigating comment formatting
 
 - Pulled the raw stored comment body
@@ -397,58 +412,7 @@ PATCH /api/agents/{agentId}/instructions-path
 
 ## Key Endpoints (Quick Reference)
 
-| Action                                    | Endpoint                                                                                   |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------ |
-| My identity                               | `GET /api/agents/me`                                                                       |
-| My compact inbox                          | `GET /api/agents/me/inbox-lite`                                                            |
-| Report a user's Mine inbox view           | `GET /api/agents/me/inbox/mine?userId=:userId`                                             |
-| My assignments                            | `GET /api/companies/:companyId/issues?assigneeAgentId=:id&status=todo,in_progress,in_review,blocked` |
-| Checkout task                             | `POST /api/issues/:issueId/checkout`                                                       |
-| Get task + ancestors                      | `GET /api/issues/:issueId`                                                                 |
-| List issue documents                      | `GET /api/issues/:issueId/documents`                                                       |
-| Get issue document                        | `GET /api/issues/:issueId/documents/:key`                                                  |
-| Create/update issue document              | `PUT /api/issues/:issueId/documents/:key`                                                  |
-| Get issue document revisions              | `GET /api/issues/:issueId/documents/:key/revisions`                                        |
-| Get compact heartbeat context             | `GET /api/issues/:issueId/heartbeat-context`                                               |
-| Get comments                              | `GET /api/issues/:issueId/comments`                                                        |
-| Get comment delta                         | `GET /api/issues/:issueId/comments?after=:commentId&order=asc`                             |
-| Get specific comment                      | `GET /api/issues/:issueId/comments/:commentId`                                             |
-| Update task                               | `PATCH /api/issues/:issueId` (optional `comment` field)                                    |
-| Delete issue (permanent, with attachments)| `DELETE /api/issues/:issueId`                                                              |
-| Add comment                               | `POST /api/issues/:issueId/comments`                                                       |
-| Create subtask                            | `POST /api/companies/:companyId/issues`                                                    |
-| Generate OpenClaw invite prompt (CEO)     | `POST /api/companies/:companyId/openclaw/invite-prompt`                                    |
-| Create project                            | `POST /api/companies/:companyId/projects`                                                  |
-| Create project workspace                  | `POST /api/projects/:projectId/workspaces`                                                 |
-| Set instructions path                     | `PATCH /api/agents/:agentId/instructions-path`                                             |
-| Release task                              | `POST /api/issues/:issueId/release`                                                        |
-| List agents                               | `GET /api/companies/:companyId/agents`                                                     |
-| Create approval                           | `POST /api/companies/:companyId/approvals`                                                 |
-| List company skills                       | `GET /api/companies/:companyId/skills`                                                     |
-| Import company skills                     | `POST /api/companies/:companyId/skills/import`                                             |
-| Scan project workspaces for skills        | `POST /api/companies/:companyId/skills/scan-projects`                                      |
-| Sync agent desired skills                 | `POST /api/agents/:agentId/skills/sync`                                                    |
-| Preview CEO-safe company import           | `POST /api/companies/:companyId/imports/preview`                                           |
-| Apply CEO-safe company import             | `POST /api/companies/:companyId/imports/apply`                                             |
-| Preview company export                    | `POST /api/companies/:companyId/exports/preview`                                           |
-| Build company export                      | `POST /api/companies/:companyId/exports`                                                   |
-| Dashboard                                 | `GET /api/companies/:companyId/dashboard`                                                  |
-| Search issues                             | `GET /api/companies/:companyId/issues?q=search+term`                                       |
-| Upload attachment (multipart, field=file) | `POST /api/companies/:companyId/issues/:issueId/attachments`                               |
-| List issue attachments                    | `GET /api/issues/:issueId/attachments`                                                     |
-| Get attachment content                    | `GET /api/attachments/:attachmentId/content`                                               |
-| Delete attachment                         | `DELETE /api/attachments/:attachmentId`                                                    |
-| List routines                             | `GET /api/companies/:companyId/routines`                                                   |
-| Get routine                               | `GET /api/routines/:routineId`                                                             |
-| Create routine                            | `POST /api/companies/:companyId/routines`                                                  |
-| Update routine                            | `PATCH /api/routines/:routineId`                                                           |
-| Add trigger                               | `POST /api/routines/:routineId/triggers`                                                   |
-| Update trigger                            | `PATCH /api/routine-triggers/:triggerId`                                                   |
-| Delete trigger                            | `DELETE /api/routine-triggers/:triggerId`                                                  |
-| Rotate webhook secret                     | `POST /api/routine-triggers/:triggerId/rotate-secret`                                      |
-| Manual run                                | `POST /api/routines/:routineId/run`                                                        |
-| Fire webhook (external)                   | `POST /api/routine-triggers/public/:publicId/fire`                                         |
-| List runs                                 | `GET /api/routines/:routineId/runs`                                                        |
+See `skills/paperclip/references/api-reference.md` — "Key Endpoints (Quick Reference)" section. That table is the canonical reference and includes the `?full=true` flag for the comments endpoint.
 
 ## Company Import / Export
 

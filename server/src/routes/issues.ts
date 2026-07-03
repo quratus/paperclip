@@ -65,6 +65,8 @@ import {
 import { emitAnalyticsEvent } from "../services/agent-analytics.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+const DEFAULT_COMMENT_LIMIT = 30;
+const COMMENT_BODY_TRUNCATE_AT = 2000;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -2070,6 +2072,7 @@ export function issueRoutes(
       typeof req.query.order === "string" && req.query.order.trim().toLowerCase() === "asc"
         ? "asc"
         : "desc";
+    const full = req.query.full === "true" || req.query.full === "1";
     const limitRaw =
       typeof req.query.limit === "string" && req.query.limit.trim().length > 0
         ? Number(req.query.limit)
@@ -2077,13 +2080,22 @@ export function issueRoutes(
     const limit =
       limitRaw && Number.isFinite(limitRaw) && limitRaw > 0
         ? Math.min(Math.floor(limitRaw), MAX_ISSUE_COMMENT_LIMIT)
-        : null;
+        : full
+          ? null
+          : DEFAULT_COMMENT_LIMIT;
     const comments = await svc.listComments(id, {
       afterCommentId,
       order,
       limit,
     });
-    res.json(comments);
+    const result = full
+      ? comments
+      : comments.map((c) =>
+          typeof c.body === "string" && c.body.length > COMMENT_BODY_TRUNCATE_AT
+            ? { ...c, body: c.body.slice(0, COMMENT_BODY_TRUNCATE_AT) + "…" }
+            : c,
+        );
+    res.json(result);
   });
 
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
