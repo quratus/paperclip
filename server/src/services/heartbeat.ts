@@ -4685,6 +4685,7 @@ export function heartbeatService(db: Db) {
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let idleSkipped = 0;
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
@@ -4695,6 +4696,41 @@ export function heartbeatService(db: Db) {
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+
+        const DEEP_PATROL_MS = 15 * 60 * 1000;
+        if (elapsedMs < DEEP_PATROL_MS) {
+          const lastSeen = agent.lastHeartbeatAt ?? new Date(0);
+          const [openWork] = await db
+            .select({ count: sql<number>`count(*)` })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.assigneeAgentId, agent.id),
+                inArray(issues.status, ["todo", "in_progress", "blocked", "in_review"]),
+                isNull(issues.completedAt),
+                isNull(issues.cancelledAt),
+                isNull(issues.hiddenAt),
+              ),
+            );
+          if (Number(openWork?.count ?? 0) === 0) {
+            const [newComments] = await db
+              .select({ count: sql<number>`count(*)` })
+              .from(issueComments)
+              .innerJoin(issues, eq(issues.id, issueComments.issueId))
+              .where(
+                and(
+                  eq(issues.assigneeAgentId, agent.id),
+                  gt(issueComments.createdAt, lastSeen),
+                  sql`${issueComments.authorAgentId} IS DISTINCT FROM ${agent.id}`,
+                ),
+              );
+            if (Number(newComments?.count ?? 0) === 0) {
+              await db.update(agents).set({ lastHeartbeatAt: now }).where(eq(agents.id, agent.id));
+              idleSkipped += 1;
+              continue;
+            }
+          }
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -4712,7 +4748,7 @@ export function heartbeatService(db: Db) {
         else skipped += 1;
       }
 
-      return { checked, enqueued, skipped };
+      return { checked, enqueued, skipped, idleSkipped };
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
