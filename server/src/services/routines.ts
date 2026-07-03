@@ -1051,6 +1051,24 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       await assertAssignableAgent(companyId, input.assigneeAgentId ?? null);
       if (input.goalId) await assertGoal(companyId, input.goalId);
       if (input.parentIssueId) await assertParentIssue(companyId, input.parentIssueId);
+      if (input.assigneeAgentId) {
+        const dup = await db
+          .select({ id: routines.id })
+          .from(routines)
+          .where(
+            and(
+              eq(routines.companyId, companyId),
+              eq(routines.assigneeAgentId, input.assigneeAgentId),
+              eq(routines.title, input.title),
+              ne(routines.status, "archived"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (dup) {
+          throw conflict("A routine with this title already exists for this agent", { existingRoutineId: dup.id });
+        }
+      }
       const variables = syncRoutineVariablesWithTemplate(
         [input.title, input.description],
         sanitizeRoutineVariableInputs(input.variables),

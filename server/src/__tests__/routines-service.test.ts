@@ -778,4 +778,53 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.source).toBe("webhook");
     expect(run.status).toBe("issue_created");
   });
+
+  it("rejects duplicate creation when same assigneeAgentId+title exists and is not archived", async () => {
+    const { companyId, agentId, svc, routine } = await seedFixture();
+
+    await expect(
+      svc.create(
+        companyId,
+        {
+          projectId: null,
+          goalId: null,
+          parentIssueId: null,
+          title: routine.title,
+          description: null,
+          assigneeAgentId: agentId,
+          priority: "medium",
+          status: "paused",
+          concurrencyPolicy: "coalesce_if_active",
+          catchUpPolicy: "skip_missed",
+        },
+        {},
+      ),
+    ).rejects.toMatchObject({ status: 409, message: expect.stringContaining("already exists") });
+  });
+
+  it("allows creation when an archived routine has the same assigneeAgentId+title", async () => {
+    const { companyId, agentId, svc, routine } = await seedFixture();
+
+    await svc.update(routine.id, { status: "archived" }, {});
+
+    const created = await svc.create(
+      companyId,
+      {
+        projectId: null,
+        goalId: null,
+        parentIssueId: null,
+        title: routine.title,
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "paused",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    expect(created.id).not.toBe(routine.id);
+    expect(created.title).toBe(routine.title);
+  });
 });
