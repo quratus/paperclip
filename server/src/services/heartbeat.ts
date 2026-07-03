@@ -96,6 +96,7 @@ import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
+  ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureRuntimeServicesForRun,
   formatManagedGitWorktreeBranchInspection,
@@ -1200,7 +1201,7 @@ function fingerprintFinalizeWorkspaceBranchValidation(input: {
   const digest = createHash("sha256")
     .update(stableStringifyForFingerprint({
       version: 1,
-      reason: "git_worktree_branch_mismatch_after_run",
+      reason: "git_worktree_branch_incoherence",
       issueId: input.issueId,
       executionWorkspaceId: input.executionWorkspaceId,
       worktreePath: input.inspection.worktreePath ? path.resolve(input.inspection.worktreePath) : null,
@@ -10796,15 +10797,84 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ) => {
         if (adapterFinalizeOutcome) return;
         let finalizeBranchMetadata: Record<string, unknown> | null = null;
+        let finalizeBranchRepairMetadata: Record<string, unknown> | null = null;
         if (status === "succeeded") {
           const branchInspection = await inspectFinalizeWorkspaceBranch();
           if (branchInspection) {
-            const managedGitWorktreeBranch = formatManagedGitWorktreeBranchInspection(branchInspection.inspection);
+            let inspection = branchInspection.inspection;
+            const initialManagedGitWorktreeBranch = formatManagedGitWorktreeBranchInspection(inspection);
+            if (!inspection.valid && inspection.reasonCode === "branch_mismatch" && inspection.repoRoot) {
+              try {
+                await ensureGitWorktreeBranchCoherent({
+                  repoRoot: inspection.repoRoot,
+                  worktreePath: inspection.worktreePath,
+                  expectedBranchName: inspection.expectedBranchName,
+                  actualBranchName: inspection.actualBranchName,
+                  sourceIssue: issueRef
+                    ? {
+                        id: issueRef.id,
+                        identifier: issueRef.identifier,
+                        title: issueRef.title,
+                        workMode: issueRef.workMode,
+                      }
+                    : null,
+                  executionWorkspaceId: branchInspection.workspaceRecord.id,
+                  recorder: workspaceOperationRecorder,
+                });
+              } catch (repairErr) {
+                const workspaceValidationFailure = isWorkspaceValidationFailure(repairErr) ? repairErr : null;
+                finalizeBranchMetadata = {
+                  executionWorkspaceId: branchInspection.workspaceRecord.id,
+                  ...initialManagedGitWorktreeBranch,
+                };
+                finalizeBranchRepairMetadata = {
+                  attempted: true,
+                  succeeded: false,
+                  initial: initialManagedGitWorktreeBranch,
+                  reason: repairErr instanceof Error ? repairErr.message : String(repairErr),
+                };
+                await workspaceOperationRecorder.recordOperation({
+                  phase: "workspace_finalize",
+                  cwd: executionWorkspace.cwd,
+                  metadata: {
+                    adapterType: agent.adapterType,
+                    executionTargetKind: executionTarget?.kind ?? "local",
+                    ...metadata,
+                    managedGitWorktreeBranch: finalizeBranchMetadata,
+                    managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata,
+                    ...(workspaceValidationFailure?.resultJson
+                      ? { workspaceValidation: workspaceValidationFailure.resultJson.workspaceValidation ?? workspaceValidationFailure.resultJson }
+                      : {}),
+                  },
+                  run: async () => ({
+                    status: "failed",
+                    stderr: `Managed git worktree branch check failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}\n`,
+                  }),
+                });
+                adapterFinalizeOutcome = "failed";
+                throw repairErr;
+              }
+
+              const repairedInspection = await inspectManagedGitWorktreeBranch({
+                worktreePath: inspection.worktreePath,
+                expectedBranchName: inspection.expectedBranchName,
+                repoRoot: inspection.repoRoot,
+              });
+              finalizeBranchRepairMetadata = {
+                attempted: true,
+                succeeded: repairedInspection.valid,
+                initial: initialManagedGitWorktreeBranch,
+                repaired: formatManagedGitWorktreeBranchInspection(repairedInspection),
+              };
+              inspection = repairedInspection;
+            }
+
+            const managedGitWorktreeBranch = formatManagedGitWorktreeBranchInspection(inspection);
             finalizeBranchMetadata = {
               executionWorkspaceId: branchInspection.workspaceRecord.id,
               ...managedGitWorktreeBranch,
             };
-            if (!branchInspection.inspection.valid) {
+            if (!inspection.valid) {
               const workspaceValidationFingerprint = fingerprintFinalizeWorkspaceBranchValidation({
                 issueId: issueRef?.id ?? null,
                 executionWorkspaceId: branchInspection.workspaceRecord.id,
@@ -10818,18 +10888,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   executionTargetKind: executionTarget?.kind ?? "local",
                   ...metadata,
                   managedGitWorktreeBranch: finalizeBranchMetadata,
+                  ...(finalizeBranchRepairMetadata ? { managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata } : {}),
                 },
                 run: async () => ({
                   status: "failed",
-                  stderr: `Managed git worktree branch check failed: ${branchInspection.inspection.reason ?? "unknown branch mismatch"}\n`,
+                  stderr: `Managed git worktree branch check failed: ${inspection.reason ?? "unknown branch mismatch"}\n`,
                 }),
               });
               adapterFinalizeOutcome = "failed";
               throw new WorkspaceValidationFailure(
-                `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${branchInspection.inspection.expectedBranchName}" at "${branchInspection.inspection.worktreePath}", but ${branchInspection.inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
+                `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
                 {
                   workspaceValidation: {
-                    reason: "git_worktree_branch_mismatch_after_run",
+                    reason: "git_worktree_branch_incoherence",
                     fingerprint: workspaceValidationFingerprint,
                     adapterType: agent.adapterType,
                     issueId: issueRef?.id ?? null,
@@ -10851,6 +10922,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionTargetKind: executionTarget?.kind ?? "local",
             ...metadata,
             ...(finalizeBranchMetadata ? { managedGitWorktreeBranch: finalizeBranchMetadata } : {}),
+            ...(finalizeBranchRepairMetadata ? { managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata } : {}),
           },
           run: async () => ({ status }),
         });
