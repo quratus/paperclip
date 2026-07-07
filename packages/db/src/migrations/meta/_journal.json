@@ -421,6 +421,13 @@
       "when": 1783504800000,
       "tag": "0059_hash_chain_audit_log",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1783508400000,
+      "tag": "0060_blocked_pending_human_status",
+      "breakpoints": true
     }
   ]
 }
