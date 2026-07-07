@@ -2673,7 +2673,9 @@ export function heartbeatService(db: Db) {
         error: "Agent not found",
       });
       const failedRun = await getRun(runId);
-      if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
+      await releaseIssueExecutionAndPromote(failedRun ?? run).catch((releaseErr) =>
+        logger.warn({ err: releaseErr, runId }, "failed to release issue execution lock in agent-not-found path"),
+      );
       return;
     }
 
@@ -3556,66 +3558,71 @@ export function heartbeatService(db: Db) {
         }
       }
 
-      const failedRun = await setRunStatus(run.id, "failed", {
-        error: message,
-        errorCode: "adapter_failed",
-        finishedAt: new Date(),
-        stdoutExcerpt,
-        stderrExcerpt,
-        logBytes: logSummary?.bytes,
-        logSha256: logSummary?.sha256,
-        logCompressed: logSummary?.compressed ?? false,
-      });
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: new Date(),
-        error: message,
-      });
-
-      if (failedRun) {
-        await appendRunEvent(failedRun, seq++, {
-          eventType: "error",
-          stream: "system",
-          level: "error",
-          message,
+      let failedRun: Awaited<ReturnType<typeof setRunStatus>> | null = null;
+      try {
+        failedRun = await setRunStatus(run.id, "failed", {
+          error: message,
+          errorCode: "adapter_failed",
+          finishedAt: new Date(),
+          stdoutExcerpt,
+          stderrExcerpt,
+          logBytes: logSummary?.bytes,
+          logSha256: logSummary?.sha256,
+          logCompressed: logSummary?.compressed ?? false,
         });
-        const startedAtTime = run.startedAt ? new Date(run.startedAt).getTime() : Date.now();
-        await emitAnalyticsEvent({
-          db,
-          run: failedRun,
-          seq: seq++,
-          eventName: "analytics.task_completed",
-          payload: {
-            workflowType: issueRef?.projectId ?? executionProjectId ?? "uncategorized",
-            intentSummary: issueRef?.title ?? undefined,
-            triggerSource: run.invocationSource,
-            status: "failed",
-            durationMs: Math.max(0, Date.now() - startedAtTime),
-          },
-        });
-        await finalizeIssueCommentPolicy(failedRun, agent);
-        await releaseIssueExecutionAndPromote(failedRun);
-
-        await updateRuntimeState(agent, failedRun, {
-          exitCode: null,
-          signal: null,
-          timedOut: false,
-          errorMessage: message,
-        }, {
-          legacySessionId: runtimeForAdapter.sessionId,
+        await setWakeupStatus(run.wakeupRequestId, "failed", {
+          finishedAt: new Date(),
+          error: message,
         });
 
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: previousSessionParams,
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
+        if (failedRun) {
+          await appendRunEvent(failedRun, seq++, {
+            eventType: "error",
+            stream: "system",
+            level: "error",
+            message,
           });
+          const startedAtTime = run.startedAt ? new Date(run.startedAt).getTime() : Date.now();
+          await emitAnalyticsEvent({
+            db,
+            run: failedRun,
+            seq: seq++,
+            eventName: "analytics.task_completed",
+            payload: {
+              workflowType: issueRef?.projectId ?? executionProjectId ?? "uncategorized",
+              intentSummary: issueRef?.title ?? undefined,
+              triggerSource: run.invocationSource,
+              status: "failed",
+              durationMs: Math.max(0, Date.now() - startedAtTime),
+            },
+          });
+          await finalizeIssueCommentPolicy(failedRun, agent);
+          await updateRuntimeState(agent, failedRun, {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: message,
+          }, {
+            legacySessionId: runtimeForAdapter.sessionId,
+          });
+
+          if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
+            await upsertTaskSession({
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: previousSessionParams,
+              sessionDisplayId: previousSessionDisplayId,
+              lastRunId: failedRun.id,
+              lastError: message,
+            });
+          }
         }
+      } finally {
+        await releaseIssueExecutionAndPromote(failedRun ?? run).catch((releaseErr) =>
+          logger.warn({ err: releaseErr, runId }, "failed to release issue execution lock in crash path"),
+        );
       }
 
       await finalizeAgentStatus(agent.id, "failed");
