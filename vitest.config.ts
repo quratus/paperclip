@@ -10,6 +10,7 @@ export default defineConfig({
     maxWorkers: 3,
     minWorkers: 1,
     projects: [
+      "packages/shared",
       "packages/db",
       "packages/adapters/codex-local",
       "packages/adapters/opencode-local",

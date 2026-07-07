@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  createLoopEscalationSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -11,6 +12,7 @@ import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import {
   approvalService,
+  createEscalation,
   heartbeatService,
   issueApprovalService,
   logActivity,
@@ -361,6 +363,41 @@ export function approvalRoutes(db: Db) {
 
     res.status(201).json(comment);
   });
+
+  router.post(
+    "/companies/:companyId/loop-escalations",
+    validate(createLoopEscalationSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      const actor = getActorInfo(req);
+      const result = await createEscalation(db, {
+        companyId,
+        actionKind: req.body.actionKind,
+        reversibility: req.body.reversibility ?? null,
+        impact: req.body.impact ?? null,
+        waitCondition: req.body.waitCondition ?? null,
+        requestedByAgentId: req.body.requestedByAgentId ?? actor.agentId ?? null,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "escalation.classified",
+        entityType: "approval",
+        entityId: result.approvalId ?? companyId,
+        details: {
+          gateState: result.gateState,
+          actionKind: req.body.actionKind,
+          approvalId: result.approvalId,
+        },
+      });
+
+      res.status(201).json(result);
+    },
+  );
 
   return router;
 }
