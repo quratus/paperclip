@@ -1,6 +1,6 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export { classifyGate } from "./gate-policy.js";
-export type { ClassifyGateInput, GateDecision, GateImpact, GateReversibility } from "./gate-policy.js";
+export type { ClassifyGateInput, GateDecision, GateImpact, GateReversibility, WaitCondition } from "./gate-policy.js";
 export {
   COMPANY_STATUSES,
   DEPLOYMENT_MODES,
@@ -518,6 +518,7 @@ export {
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
+  createLoopEscalationSchema,
   type CreateApproval,
   type UpsertBudgetPolicy,
   type ResolveBudgetIncident,
@@ -525,6 +526,7 @@ export {
   type RequestApprovalRevision,
   type ResubmitApproval,
   type AddApprovalComment,
+  type CreateLoopEscalation,
   envBindingPlainSchema,
   envBindingSecretRefSchema,
   envBindingSchema,

@@ -407,6 +407,13 @@
       "when": 1752307200000,
       "tag": "0057_approvals_gate_fields",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1783418400000,
+      "tag": "0058_escalation_wait_condition",
+      "breakpoints": true
     }
   ]
 }

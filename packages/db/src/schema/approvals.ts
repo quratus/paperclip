@@ -14,6 +14,7 @@ export const approvals = pgTable(
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
     reversibility: text("reversibility"),
     impact: text("impact"),
+    waitCondition: jsonb("wait_condition").$type<{ kind: "schedule"; fireAt: string } | { kind: "internal"; blockingIssueId: string } | null>(),
     decisionNote: text("decision_note"),
     decidedByUserId: text("decided_by_user_id"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),

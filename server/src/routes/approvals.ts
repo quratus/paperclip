@@ -13,6 +13,7 @@ import { logger } from "../middleware/logger.js";
 import {
   approvalService,
   createEscalation,
+  sweepAutoClearing,
   heartbeatService,
   issueApprovalService,
   logActivity,
@@ -398,6 +399,14 @@ export function approvalRoutes(db: Db) {
       res.status(201).json(result);
     },
   );
+
+  router.post("/companies/:companyId/escalations/sweep", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const nowIso = new Date().toISOString();
+    const result = await sweepAutoClearing(db, companyId, nowIso);
+    res.status(200).json(result);
+  });
 
   return router;
 }

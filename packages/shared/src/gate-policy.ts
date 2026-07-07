@@ -2,6 +2,10 @@ export type GateReversibility = "reversible" | "irreversible";
 export type GateImpact = "low" | "high";
 export type GateDecision = "ungated" | "auto_clearing" | "batched_escalate";
 
+export type WaitCondition =
+  | { kind: "schedule"; fireAt: string }
+  | { kind: "internal"; blockingIssueId: string };
+
 export interface ClassifyGateInput {
   reversibility: GateReversibility | null | undefined;
   impact: GateImpact | null | undefined;
