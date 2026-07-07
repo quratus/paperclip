@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -1492,6 +1492,35 @@ export function issueService(db: Db) {
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
         }
+        // Near-duplicate guard: reject a child with the same normalized title
+        // created under the same parent within the last 10 minutes. Catches
+        // agentic-loop double-creation without blocking intentional duplicates
+        // at the top level or after the window expires.
+        if (issueData.parentId) {
+          const normalizeTitle = (t: string) => t.trim().toLowerCase().replace(/\s+/g, " ");
+          const normalizedNew = normalizeTitle(issueData.title ?? "");
+          const windowStart = new Date(Date.now() - 10 * 60 * 1000);
+          const sibling = await tx
+            .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, companyId),
+                eq(issues.parentId, issueData.parentId),
+                gte(issues.createdAt, windowStart),
+              ),
+            )
+            .then((rows) =>
+              rows.find((r) => normalizeTitle(r.title ?? "") === normalizedNew),
+            );
+          if (sibling) {
+            throw conflict(
+              `Near-duplicate child issue already exists: ${sibling.identifier} "${sibling.title}" (created in the last 10 minutes with the same title)`,
+              { duplicateId: sibling.id, duplicateIdentifier: sibling.identifier },
+            );
+          }
+        }
+
         // Self-correcting counter: use MAX(issue_number) + 1 if the counter
         // has drifted below the actual max, preventing identifier collisions.
         const [maxRow] = await tx

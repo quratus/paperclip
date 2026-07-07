@@ -24,6 +24,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
+import { HttpError } from "../errors.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1378,5 +1379,102 @@ describeEmbeddedPostgres("issueService.list goalId filter", () => {
     expect(ids).toContain(issueOnA2);
     expect(ids).not.toContain(issueOnB);
     expect(ids).not.toContain(issueNoGoal);
+  });
+});
+
+describeEmbeddedPostgres("issueService.create near-duplicate guard", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-near-dup-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("rejects a second child with the same title under the same parent within 10 minutes", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "NearDupCo",
+      issuePrefix: `ND${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent task",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    await svc.create(companyId, { parentId, title: "Fix the login bug" });
+
+    const err = await svc.create(companyId, { parentId, title: "Fix the login bug" }).catch((e) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).status).toBe(409);
+    expect((err as HttpError).message).toContain("Near-duplicate child issue already exists");
+  });
+
+  it("allows a second child with a different title under the same parent", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "NearDupCo2",
+      issuePrefix: `N2${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent task",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    await svc.create(companyId, { parentId, title: "Fix the login bug" });
+    const second = await svc.create(companyId, { parentId, title: "Fix the logout bug" });
+    expect(second.title).toBe("Fix the logout bug");
+  });
+
+  it("allows a duplicate title on a top-level issue (no parentId)", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "NearDupCo3",
+      issuePrefix: `N3${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await svc.create(companyId, { title: "Recurring task" });
+    const second = await svc.create(companyId, { title: "Recurring task" });
+    expect(second.title).toBe("Recurring task");
   });
 });
