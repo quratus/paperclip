@@ -4,6 +4,7 @@ import { approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
+import { appendAuditEntry } from "./audit-log.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -78,6 +79,11 @@ export function approvalService(db: Db) {
     );
   }
 
+  async function auditApprovalDecision(approval: ApprovalRecord, decidedByUserId: string, decisionNote: string | null | undefined): Promise<void> {
+    if (typeof (db as { transaction?: unknown }).transaction !== "function") return;
+    await appendAuditEntry(db, { eventType: "approval.decided", companyId: approval.companyId, subjectType: "approval", subjectId: approval.id, payload: { status: approval.status, decidedByUserId, decisionNote: decisionNote ?? null } });
+  }
+
   return {
     list: (companyId: string, status?: string) => {
       const conditions = [eq(approvals.companyId, companyId)];
@@ -106,6 +112,7 @@ export function approvalService(db: Db) {
         decidedByUserId,
         decisionNote,
       );
+      if (applied) await auditApprovalDecision(updated, decidedByUserId, decisionNote);
 
       let hireApprovedAgentId: string | null = null;
       const now = new Date();
@@ -175,6 +182,7 @@ export function approvalService(db: Db) {
         decidedByUserId,
         decisionNote,
       );
+      if (applied) await auditApprovalDecision(updated, decidedByUserId, decisionNote);
 
       if (applied && updated.type === "hire_agent") {
         const payload = updated.payload as Record<string, unknown>;
@@ -194,7 +202,7 @@ export function approvalService(db: Db) {
       }
 
       const now = new Date();
-      return db
+      const updated = await db
         .update(approvals)
         .set({
           status: "revision_requested",
@@ -206,6 +214,8 @@ export function approvalService(db: Db) {
         .where(eq(approvals.id, id))
         .returning()
         .then((rows) => rows[0]);
+      if (updated) await auditApprovalDecision(updated, decidedByUserId, decisionNote);
+      return updated;
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
