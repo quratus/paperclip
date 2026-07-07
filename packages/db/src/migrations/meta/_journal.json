@@ -414,6 +414,13 @@
       "when": 1783418400000,
       "tag": "0058_escalation_wait_condition",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1783504800000,
+      "tag": "0059_hash_chain_audit_log",
+      "breakpoints": true
     }
   ]
 }
