@@ -37,6 +37,17 @@ function createApproval(status: string): ApprovalRecord {
   };
 }
 
+function createLoopActionApproval(status: string): ApprovalRecord {
+  return {
+    id: "approval-1",
+    companyId: "company-1",
+    type: "loop_action",
+    status,
+    payload: { actionKind: "delete_database", gateState: "batched_escalate" },
+    requestedByAgentId: "requester-1",
+  };
+}
+
 function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
   const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
@@ -103,5 +114,30 @@ describe("approvalService resolution idempotency", () => {
     expect(result.applied).toBe(true);
     expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1");
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it("approves loop_action approvals through the generic status update path", async () => {
+    const approved = createLoopActionApproval("approved");
+    const dbStub = createDbStub([[createLoopActionApproval("pending")]], [approved]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.approve("approval-1", "board", "approved");
+
+    expect(result).toEqual({ approval: approved, applied: true });
+    expect(dbStub.returning).toHaveBeenCalledTimes(1);
+    expect(mockAgentService.activatePendingApproval).not.toHaveBeenCalled();
+    expect(mockNotifyHireApproved).not.toHaveBeenCalled();
+  });
+
+  it("rejects loop_action approvals through the generic status update path", async () => {
+    const rejected = createLoopActionApproval("rejected");
+    const dbStub = createDbStub([[createLoopActionApproval("pending")]], [rejected]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.reject("approval-1", "board", "rejected");
+
+    expect(result).toEqual({ approval: rejected, applied: true });
+    expect(dbStub.returning).toHaveBeenCalledTimes(1);
+    expect(mockAgentService.terminate).not.toHaveBeenCalled();
   });
 });
