@@ -1,13 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  auditLog,
-  companies,
-  createDb,
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "@paperclipai/db";
+import { auditLog, companies, createDb, getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
 import { appendAuditEntry, recomputeAuditHash } from "../services/audit-log.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -17,29 +11,19 @@ if (!support.supported) console.warn(`Skipping audit log tests: ${support.reason
 describePg("appendAuditEntry", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-audit-log-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
-
   afterEach(async () => {
     await db.execute(sql`TRUNCATE TABLE "audit_log" RESTART IDENTITY`);
     await db.delete(companies);
   });
-
-  afterAll(async () => {
-    await tempDb?.cleanup();
-  });
+  afterAll(async () => tempDb?.cleanup());
 
   async function company() {
     const id = randomUUID();
-    await db.insert(companies).values({
-      id,
-      name: "AuditCo",
-      issuePrefix: `AU${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await db.insert(companies).values({ id, name: "AuditCo", issuePrefix: `AU${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
     return id;
   }
 
@@ -66,5 +50,4 @@ describePg("appendAuditEntry", () => {
     const tampered = { ...row, payload: { status: "rejected" } };
     expect(await recomputeAuditHash(db, tampered)).not.toBe(row.thisHash);
   });
-
 });

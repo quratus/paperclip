@@ -5,27 +5,15 @@ import { auditLog } from "@paperclipai/db";
 const GENESIS_HASH = "0".repeat(64);
 
 export interface AuditEntryInput {
-  eventType: string;
-  companyId: string;
-  subjectType: string;
-  subjectId: string;
+  companyId: string; eventType: string; subjectType: string; subjectId: string;
   payload?: Record<string, unknown> | null;
 }
 export type AuditEntry = typeof auditLog.$inferSelect;
 
-/**
- * Append a tamper-evident entry to the hash-chained audit log.
- *
- * Invariants:
- *   this_hash = audit_log_hash(seq, companyId, eventType, subjectType,
- *                              subjectId, payload, prevHash, createdAt)
- *   prevHash   = this_hash of the previous row (or GENESIS_HASH for the first)
- */
 export async function appendAuditEntry(db: Db, input: AuditEntryInput): Promise<AuditEntry> {
   validateInput(input);
   return db.transaction(async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.companyId}, 0))`);
-
     const [lastRow] = await tx
       .select({ seq: auditLog.seq, thisHash: auditLog.thisHash })
       .from(auditLog)
@@ -39,23 +27,13 @@ export async function appendAuditEntry(db: Db, input: AuditEntryInput): Promise<
     const nextSeq = Number.parseInt(String(rawSeq ?? "1"), 10);
     const createdAt = new Date().toISOString();
     const payload = JSON.stringify(input.payload ?? {});
-
     const inserted = await tx.execute(sql`
-        INSERT INTO "audit_log" (seq, event_type, company_id, subject_type, subject_id, payload, prev_hash, this_hash, created_at)
-        VALUES (
-          ${nextSeq},
-          ${input.eventType},
-          ${input.companyId},
-          ${input.subjectType},
-          ${input.subjectId},
-          ${payload}::jsonb,
-          ${prevHash},
-          audit_log_hash(${nextSeq}, ${input.companyId}::uuid, ${input.eventType}, ${input.subjectType}, ${input.subjectId}::uuid, ${payload}::jsonb, ${prevHash}, ${createdAt}),
-          ${createdAt}
-        )
-        RETURNING seq, event_type AS "eventType", company_id AS "companyId", subject_type AS "subjectType",
-          subject_id AS "subjectId", payload, prev_hash AS "prevHash", this_hash AS "thisHash", created_at AS "createdAt"
-      `);
+      INSERT INTO "audit_log" (seq, event_type, company_id, subject_type, subject_id, payload, prev_hash, this_hash, created_at)
+      VALUES (${nextSeq}, ${input.eventType}, ${input.companyId}, ${input.subjectType}, ${input.subjectId}, ${payload}::jsonb, ${prevHash},
+        audit_log_hash(${nextSeq}, ${input.companyId}::uuid, ${input.eventType}, ${input.subjectType}, ${input.subjectId}::uuid, ${payload}::jsonb, ${prevHash}, ${createdAt}), ${createdAt})
+      RETURNING seq, event_type AS "eventType", company_id AS "companyId", subject_type AS "subjectType",
+        subject_id AS "subjectId", payload, prev_hash AS "prevHash", this_hash AS "thisHash", created_at AS "createdAt"
+    `);
     const row = (inserted as unknown as AuditEntry[])[0];
     if (!row) throw new Error("audit_log insert returned no row");
     return row;
