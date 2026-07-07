@@ -400,6 +400,13 @@
       "when": 1779455327862,
       "tag": "0056_issue_comment_metadata",
       "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1752307200000,
+      "tag": "0057_approvals_gate_fields",
+      "breakpoints": true
     }
   ]
 }
