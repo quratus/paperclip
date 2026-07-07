@@ -9,7 +9,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
-import { createEscalation, sweepAutoClearing } from "../services/escalations.ts";
+import {
+  createEscalation,
+  listPendingBatchedEscalations,
+  sweepAutoClearing,
+} from "../services/escalations.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -109,6 +113,54 @@ describeEmbeddedPostgres("createEscalation", () => {
     expect(rows[0].type).toBe("loop_action");
     expect((rows[0].waitCondition as Record<string, unknown>)?.kind).toBe("schedule");
     expect((rows[0].waitCondition as Record<string, unknown>)?.fireAt).toBe("2026-09-01T00:00:00.000Z");
+  });
+
+  it("lists only pending batched_escalate loop approvals for digest", async () => {
+    const companyId = await setupCompany();
+    const pending = await createEscalation(db, {
+      companyId,
+      actionKind: "delete_database",
+      reversibility: "irreversible",
+      impact: "high",
+    });
+    const resolved = await createEscalation(db, {
+      companyId,
+      actionKind: "publish_public_statement",
+      reversibility: "irreversible",
+      impact: "high",
+    });
+    const autoCleared = await createEscalation(db, {
+      companyId,
+      actionKind: "rotate_key",
+      reversibility: "irreversible",
+      impact: "high",
+    });
+    await createEscalation(db, {
+      companyId,
+      actionKind: "send_message",
+      reversibility: "reversible",
+      impact: "low",
+      waitCondition: { kind: "schedule", fireAt: "2099-01-01T00:00:00.000Z" },
+    });
+    await createEscalation(db, {
+      companyId,
+      actionKind: "file_write",
+      reversibility: "reversible",
+      impact: "low",
+    });
+    await db.update(approvals).set({ status: "resolved" }).where(eq(approvals.id, resolved.approvalId));
+    await db.update(approvals).set({ status: "auto_cleared" }).where(eq(approvals.id, autoCleared.approvalId));
+
+    const rows = await listPendingBatchedEscalations(db, companyId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(pending.approvalId);
+    expect((rows[0].payload as Record<string, unknown>).actionKind).toBe("delete_database");
+    expect((rows[0].payload as Record<string, unknown>).gateState).toBe("batched_escalate");
+
+    const allRows = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(allRows).not.toContainEqual(
+      expect.objectContaining({ payload: expect.objectContaining({ gateState: "ungated" }) }),
+    );
   });
 });
 

@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issues } from "@paperclipai/db";
 import { classifyGate, type ClassifyGateInput, type GateDecision, type WaitCondition } from "@paperclipai/shared";
@@ -17,6 +17,21 @@ export interface EscalationResult {
 
 export interface SweepResult {
   cleared: number;
+}
+
+export function listPendingBatchedEscalations(db: Db, companyId: string, limit = 50) {
+  return db
+    .select()
+    .from(approvals)
+    .where(
+      and(
+        eq(approvals.companyId, companyId),
+        eq(approvals.status, "pending"),
+        sql`${approvals.payload}->>'gateState' = 'batched_escalate'`,
+      ),
+    )
+    .orderBy(asc(approvals.createdAt))
+    .limit(limit);
 }
 
 /**

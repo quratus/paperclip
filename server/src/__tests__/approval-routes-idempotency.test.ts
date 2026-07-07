@@ -28,11 +28,13 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockListPendingBatchedEscalations = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/index.js", () => ({
   approvalService: () => mockApprovalService,
   heartbeatService: () => mockHeartbeatService,
   issueApprovalService: () => mockIssueApprovalService,
+  listPendingBatchedEscalations: mockListPendingBatchedEscalations,
   logActivity: mockLogActivity,
   secretService: () => mockSecretService,
 }));
@@ -88,6 +90,7 @@ describe("approval routes idempotent retries", () => {
     vi.resetAllMocks();
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
+    mockListPendingBatchedEscalations.mockResolvedValue([]);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -233,5 +236,26 @@ describe("approval routes idempotent retries", () => {
         action: "approval.created",
       }),
     );
+  });
+
+  it("returns grouped pending batched escalation digest without creating a resolver path", async () => {
+    mockListPendingBatchedEscalations.mockResolvedValue([
+      { id: "approval-1", type: "loop_action", status: "pending", payload: { actionKind: "delete_database" } },
+      { id: "approval-2", type: "loop_action", status: "pending", payload: { actionKind: "delete_database" } },
+      { id: "approval-3", type: "request_board_approval", status: "pending", payload: { actionKind: "sign_contract" } },
+    ]);
+
+    const res = await request(await createAgentApp())
+      .get("/api/companies/company-1/escalations/digest?limit=500")
+      .send();
+
+    expect(res.status).toBe(200);
+    expect(mockListPendingBatchedEscalations).toHaveBeenCalledWith(expect.anything(), "company-1", 100);
+    expect(res.body.groups).toHaveLength(2);
+    expect(res.body.groups[0]).toMatchObject({ type: "loop_action", actionKind: "delete_database", count: 2 });
+    expect(res.body.groups[0].items.map((item: { id: string }) => item.id)).toEqual(["approval-1", "approval-2"]);
+    expect(res.body.groups[1]).toMatchObject({ type: "request_board_approval", actionKind: "sign_contract", count: 1 });
+    expect(mockApprovalService.approve).not.toHaveBeenCalled();
+    expect(mockApprovalService.reject).not.toHaveBeenCalled();
   });
 });

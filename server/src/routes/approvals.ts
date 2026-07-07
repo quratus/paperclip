@@ -13,6 +13,7 @@ import { logger } from "../middleware/logger.js";
 import {
   approvalService,
   createEscalation,
+  listPendingBatchedEscalations,
   sweepAutoClearing,
   heartbeatService,
   issueApprovalService,
@@ -399,6 +400,36 @@ export function approvalRoutes(db: Db) {
       res.status(201).json(result);
     },
   );
+
+  router.get("/companies/:companyId/escalations/digest", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const rawLimit = Number.parseInt(String(req.query.limit ?? "50"), 10);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 50;
+    const rows = await listPendingBatchedEscalations(db, companyId, limit);
+    const groups = new Map<
+      string,
+      { type: string; actionKind: string; items: Array<(typeof rows)[number]> }
+    >();
+
+    for (const approval of rows) {
+      const payload = approval.payload as Record<string, unknown>;
+      const actionKind = typeof payload.actionKind === "string" ? payload.actionKind : "unknown";
+      const key = `${approval.type}:${actionKind}`;
+      const group = groups.get(key) ?? { type: approval.type, actionKind, items: [] };
+      group.items.push(approval);
+      groups.set(key, group);
+    }
+
+    res.json({
+      groups: Array.from(groups.values()).map((group) => ({
+        type: group.type,
+        actionKind: group.actionKind,
+        count: group.items.length,
+        items: group.items.map((approval) => redactApprovalPayload(approval)),
+      })),
+    });
+  });
 
   router.post("/companies/:companyId/escalations/sweep", async (req, res) => {
     const companyId = req.params.companyId as string;
