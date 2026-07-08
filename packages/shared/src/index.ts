@@ -1,6 +1,15 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export { classifyGate } from "./gate-policy.js";
 export type { ClassifyGateInput, GateDecision, GateImpact, GateReversibility, WaitCondition } from "./gate-policy.js";
+export { plateauDetector, runVerifier } from "./stuck-detector.js";
+export type {
+  PlateauDetectorInput,
+  PlateauDetectorResult,
+  PlateauReason,
+  TestPassFailInput,
+  VerifierMethod,
+  VerifierResult,
+} from "./stuck-detector.js";
 export {
   COMPANY_STATUSES,
   DEPLOYMENT_MODES,

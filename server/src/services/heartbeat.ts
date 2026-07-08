@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
+import { classifyGate, plateauDetector, runVerifier, type BillingType, type ExecutionWorkspace, type ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
   agents,
   agentRuntimeState,
@@ -3703,12 +3703,89 @@ export function heartbeatService(db: Db) {
         .select({
           id: issues.id,
           companyId: issues.companyId,
+          status: issues.status,
+          title: issues.title,
+          assigneeAgentId: issues.assigneeAgentId,
         })
         .from(issues)
         .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
         .then((rows) => rows[0] ?? null);
 
       if (!issue) return;
+
+      if ((run.status === "failed" || run.status === "timed_out") && issue.status !== "done" && issue.status !== "cancelled") {
+        const recentRuns = await tx
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            error: heartbeatRuns.error,
+            errorCode: heartbeatRuns.errorCode,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              inArray(heartbeatRuns.status, ["failed", "timed_out", "succeeded", "cancelled"]),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(2);
+
+        const signatures = recentRuns
+          .reverse()
+          .map((recentRun) =>
+            recentRun.status === "failed" || recentRun.status === "timed_out"
+              ? `error:${recentRun.errorCode ?? recentRun.error ?? recentRun.status}`
+              : `state:${recentRun.status}`,
+          );
+        const plateau = plateauDetector({ iterationSignatures: signatures, maxPlateauIterations: 2 });
+        const verifier = await runVerifier("test_pass_fail", {
+          exitCode: 1,
+          evidence: `${run.status}${run.errorCode ? `:${run.errorCode}` : ""}`,
+        });
+        const gateState = classifyGate({ reversibility: "irreversible", impact: "high" });
+
+        if (plateau.isStuck && !verifier.verified && gateState === "batched_escalate") {
+          const now = new Date();
+          await tx
+            .update(issues)
+            .set({
+              status: "blocked_pending_human",
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              checkoutRunId: null,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, issue.id));
+
+          await tx.insert(issueComments).values({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            authorAgentId: issue.assigneeAgentId ?? run.agentId,
+            createdByRunId: run.id,
+            body: [
+              "Blocked pending human: stuck execution loop detected.",
+              "",
+              `Issue: ${issue.title}`,
+              `Detector: ${plateau.reason}`,
+              `Verifier: ${verifier.method} (${verifier.evidence})`,
+              `Gate: ${gateState}`,
+              "",
+              "Paperclip stopped promoting queued execution for this issue because the last two live runs produced the same failing outcome.",
+            ].join("\n"),
+            metadata: {
+              kind: "stuck_detection_transition",
+              gateState,
+              plateauReason: plateau.reason,
+              verifier,
+            },
+          });
+
+          return null;
+        }
+      }
 
       await tx
         .update(issues)
@@ -4713,7 +4790,7 @@ export function heartbeatService(db: Db) {
             .where(
               and(
                 eq(issues.assigneeAgentId, agent.id),
-                inArray(issues.status, ["todo", "in_progress", "blocked", "in_review"]),
+                inArray(issues.status, ["todo", "in_progress", "blocked_pending_human", "blocked", "in_review"]),
                 isNull(issues.completedAt),
                 isNull(issues.cancelledAt),
                 isNull(issues.hiddenAt),

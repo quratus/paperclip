@@ -9,6 +9,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -134,6 +135,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     }
     cleanupPids.clear();
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -167,6 +169,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     processGroupId?: number | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
+    issueStatus?: "todo" | "in_progress" | "done" | "cancelled";
     runErrorCode?: string | null;
     runError?: string | null;
   }) {
@@ -233,7 +236,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: issueId,
         companyId,
         title: "Recover local adapter after lost process",
-        status: "in_progress",
+        status: input?.issueStatus ?? "in_progress",
         priority: "medium",
         assigneeAgentId: agentId,
         checkoutRunId: runId,
@@ -370,6 +373,122 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBeNull();
     expect(issue?.checkoutRunId).toBe(runId);
+  });
+
+  it("transitions to blocked_pending_human after two identical failed execution outcomes", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId },
+      errorCode: "process_lost",
+      error: "Previous execution process was lost",
+      createdAt: new Date("2026-03-18T23:59:00.000Z"),
+      updatedAt: new Date("2026-03-18T23:59:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked_pending_human");
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Blocked pending human: stuck execution loop detected.");
+    expect(comments[0]?.body).toContain("Detector: repeating_error");
+    expect(comments[0]?.body).toContain("Gate: batched_escalate");
+  });
+
+  it("does not transition when the recent execution history is not a plateau", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId },
+      createdAt: new Date("2026-03-18T23:59:00.000Z"),
+      updatedAt: new Date("2026-03-18T23:59:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reapOrphanedRuns();
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBeNull();
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("does not move terminal issues back to blocked_pending_human from stale failed runs", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      issueStatus: "done",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: { issueId },
+      errorCode: "process_lost",
+      error: "Previous execution process was lost",
+      createdAt: new Date("2026-03-18T23:59:00.000Z"),
+      updatedAt: new Date("2026-03-18T23:59:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reapOrphanedRuns();
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("done");
+    expect(issue?.executionRunId).toBeNull();
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
   });
 
   it("clears the detached warning when the run reports activity again", async () => {
