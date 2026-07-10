@@ -3,6 +3,8 @@ import { asString, asNumber, parseObject, parseJson } from "@paperclipai/adapter
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
+const CLAUDE_TRANSIENT_NETWORK_RE =
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network error|fetch failed|unable to connect to (?:the )?api/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -176,4 +178,18 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   return allMessages.some((msg) =>
     /no conversation found with session id|unknown session|session .* not found/i.test(msg),
   );
+}
+
+export function isClaudeInvalidResumeArgError(stderr: string): boolean {
+  return /--resume requires a valid session ID|not a UUID and does not match any session title/i.test(stderr);
+}
+
+export function isClaudeTransientNetworkError(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed) return false;
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  return allMessages.some((msg) => CLAUDE_TRANSIENT_NETWORK_RE.test(msg));
 }

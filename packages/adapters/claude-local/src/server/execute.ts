@@ -13,6 +13,7 @@ import {
   buildPaperclipEnv,
   readPaperclipRuntimeSkillEntries,
   joinPromptSections,
+  currentDateSection,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensureCommandResolvable,
@@ -29,6 +30,8 @@ import {
   detectClaudeLoginRequired,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeInvalidResumeArgError,
+  isClaudeTransientNetworkError,
 } from "./parse.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
@@ -372,11 +375,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
   const hasMatchingPromptBundle =
     runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
-  const canResumeSession =
+  const isValidClaudeSessionId =
     runtimeSessionId.length > 0 &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  const canResumeSession =
+    isValidClaudeSessionId &&
     hasMatchingPromptBundle &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd));
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !isValidClaudeSessionId) {
+    await onLog(
+      "stdout",
+      `[paperclip] Skipping session resume: stored session ID "${runtimeSessionId}" is not a valid UUID and will not be passed to --resume.\n`,
+    );
+  }
   if (
     runtimeSessionId &&
     runtimeSessionCwd.length > 0 &&
@@ -412,6 +424,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const prompt = joinPromptSections([
+    currentDateSection(),
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
@@ -614,8 +627,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionId &&
     !initial.proc.timedOut &&
     (initial.proc.exitCode ?? 0) !== 0 &&
-    initial.parsed &&
-    isClaudeUnknownSessionError(initial.parsed)
+    (
+      (initial.parsed && isClaudeUnknownSessionError(initial.parsed)) ||
+      (!initial.parsed && isClaudeInvalidResumeArgError(initial.proc.stderr))
+    )
   ) {
     await onLog(
       "stdout",
@@ -623,6 +638,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
     const retry = await runAttempt(null);
     return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+  }
+
+  if (
+    !initial.proc.timedOut &&
+    (initial.proc.exitCode ?? 0) !== 0 &&
+    isClaudeTransientNetworkError(initial.parsed)
+  ) {
+    const resumeSessionId = asString(initial.parsed?.session_id, sessionId ?? "") || sessionId;
+    await onLog(
+      "stdout",
+      `[paperclip] Claude hit a transient network error talking to the API; retrying once${
+        resumeSessionId ? ` by resuming session "${resumeSessionId}"` : ""
+      }.\n`,
+    );
+    const retry = await runAttempt(resumeSessionId ?? null);
+    return toAdapterResult(retry, {
+      fallbackSessionId: resumeSessionId || runtimeSessionId || runtime.sessionId,
+    });
   }
 
   return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });

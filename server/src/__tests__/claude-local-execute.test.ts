@@ -31,9 +31,9 @@ const payload = {
 if (capturePath) {
   fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
 }
-console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }));
-console.log(JSON.stringify({ type: "assistant", session_id: "claude-session-1", message: { content: [{ type: "text", text: "hello" }] } }));
-console.log(JSON.stringify({ type: "result", session_id: "claude-session-1", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
+console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "11111111-1111-4111-8111-111111111111", model: "claude-sonnet" }));
+console.log(JSON.stringify({ type: "assistant", session_id: "11111111-1111-4111-8111-111111111111", message: { content: [{ type: "text", text: "hello" }] } }));
+console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-8111-111111111111", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
@@ -78,15 +78,49 @@ if (shouldFailResume) {
   console.log(JSON.stringify({
     type: "result",
     subtype: "error",
-    session_id: "claude-session-1",
-    result: "No conversation found with session id claude-session-1",
-    errors: ["No conversation found with session id claude-session-1"],
+    session_id: "11111111-1111-4111-8111-111111111111",
+    result: "No conversation found with session id 11111111-1111-4111-8111-111111111111",
+    errors: ["No conversation found with session id 11111111-1111-4111-8111-111111111111"],
   }));
   process.exit(1);
 }
-console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-2", model: "claude-sonnet" }));
-console.log(JSON.stringify({ type: "assistant", session_id: "claude-session-2", message: { content: [{ type: "text", text: "hello" }] } }));
-console.log(JSON.stringify({ type: "result", session_id: "claude-session-2", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
+console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "22222222-2222-4222-8222-222222222222", model: "claude-sonnet" }));
+console.log(JSON.stringify({ type: "assistant", session_id: "22222222-2222-4222-8222-222222222222", message: { content: [{ type: "text", text: "hello" }] } }));
+console.log(JSON.stringify({ type: "result", session_id: "22222222-2222-4222-8222-222222222222", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
+async function writeTransientNetworkThenSucceedClaudeCommand(commandPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+
+const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
+const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
+const payload = {
+  argv: process.argv.slice(2),
+};
+if (capturePath) {
+  const entries = fs.existsSync(capturePath) ? JSON.parse(fs.readFileSync(capturePath, "utf8")) : [];
+  entries.push(payload);
+  fs.writeFileSync(capturePath, JSON.stringify(entries), "utf8");
+}
+const alreadyFailed = statePath && fs.existsSync(statePath);
+if (!alreadyFailed) {
+  if (statePath) fs.writeFileSync(statePath, "failed-once", "utf8");
+  console.log(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    session_id: "33333333-3333-4333-8333-333333333333",
+    result: "API Error: Unable to connect to API (ECONNRESET)",
+  }));
+  process.exit(1);
+}
+console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "33333333-3333-4333-8333-333333333333", model: "claude-sonnet" }));
+console.log(JSON.stringify({ type: "assistant", session_id: "33333333-3333-4333-8333-333333333333", message: { content: [{ type: "text", text: "hello" }] } }));
+console.log(JSON.stringify({ type: "result", session_id: "33333333-3333-4333-8333-333333333333", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
@@ -166,7 +200,7 @@ describe("claude execute", () => {
       await execute({
         runId: "run-resume",
         agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
-        runtime: { sessionId: "claude-session-1", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           command: commandPath,
           cwd: workspace,
@@ -234,7 +268,7 @@ describe("claude execute", () => {
       await execute({
         runId: "run-notes-resume",
         agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
-        runtime: { sessionId: "claude-session-1", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           command: commandPath,
           cwd: workspace,
@@ -266,7 +300,7 @@ describe("claude execute", () => {
       const result = await execute({
         runId: "run-resume-fallback",
         agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
-        runtime: { sessionId: "claude-session-1", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           command: commandPath,
           cwd: workspace,
@@ -309,8 +343,50 @@ describe("claude execute", () => {
       expect(metaEvents).toHaveLength(2);
       expect(metaEvents[0]?.commandNotes).toHaveLength(0);
       expect(metaEvents[1]?.commandNotes.some((note) => note.includes("--append-system-prompt-file"))).toBe(true);
-      expect(result.sessionId).toBe("claude-session-2");
+      expect(result.sessionId).toBe("22222222-2222-4222-8222-222222222222");
       expect(result.clearSession).toBe(false);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retries once by resuming the same session after a transient network error", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-network-retry-"));
+    const { workspace, commandPath, capturePath, statePath, restore } = await setupExecuteEnv(root, {
+      commandWriter: writeTransientNetworkThenSucceedClaudeCommand,
+    });
+    const logs: string[] = [];
+    try {
+      const result = await execute({
+        runId: "run-network-retry",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+            PAPERCLIP_TEST_STATE_PATH: statePath,
+          },
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+        onMeta: async () => {},
+      });
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf-8")) as Array<{ argv: string[] }>;
+      expect(captured).toHaveLength(2);
+      expect(captured[0]?.argv).not.toContain("--resume");
+      expect(captured[1]?.argv).toContain("--resume");
+      expect(captured[1]?.argv).toContain("33333333-3333-4333-8333-333333333333");
+      expect(logs.join("")).toContain("transient network error");
+      expect(result.exitCode).toBe(0);
+      expect(result.errorMessage).toBeNull();
+      expect(result.sessionId).toBe("33333333-3333-4333-8333-333333333333");
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });
@@ -438,7 +514,7 @@ describe("claude execute", () => {
       expect(first.exitCode).toBe(0);
       expect(first.errorMessage).toBeNull();
       expect(first.sessionParams).toMatchObject({
-        sessionId: "claude-session-1",
+        sessionId: "11111111-1111-4111-8111-111111111111",
         cwd: workspace,
       });
       expect(typeof first.sessionParams?.promptBundleKey).toBe("string");
@@ -530,7 +606,7 @@ describe("claude execute", () => {
       expect(capture1.instructionsContents).toContain(`The above agent instructions were loaded from ${instructionsPath}.`);
       expect(capture1.skillEntries).toContain("paperclip");
       expect(capture2.argv).toContain("--resume");
-      expect(capture2.argv).toContain("claude-session-1");
+      expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
       expect(capture2.prompt).toContain("## Paperclip Resume Delta");
       expect(capture2.prompt).not.toContain("Follow the paperclip heartbeat.");
     } finally {
