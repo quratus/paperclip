@@ -216,6 +216,10 @@ export function joinPromptSections(
     .join(separator);
 }
 
+export function currentDateSection(): string {
+  return `Today's date is ${new Date().toISOString().slice(0, 10)}.`;
+}
+
 type PaperclipWakeIssue = {
   id: string | null;
   identifier: string | null;

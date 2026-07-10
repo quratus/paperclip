@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { envWithKimiPath, resolveKimiCommand } from "./resolve-kimi.js";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -27,6 +28,7 @@ import {
   renderTemplate,
   renderPaperclipWakePrompt,
   joinPromptSections,
+  currentDateSection,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 
@@ -299,6 +301,12 @@ async function buildKimiRuntimeConfig(
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
   env.PAPERCLIP_RUN_ID = runId;
 
+  // Ensure the Kimi Code CLI binary directory is on PATH even when Paperclip
+  // is started from a non-interactive context (launchd, cron, systemd) that
+  // does not inherit the user's shell PATH.
+  const envWithFallback = envWithKimiPath({ ...process.env, ...env });
+  env.PATH = envWithFallback.PATH ?? process.env.PATH ?? "";
+
   const envConfig = parseObject(config.env);
   const hasExplicitApiKey =
     typeof envConfig.KIMI_API_KEY === "string" && envConfig.KIMI_API_KEY.trim().length > 0;
@@ -416,18 +424,15 @@ When working: read the issue description completely first, then the project's AG
   const renderedPrompt = renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
 
-  const prompt = joinPromptSections([wakePrompt, sessionHandoffNote, renderedPrompt]);
+  const prompt = joinPromptSections([currentDateSection(), wakePrompt, sessionHandoffNote, renderedPrompt]);
 
-  // Build Kimi CLI arguments
+  // Build Kimi CLI arguments for the current kimi-code CLI.
+  // Non-interactive prompt mode uses --prompt <text> plus --output-format stream-json.
   const args = [
-    "--print",
-    "--input-format",
-    "text",
+    "--prompt",
+    prompt,
     "--output-format",
     "stream-json",
-    "--verbose",
-    "--work-dir",
-    cwd,
   ];
 
   if (canResumeSession) {
@@ -435,23 +440,17 @@ When working: read the issue description completely first, then the project's AG
     await onLog("stdout", `[paperclip] Continuing previous Kimi session for ${resolvedCwd}\n`);
   }
 
-  // Agent selection: the core "what powers the agent" configuration
-  if (agentPreset === "custom" && customAgentFile) {
-    args.push("--agent-file", customAgentFile);
-  } else if (agentPreset === "okabe") {
-    args.push("--agent", "okabe");
-  } else {
-    args.push("--agent", "default");
-  }
-
   if (model) {
     args.push("--model", model);
   }
 
-  if (thinking) {
-    args.push("--thinking");
-  } else if (noThinking) {
-    args.push("--no-thinking");
+  // Agent preset / thinking flags are not supported by the current kimi-code CLI.
+  // Keep reading the config for backwards compatibility but do not pass them.
+  if (agentPreset !== "default" || customAgentFile || thinking || noThinking) {
+    await onLog(
+      "stderr",
+      `[paperclip] kimi_local: agentPreset/thinking options are ignored by the current Kimi CLI\n`,
+    );
   }
 
   const extraArgs = asString(config.extraArgs, "").trim();
@@ -484,7 +483,6 @@ When working: read the issue description completely first, then the project's AG
   const proc = await runChildProcess(runId, command, args, {
     cwd,
     env,
-    stdin: prompt,
     timeoutSec,
     graceSec,
     onSpawn,

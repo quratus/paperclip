@@ -15,6 +15,8 @@ import path from "node:path";
 import { parseCodexJsonl } from "./parse.js";
 import { codexHomeDir, readCodexAuthInfo } from "./quota.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import { prepareManagedCodexHome, resolveManagedCodexHomeDir } from "./codex-home.js";
+import { envWithCodexPath, resolveCodexCommand } from "./resolve-codex.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -51,6 +53,41 @@ function summarizeProbeDetail(stdout: string, stderr: string, parsedError: strin
 const CODEX_AUTH_REQUIRED_RE =
   /(?:not\s+logged\s+in|login\s+required|authentication\s+required|unauthorized|invalid(?:\s+or\s+missing)?\s+api(?:[_\s-]?key)?|openai[_\s-]?api[_\s-]?key|api[_\s-]?key.*required|please\s+run\s+`?codex\s+login`?)/i;
 
+export async function buildCodexEnvironmentTestRuntimeEnv(
+  config: Record<string, unknown>,
+  companyId: string,
+): Promise<{
+  env: Record<string, string>;
+  runtimeEnv: Record<string, string>;
+  effectiveCodexHome: string;
+}> {
+  const envConfig = parseObject(config.env);
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
+  }
+
+  const configuredCodexHome = isNonEmpty(env.CODEX_HOME)
+    ? path.resolve(env.CODEX_HOME)
+    : null;
+  const preparedManagedCodexHome =
+    configuredCodexHome
+      ? null
+      : await prepareManagedCodexHome(process.env, async () => {}, companyId);
+  const effectiveCodexHome =
+    configuredCodexHome ?? preparedManagedCodexHome ?? resolveManagedCodexHomeDir(process.env, companyId);
+
+  env.CODEX_HOME = effectiveCodexHome;
+
+  const runtimeEnv = Object.fromEntries(
+    Object.entries(envWithCodexPath(ensurePathInEnv({ ...process.env, ...env }))).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+
+  return { env, runtimeEnv, effectiveCodexHome };
+}
+
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
@@ -75,18 +112,17 @@ export async function testEnvironment(
     });
   }
 
-  const envConfig = parseObject(config.env);
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(envConfig)) {
-    if (typeof value === "string") env[key] = value;
-  }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const { env, runtimeEnv, effectiveCodexHome } = await buildCodexEnvironmentTestRuntimeEnv(
+    config,
+    ctx.companyId,
+  );
+  const resolvedCommand = await resolveCodexCommand(command, runtimeEnv.PATH);
   try {
-    await ensureCommandResolvable(command, cwd, runtimeEnv);
+    await ensureCommandResolvable(resolvedCommand, cwd, runtimeEnv);
     checks.push({
       code: "codex_command_resolvable",
       level: "info",
-      message: `Command is executable: ${command}`,
+      message: `Command is executable: ${resolvedCommand}`,
     });
   } catch (err) {
     checks.push({
@@ -108,14 +144,13 @@ export async function testEnvironment(
       detail: `Detected in ${source}.`,
     });
   } else {
-    const codexHome = isNonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : undefined;
-    const codexAuth = await readCodexAuthInfo(codexHome).catch(() => null);
+    const codexAuth = await readCodexAuthInfo(effectiveCodexHome).catch(() => null);
     if (codexAuth) {
       checks.push({
         code: "codex_native_auth_present",
         level: "info",
         message: "Codex is authenticated via its own auth configuration.",
-        detail: codexAuth.email ? `Logged in as ${codexAuth.email}.` : `Credentials found in ${path.join(codexHome ?? codexHomeDir(), "auth.json")}.`,
+        detail: codexAuth.email ? `Logged in as ${codexAuth.email}.` : `Credentials found in ${path.join(effectiveCodexHome ?? codexHomeDir(), "auth.json")}.`,
       });
     } else {
       checks.push({
@@ -152,11 +187,11 @@ export async function testEnvironment(
 
       const probe = await runChildProcess(
         `codex-envtest-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        command,
+        resolvedCommand,
         args,
         {
           cwd,
-          env,
+          env: runtimeEnv,
           timeoutSec: 45,
           graceSec: 5,
           stdin: "Respond with hello.",

@@ -2,6 +2,29 @@ import { describe, expect, it } from "vitest";
 import { buildCodexExecArgs } from "./codex-args.js";
 
 describe("buildCodexExecArgs", () => {
+  it("bypasses Codex approvals and sandbox by default for unattended local runs", () => {
+    const result = buildCodexExecArgs({});
+
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-",
+    ]);
+  });
+
+  it("allows Codex approvals and sandbox bypass to be explicitly disabled", () => {
+    const result = buildCodexExecArgs({
+      dangerouslyBypassApprovalsAndSandbox: false,
+    });
+
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "-",
+    ]);
+  });
+
   it("enables Codex fast mode overrides for GPT-5.4", () => {
     const result = buildCodexExecArgs({
       model: "gpt-5.4",
@@ -16,6 +39,7 @@ describe("buildCodexExecArgs", () => {
       "--search",
       "exec",
       "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       "gpt-5.4",
       "-c",
@@ -38,6 +62,7 @@ describe("buildCodexExecArgs", () => {
     expect(result.args).toEqual([
       "exec",
       "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       "gpt-5.3-codex",
       "-",

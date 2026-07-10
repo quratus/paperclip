@@ -1,6 +1,7 @@
 import { asBoolean, asString, asStringArray } from "@paperclipai/adapter-utils/server-utils";
 import {
   CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS,
+  DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
   isCodexLocalFastModeSupported,
 } from "../index.js";
 
@@ -43,7 +44,7 @@ export function buildCodexExecArgs(
   const fastModeApplied = fastModeRequested && isCodexLocalFastModeSupported(model);
   const bypass = asBoolean(
     record.dangerouslyBypassApprovalsAndSandbox,
-    asBoolean(record.dangerouslyBypassSandbox, false),
+    asBoolean(record.dangerouslyBypassSandbox, DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX),
   );
   const extraArgs = readExtraArgs(record);
 

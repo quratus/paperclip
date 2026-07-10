@@ -6,12 +6,13 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import { asString, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import { envWithKimiPath, resolveKimiCommand } from "./resolve-kimi.js";
 
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
   const config = parseObject(ctx.config);
-  const command = asString(config.command, "kimi");
+  const command = await resolveKimiCommand(asString(config.command, "kimi"));
   const checks: AdapterEnvironmentTestResult["checks"] = [];
 
   // Check 1: command resolves
@@ -21,6 +22,7 @@ export async function testEnvironment(
         const child = spawn(command, ["--version"], {
           stdio: ["ignore", "pipe", "pipe"],
           timeout: 10000,
+          env: envWithKimiPath(),
         });
         let stdout = "";
         let stderr = "";

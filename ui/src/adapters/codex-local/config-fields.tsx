@@ -9,6 +9,7 @@ import { ChoosePathButton } from "../../components/PathInstructionsModal";
 import { LocalWorkspaceRuntimeFields } from "../local-workspace-runtime-fields";
 import {
   CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS,
+  DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
   isCodexLocalFastModeSupported,
 } from "@paperclipai/adapter-codex-local";
 
@@ -30,7 +31,9 @@ export function CodexLocalConfigFields({
   hideInstructionsFile,
 }: AdapterConfigFieldsProps) {
   const bypassEnabled =
-    config.dangerouslyBypassApprovalsAndSandbox === true || config.dangerouslyBypassSandbox === true;
+    config.dangerouslyBypassApprovalsAndSandbox === false || config.dangerouslyBypassSandbox === false
+      ? false
+      : DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX;
   const fastModeEnabled = isCreate
     ? Boolean(values!.fastMode)
     : eff("adapterConfig", "fastMode", Boolean(config.fastMode));

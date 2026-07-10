@@ -25,6 +25,7 @@ import { parseCodexJsonl, isCodexUnknownSessionError } from "./parse.js";
 import { pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir } from "./codex-home.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import { envWithCodexPath, resolveCodexCommand } from "./resolve-codex.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROLLOUT_NOISE_RE =
@@ -378,9 +379,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ),
   );
   const billingType = resolveCodexBillingType(effectiveEnv);
-  const runtimeEnv = ensurePathInEnv(effectiveEnv);
-  await ensureCommandResolvable(command, cwd, runtimeEnv);
-  const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
+  const runtimeEnv = ensurePathInEnv(envWithCodexPath(effectiveEnv));
+  const commandForSpawn = await resolveCodexCommand(command, runtimeEnv.PATH);
+  await ensureCommandResolvable(commandForSpawn, cwd, runtimeEnv);
+  const resolvedCommand = await resolveCommandForLogs(commandForSpawn, cwd, runtimeEnv);
   const loggedEnv = buildInvocationEnvForLogs(env, {
     runtimeEnv,
     includeRuntimeKeys: ["HOME"],
@@ -508,7 +510,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runChildProcess(runId, command, args, {
+    const proc = await runChildProcess(runId, commandForSpawn, args, {
       cwd,
       env,
       stdin: prompt,
