@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
+import { badRequest, unauthorized } from "../errors.js";
 import {
   approvalService,
   createEscalation,
@@ -47,11 +48,46 @@ export function approvalRoutes(db: Db) {
     return approval;
   }
 
+  function resolvePendingApprovalCompanyIds(req: Request): string[] | null {
+    const requestedCompanyId = req.query.companyId;
+    if (Array.isArray(requestedCompanyId)) {
+      throw badRequest("companyId must be a single value");
+    }
+    if (typeof requestedCompanyId === "string" && requestedCompanyId.trim()) {
+      const companyId = requestedCompanyId.trim();
+      assertCompanyAccess(req, companyId);
+      return [companyId];
+    }
+
+    if (req.actor.type === "agent") {
+      if (!req.actor.companyId) throw unauthorized();
+      return [req.actor.companyId];
+    }
+
+    if (req.actor.type === "board") {
+      if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
+        return null;
+      }
+      return req.actor.companyIds ?? [];
+    }
+
+    throw unauthorized();
+  }
+
   router.get("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const status = req.query.status as string | undefined;
     const result = await svc.list(companyId, status);
+    res.json(result.map((approval) => redactApprovalPayload(approval)));
+  });
+
+  router.get("/approvals/pending", async (req, res) => {
+    const companyIds = resolvePendingApprovalCompanyIds(req);
+    const result =
+      companyIds === null
+        ? await svc.listAll("pending")
+        : await svc.listForCompanies(companyIds, "pending");
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
 

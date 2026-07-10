@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockApprovalService = vi.hoisted(() => ({
   list: vi.fn(),
+  listForCompanies: vi.fn(),
+  listAll: vi.fn(),
   getById: vi.fn(),
   create: vi.fn(),
   approve: vi.fn(),
@@ -92,6 +94,63 @@ describe("approval routes idempotent retries", () => {
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockListPendingBatchedEscalations.mockResolvedValue([]);
     mockLogActivity.mockResolvedValue(undefined);
+    mockApprovalService.list.mockResolvedValue([]);
+    mockApprovalService.listForCompanies.mockResolvedValue([]);
+    mockApprovalService.listAll.mockResolvedValue([]);
+  });
+
+  it("lists pending approvals from the legacy flat route for agent callers", async () => {
+    mockApprovalService.listForCompanies.mockResolvedValue([
+      {
+        id: "approval-1",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "pending",
+        payload: { title: "Ship it" },
+      },
+    ]);
+
+    const res = await request(await createAgentApp())
+      .get("/api/approvals/pending")
+      .send();
+
+    expect(res.status).toBe(200);
+    expect(mockApprovalService.listForCompanies).toHaveBeenCalledWith(["company-1"], "pending");
+    expect(mockApprovalService.getById).not.toHaveBeenCalled();
+    expect(res.body).toEqual([
+      expect.objectContaining({
+        id: "approval-1",
+        companyId: "company-1",
+        status: "pending",
+      }),
+    ]);
+  });
+
+  it("lists all pending approvals from the legacy flat route for local admin callers", async () => {
+    mockApprovalService.listAll.mockResolvedValue([
+      {
+        id: "approval-1",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "pending",
+        payload: {},
+      },
+    ]);
+
+    const res = await request(await createApp({ source: "local_implicit", isInstanceAdmin: true }))
+      .get("/api/approvals/pending")
+      .send();
+
+    expect(res.status).toBe(200);
+    expect(mockApprovalService.listAll).toHaveBeenCalledWith("pending");
+    expect(mockApprovalService.getById).not.toHaveBeenCalled();
+    expect(res.body).toEqual([
+      expect.objectContaining({
+        id: "approval-1",
+        companyId: "company-1",
+        status: "pending",
+      }),
+    ]);
   });
 
   it("does not emit duplicate approval side effects when approve is already resolved", async () => {

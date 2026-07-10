@@ -91,6 +91,20 @@ export function approvalService(db: Db) {
       return db.select().from(approvals).where(and(...conditions));
     },
 
+    listForCompanies: (companyIds: string[], status?: string) => {
+      if (companyIds.length === 0) return Promise.resolve([]);
+      const conditions = [inArray(approvals.companyId, companyIds)];
+      if (status) conditions.push(eq(approvals.status, status));
+      return db.select().from(approvals).where(and(...conditions));
+    },
+
+    listAll: (status?: string) => {
+      if (status) {
+        return db.select().from(approvals).where(eq(approvals.status, status));
+      }
+      return db.select().from(approvals);
+    },
+
     getById: (id: string) =>
       db
         .select()
