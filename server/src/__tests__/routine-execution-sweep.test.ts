@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  agents,
   companies,
   issueComments,
+  issueRelations,
   issues,
   createDb,
 } from "@paperclipai/db";
@@ -11,7 +13,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { closeStaleRoutineExecutionIssues } from "../services/routine-execution-sweep.js";
+import { clearResolvedIssueBlockers, closeStaleRoutineExecutionIssues } from "../services/routine-execution-sweep.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -33,7 +35,9 @@ describeEmbeddedPostgres("routine-execution-sweep", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -109,5 +113,48 @@ describeEmbeddedPostgres("routine-execution-sweep", () => {
     expect(row.status).toBe("done");
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("clears blocked issues whose blockers are all resolved", async () => {
+    const companyId = await seedCompany();
+    const assigneeAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "blocker", status: "done", priority: "medium" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "blocked",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const count = await clearResolvedIssueBlockers(db);
+
+    expect(count).toBe(1);
+    const [updated] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(updated.status).toBe("todo");
+    const relations = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(relations).toHaveLength(0);
   });
 });

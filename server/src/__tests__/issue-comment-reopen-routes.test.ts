@@ -9,6 +9,7 @@ const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  clearResolvedBlockedIssues: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
 
@@ -142,6 +143,7 @@ describe("issue comment reopen routes", () => {
     mockIssueService.addComment.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.clearResolvedBlockedIssues.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
     mockAccessService.canUser.mockReset();
     mockAccessService.hasPermission.mockReset();
@@ -196,6 +198,7 @@ describe("issue comment reopen routes", () => {
     });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.clearResolvedBlockedIssues.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAccessService.canUser.mockResolvedValue(false);
@@ -298,6 +301,48 @@ describe("issue comment reopen routes", () => {
           issueId: "11111111-1111-4111-8111-111111111111",
         }),
       }),
+    );
+  });
+
+  it("allows persistent agent keys to comment on their own in-progress issue without a heartbeat run id", async () => {
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_progress",
+      assigneeAgentId: "22222222-2222-4222-8222-222222222222",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "manual note",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: "22222222-2222-4222-8222-222222222222",
+      authorUserId: null,
+    });
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: "22222222-2222-4222-8222-222222222222",
+        companyId: "company-1",
+        source: "agent_key",
+      }),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "manual note" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      "manual note",
+      expect.objectContaining({
+        agentId: "22222222-2222-4222-8222-222222222222",
+        runId: null,
+      }),
+      expect.anything(),
     );
   });
 

@@ -26,6 +26,11 @@ const mockSecretService = vi.hoisted(() => ({
   normalizeEnvBindingsForPersistence: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockHeartbeatService = vi.hoisted(() => ({
+  wakeup: vi.fn(),
+  list: vi.fn(),
+  cancelRun: vi.fn(),
+}));
 const mockTrackProjectCreated = vi.hoisted(() => vi.fn());
 const mockTrackGoalCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
@@ -47,6 +52,7 @@ vi.mock("../telemetry.js", () => ({
 
 vi.mock("../services/index.js", () => ({
   goalService: () => mockGoalService,
+  heartbeatService: () => mockHeartbeatService,
   logActivity: mockLogActivity,
   projectService: () => mockProjectService,
   secretService: () => mockSecretService,
@@ -97,6 +103,9 @@ describe("project and goal telemetry routes", () => {
       level: "team",
       status: "planned",
     });
+    mockHeartbeatService.wakeup.mockResolvedValue(null);
+    mockHeartbeatService.list.mockResolvedValue([]);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -116,5 +125,73 @@ describe("project and goal telemetry routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockTrackGoalCreated).toHaveBeenCalledWith(expect.anything(), { goalLevel: "team" });
+  });
+
+  it("starts the owner goal-loop when an active goal has a terminal condition", async () => {
+    const ownerAgentId = "11111111-1111-1111-1111-111111111111";
+    mockGoalService.create.mockResolvedValueOnce({
+      id: "goal-1",
+      companyId: "company-1",
+      title: "Run the loop",
+      description: "Terminal condition: goal is achieved",
+      level: "task",
+      status: "active",
+      ownerAgentId,
+    });
+
+    const res = await request(createApp(goalRoutes({} as any)))
+      .post("/api/companies/company-1/goals")
+      .send({
+        title: "Run the loop",
+        description: "Terminal condition: goal is achieved",
+        status: "active",
+        ownerAgentId,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ownerAgentId,
+      expect.objectContaining({
+        reason: "goal_loop_started",
+        contextSnapshot: expect.objectContaining({
+          goalLoop: true,
+          goalId: "goal-1",
+          terminalCondition: "goal is achieved",
+        }),
+      }),
+    );
+  });
+
+  it("cancels matching goal-loop runs when the goal closes", async () => {
+    mockGoalService.getById.mockResolvedValueOnce({
+      id: "goal-1",
+      companyId: "company-1",
+      title: "Run the loop",
+      description: "Terminal condition: goal is achieved",
+      level: "task",
+      status: "active",
+      ownerAgentId: "agent-1",
+    });
+    mockGoalService.update.mockResolvedValueOnce({
+      id: "goal-1",
+      companyId: "company-1",
+      title: "Run the loop",
+      description: "Terminal condition: goal is achieved",
+      level: "task",
+      status: "achieved",
+      ownerAgentId: "agent-1",
+    });
+    mockHeartbeatService.list.mockResolvedValueOnce([
+      { id: "run-1", status: "running", contextSnapshot: { goalLoop: true, goalId: "goal-1" } },
+      { id: "run-2", status: "running", contextSnapshot: { goalLoop: true, goalId: "other-goal" } },
+    ]);
+
+    const res = await request(createApp(goalRoutes({} as any)))
+      .patch("/api/goals/goal-1")
+      .send({ status: "achieved" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalledWith("run-2");
   });
 });

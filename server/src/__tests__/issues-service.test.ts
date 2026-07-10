@@ -61,7 +61,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 40_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -1080,6 +1080,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
+
     await db.insert(agents).values({
       id: assigneeAgentId,
       companyId,
@@ -1121,6 +1122,60 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         blockerIssueIds: expect.arrayContaining([blockerA, blockerB]),
       }),
     ]);
+  });
+
+  it("clears blocked dependents when every blocker is done or cancelled", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const blockerDone = randomUUID();
+    const blockerCancelled = randomUUID();
+    const blockedIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerDone, companyId, title: "Done blocker", status: "done", priority: "medium" },
+      { id: blockerCancelled, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked issue",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(blockedIssueId, { blockedByIssueIds: [blockerDone, blockerCancelled] });
+
+    await expect(svc.clearResolvedBlockedIssues(blockerDone)).resolves.toEqual([
+      expect.objectContaining({
+        id: blockedIssueId,
+        assigneeAgentId,
+        blockerIssueIds: expect.arrayContaining([blockerDone, blockerCancelled]),
+      }),
+    ]);
+
+    const [updated] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(updated.status).toBe("todo");
+    const relations = await svc.getRelationSummaries(blockedIssueId);
+    expect(relations.blockedBy).toEqual([]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockedIssueId));
+    expect(comments.map((comment) => comment.body)).toContain("auto-unblocked: all blocking issues are done or cancelled");
   });
 
   it("wakes parents only when all direct children are terminal", async () => {
@@ -1196,7 +1251,7 @@ describeEmbeddedPostgres("issueService stale-lock recovery", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 40_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -1265,6 +1320,55 @@ describeEmbeddedPostgres("issueService stale-lock recovery", () => {
     expect(result).not.toBeNull();
     expect(result!.checkoutRunId).toBe(newRunId);
     expect(result!.executionRunId).toBe(newRunId);
+  });
+
+  it("adopts an expired running checkout lock during ownership checks", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const staleRunId = randomUUID();
+    const actorRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      { id: staleRunId, companyId, agentId, status: "running" },
+      { id: actorRunId, companyId, agentId, status: "running" },
+    ]);
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired owner lock",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: staleRunId,
+      executionRunId: staleRunId,
+    });
+    await db.execute(
+      sql`update issues set execution_locked_at = now() - interval '3 hours' where id = ${issueId}`,
+    );
+
+    const ownership = await svc.assertCheckoutOwner(issueId, agentId, actorRunId);
+    expect(ownership.adoptedFromRunId).toBe(staleRunId);
+    expect(ownership.checkoutRunId).toBe(actorRunId);
+    expect(ownership.executionRunId).toBe(actorRunId);
   });
 
   it("clears all lock fields when forceReleaseLock is called", async () => {

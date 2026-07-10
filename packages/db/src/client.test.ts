@@ -467,4 +467,52 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
     },
     20_000,
   );
+
+  it(
+    "repairs migration 0059 history when audit log objects already exist",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const hashChainAuditLogHash = await migrationHash("0059_hash_chain_audit_log.sql");
+
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hashChainAuditLogHash}'`,
+        );
+
+        const rows = await sql.unsafe<{ seq: string; event_type: string; subject_type: string }[]>(
+          `
+            SELECT seq::text, event_type, subject_type
+            FROM "audit_log"
+            WHERE seq = 0
+          `,
+        );
+        expect(rows).toEqual([
+          {
+            seq: "0",
+            event_type: "genesis",
+            subject_type: "audit_log",
+          },
+        ]);
+      } finally {
+        await sql.end();
+      }
+
+      const pendingState = await inspectMigrations(connectionString);
+      expect(pendingState).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0059_hash_chain_audit_log.sql"],
+        reason: "pending-migrations",
+      });
+
+      await applyPendingMigrations(connectionString);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
+    },
+    20_000,
+  );
 });

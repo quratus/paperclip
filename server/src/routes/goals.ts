@@ -3,13 +3,70 @@ import type { Db } from "@paperclipai/db";
 import { createGoalSchema, updateGoalSchema } from "@paperclipai/shared";
 import { trackGoalCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
-import { goalService, logActivity } from "../services/index.js";
+import { goalService, heartbeatService, logActivity } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { getTelemetryClient } from "../telemetry.js";
 
 export function goalRoutes(db: Db) {
   const router = Router();
   const svc = goalService(db);
+  const heartbeat = heartbeatService(db);
+
+  function terminalCondition(description: string | null | undefined) {
+    const match = description?.match(/(?:^|\n)\s*Terminal condition\s*:\s*(.+)/i);
+    return match?.[1]?.trim() || null;
+  }
+
+  async function syncGoalLoop(goal: {
+    id: string;
+    companyId: string;
+    title: string;
+    description: string | null;
+    status: string;
+    ownerAgentId: string | null;
+  }, previous?: { description: string | null; status: string; ownerAgentId: string | null }) {
+    const terminal = terminalCondition(goal.description);
+    if (goal.ownerAgentId && goal.status === "active" && terminal) {
+      const changed =
+        !previous ||
+        previous.status !== "active" ||
+        previous.ownerAgentId !== goal.ownerAgentId ||
+        terminalCondition(previous.description) !== terminal;
+      if (changed) {
+        await heartbeat.wakeup(goal.ownerAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "goal_loop_started",
+          idempotencyKey: `goal-loop:${goal.id}`,
+          contextSnapshot: {
+            goalLoop: true,
+            goalId: goal.id,
+            terminalCondition: terminal,
+            wakeReason: "goal_loop_started",
+          },
+          payload: { goalId: goal.id, terminalCondition: terminal },
+          requestedByActorType: "system",
+          requestedByActorId: "goal-loop",
+        });
+      }
+    }
+
+    if (previous?.status === "active" && (goal.status === "achieved" || goal.status === "cancelled")) {
+      const runs = goal.ownerAgentId ? await heartbeat.list(goal.companyId, goal.ownerAgentId, 50) : [];
+      await Promise.all(
+        runs
+          .filter((run) => {
+            const context = run.contextSnapshot ?? {};
+            return (
+              (run.status === "queued" || run.status === "running") &&
+              context.goalLoop === true &&
+              context.goalId === goal.id
+            );
+          })
+          .map((run) => heartbeat.cancelRun(run.id)),
+      );
+    }
+  }
 
   router.get("/companies/:companyId/goals", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -33,6 +90,7 @@ export function goalRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const goal = await svc.create(companyId, req.body);
+    await syncGoalLoop(goal);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -64,6 +122,8 @@ export function goalRoutes(db: Db) {
       res.status(404).json({ error: "Goal not found" });
       return;
     }
+
+    await syncGoalLoop(goal, existing);
 
     const actor = getActorInfo(req);
     await logActivity(db, {

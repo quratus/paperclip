@@ -386,6 +386,10 @@ export function issueRoutes(
     return null;
   }
 
+  function isManualAgentKeyRequest(req: Request) {
+    return req.actor.type === "agent" && req.actor.source === "agent_key" && !req.actor.runId;
+  }
+
   async function assertAgentRunCheckoutOwnership(
     req: Request,
     res: Response,
@@ -396,6 +400,9 @@ export function issueRoutes(
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
       return false;
+    }
+    if (isManualAgentKeyRequest(req)) {
+      return true;
     }
     if (issue.status !== "in_progress" || issue.assigneeAgentId !== actorAgentId) {
       return true;
@@ -1808,10 +1815,12 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
-        const dependents = await svc.listWakeableBlockedDependents(issue.id);
+      const becameResolvedBlocker =
+        !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
+      if (becameResolvedBlocker) {
+        const dependents = await svc.clearResolvedBlockedIssues(issue.id);
         for (const dependent of dependents) {
+          if (!dependent.assigneeAgentId) continue;
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -39,8 +40,10 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 
-const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked_pending_human", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
+const RESOLVED_BLOCKER_STATUSES = ["done", "cancelled"];
+const AUTO_UNBLOCK_COMMENT = "auto-unblocked: all blocking issues are done or cancelled";
 
 function assertTransition(from: string, to: string) {
   if (from === to) return;
@@ -132,6 +135,12 @@ type IssueRelationSummaryMap = {
 function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   if (actorRunId) return checkoutRunId === actorRunId;
   return checkoutRunId == null;
+}
+
+const LOCK_TTL_MS = 2 * 60 * 60 * 1000; // 2h
+
+function isLockExpired(executionLockedAt: Date | null | undefined, now = new Date()) {
+  return executionLockedAt != null && now.getTime() - executionLockedAt.getTime() > LOCK_TTL_MS;
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
@@ -880,9 +889,10 @@ export function issueService(db: Db) {
     actorAgentId: string;
     actorRunId: string;
     expectedCheckoutRunId: string;
+    expectedExecutionLockedAt?: Date | null;
   }) {
     const stale = await isTerminalOrMissingHeartbeatRun(input.expectedCheckoutRunId);
-    if (!stale) return null;
+    if (!stale && !isLockExpired(input.expectedExecutionLockedAt)) return null;
 
     const now = new Date();
     const adopted = await db
@@ -1349,6 +1359,90 @@ export function issueService(db: Db) {
         }));
     },
 
+    clearResolvedBlockedIssues: async (blockerIssueId?: string) => {
+      return db.transaction(async (tx) => {
+        const baseConditions = [
+          eq(issueRelations.type, "blocks"),
+          eq(issues.status, "blocked"),
+        ];
+        if (blockerIssueId) {
+          baseConditions.push(eq(issueRelations.issueId, blockerIssueId));
+        }
+
+        const candidates = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
+          })
+          .from(issueRelations)
+          .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+          .where(and(...baseConditions));
+        if (candidates.length === 0) return [];
+
+        const candidateIds = [...new Set(candidates.map((candidate) => candidate.id))];
+        const blockerRows = await tx
+          .select({
+            issueId: issueRelations.relatedIssueId,
+            blockerIssueId: issueRelations.issueId,
+            blockerStatus: issues.status,
+          })
+          .from(issueRelations)
+          .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+          .where(and(eq(issueRelations.type, "blocks"), inArray(issueRelations.relatedIssueId, candidateIds)));
+
+        const blockersByIssueId = new Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>();
+        for (const row of blockerRows) {
+          const list = blockersByIssueId.get(row.issueId) ?? [];
+          list.push({ blockerIssueId: row.blockerIssueId, blockerStatus: row.blockerStatus });
+          blockersByIssueId.set(row.issueId, list);
+        }
+
+        const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+        const clearable = [...byId.values()]
+          .map((candidate) => ({
+            ...candidate,
+            blockerIssueIds: (blockersByIssueId.get(candidate.id) ?? []).map((blocker) => blocker.blockerIssueId),
+            allBlockersResolved: (blockersByIssueId.get(candidate.id) ?? []).every((blocker) =>
+              RESOLVED_BLOCKER_STATUSES.includes(blocker.blockerStatus),
+            ),
+          }))
+          .filter((candidate) => candidate.blockerIssueIds.length > 0 && candidate.allBlockersResolved);
+        if (clearable.length === 0) return [];
+
+        const now = new Date();
+        const clearableIds = clearable.map((candidate) => candidate.id);
+        await tx
+          .update(issues)
+          .set({
+            status: "todo",
+            updatedAt: now,
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+          })
+          .where(inArray(issues.id, clearableIds));
+        await tx
+          .delete(issueRelations)
+          .where(and(eq(issueRelations.type, "blocks"), inArray(issueRelations.relatedIssueId, clearableIds)));
+        await tx.insert(issueComments).values(
+          clearable.map((candidate) => ({
+            id: randomUUID(),
+            companyId: candidate.companyId,
+            issueId: candidate.id,
+            body: AUTO_UNBLOCK_COMMENT,
+          })),
+        );
+
+        return clearable.map((candidate) => ({
+          id: candidate.id,
+          assigneeAgentId: candidate.assigneeAgentId,
+          blockerIssueIds: candidate.blockerIssueIds,
+        }));
+      });
+    },
+
     getWakeableParentAfterChildCompletion: async (parentIssueId: string) => {
       const parent = await db
         .select({
@@ -1790,7 +1884,6 @@ export function issueService(db: Db) {
       // applying the execution lock condition so a dead lock can't produce a spurious 409.
       // Two eviction criteria: (1) the lock run is terminal/missing, or (2) the lock is
       // older than LOCK_TTL_MS (covers orphan runs still recorded as "running" in the DB).
-      const LOCK_TTL_MS = 2 * 60 * 60 * 1000; // 2h
       await db.transaction(async (tx) => {
         await tx.execute(
           sql`select id from issues where id = ${id} for update`,
@@ -1881,9 +1974,10 @@ export function issueService(db: Db) {
           id: issues.id,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
@@ -1930,6 +2024,7 @@ export function issueService(db: Db) {
           actorAgentId: agentId,
           actorRunId: checkoutRunId,
           expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionLockedAt: current.executionLockedAt,
         });
         if (adopted) {
           const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
@@ -1967,6 +2062,7 @@ export function issueService(db: Db) {
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
+          executionLockedAt: issues.executionLockedAt,
         })
         .from(issues)
         .where(eq(issues.id, id))
@@ -1994,6 +2090,7 @@ export function issueService(db: Db) {
           actorAgentId,
           actorRunId,
           expectedCheckoutRunId: current.checkoutRunId,
+          expectedExecutionLockedAt: current.executionLockedAt,
         });
 
         if (adopted) {

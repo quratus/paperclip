@@ -373,6 +373,89 @@ async function constraintExists(
   return rows[0]?.exists ?? false;
 }
 
+async function extensionExists(
+  sql: ReturnType<typeof postgres>,
+  extensionName: string,
+): Promise<boolean> {
+  const rows = await sql<{ exists: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM pg_extension
+      WHERE extname = ${extensionName}
+    ) AS exists
+  `;
+  return rows[0]?.exists ?? false;
+}
+
+async function functionExists(
+  sql: ReturnType<typeof postgres>,
+  functionName: string,
+): Promise<boolean> {
+  const rows = await sql<{ exists: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.proname = ${functionName}
+    ) AS exists
+  `;
+  return rows[0]?.exists ?? false;
+}
+
+async function triggerExists(
+  sql: ReturnType<typeof postgres>,
+  tableName: string,
+  triggerName: string,
+): Promise<boolean> {
+  const rows = await sql<{ exists: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relname = ${tableName}
+        AND t.tgname = ${triggerName}
+        AND NOT t.tgisinternal
+    ) AS exists
+  `;
+  return rows[0]?.exists ?? false;
+}
+
+async function auditLogGenesisExists(sql: ReturnType<typeof postgres>): Promise<boolean> {
+  if (!(await tableExists(sql, "audit_log"))) return false;
+  const rows = await sql<{ exists: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM "audit_log"
+      WHERE seq = 0
+        AND company_id IS NULL
+        AND event_type = 'genesis'
+        AND subject_type = 'audit_log'
+    ) AS exists
+  `;
+  return rows[0]?.exists ?? false;
+}
+
+async function tablePrivilegesRevoked(
+  sql: ReturnType<typeof postgres>,
+  tableName: string,
+  grantee: string,
+  privileges: string[],
+): Promise<boolean> {
+  if (!(await tableExists(sql, tableName))) return false;
+  const rows = await sql<{ privilege_type: string }[]>`
+    SELECT privilege_type
+    FROM information_schema.table_privileges
+    WHERE table_schema = 'public'
+      AND table_name = ${tableName}
+      AND grantee = ${grantee}
+      AND privilege_type = ANY(${privileges})
+  `;
+  return rows.length === 0;
+}
+
 async function migrationStatementAlreadyApplied(
   sql: ReturnType<typeof postgres>,
   statement: string,
@@ -399,6 +482,37 @@ async function migrationStatementAlreadyApplied(
   const addConstraintMatch = normalized.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)"/i);
   if (addConstraintMatch) {
     return constraintExists(sql, addConstraintMatch[2]);
+  }
+
+  const createExtensionMatch = normalized.match(/^CREATE EXTENSION IF NOT EXISTS "([^"]+)"/i);
+  if (createExtensionMatch) {
+    return extensionExists(sql, createExtensionMatch[1]);
+  }
+
+  const createFunctionMatch = normalized.match(/^CREATE OR REPLACE FUNCTION ([A-Za-z_][A-Za-z0-9_]*)\(/i);
+  if (createFunctionMatch) {
+    return functionExists(sql, createFunctionMatch[1]);
+  }
+
+  const createTriggerMatch = normalized.match(/^CREATE OR REPLACE TRIGGER ([A-Za-z_][A-Za-z0-9_]*) .* ON "([^"]+)"/i);
+  if (createTriggerMatch) {
+    return triggerExists(sql, createTriggerMatch[2], createTriggerMatch[1]);
+  }
+
+  if (/^INSERT INTO "audit_log"/i.test(normalized)) {
+    return auditLogGenesisExists(sql);
+  }
+
+  const revokePublicMatch = normalized.match(/^REVOKE UPDATE, DELETE ON "([^"]+)" FROM PUBLIC/i);
+  if (revokePublicMatch) {
+    return tablePrivilegesRevoked(sql, revokePublicMatch[1], "PUBLIC", ["UPDATE", "DELETE"]);
+  }
+
+  const revokeRoleMatch = normalized.match(/rolname = '([^']+)'.*REVOKE UPDATE, DELETE ON "([^"]+)" FROM "([^"]+)"/i);
+  if (revokeRoleMatch) {
+    return revokeRoleMatch[1] === revokeRoleMatch[3]
+      ? tablePrivilegesRevoked(sql, revokeRoleMatch[2], revokeRoleMatch[3], ["UPDATE", "DELETE"])
+      : false;
   }
 
   // If we cannot reason about a statement safely, require manual migration.
