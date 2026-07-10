@@ -494,18 +494,21 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
 });
 
 describe("parseSessionCompactionPolicy", () => {
-  it("disables Paperclip-managed rotation by default for codex and claude local", () => {
+  it("keeps codex local unmanaged but rotates claude local on the heartbeat compaction policy by default", () => {
+    // codex_local: native context management, no Paperclip-managed rotation.
     expect(parseSessionCompactionPolicy(buildAgent("codex_local"))).toEqual({
       enabled: true,
       maxSessionRuns: 0,
       maxRawInputTokens: 0,
       maxSessionAgeHours: 0,
     });
+    // claude_local now always uses PAPERCLIP_HEARTBEAT_COMPACTION_POLICY
+    // (session-compaction.ts) — rotate before sessions bloat and die (process_lost).
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
-      maxSessionRuns: 0,
-      maxRawInputTokens: 0,
-      maxSessionAgeHours: 0,
+      maxSessionRuns: 9,
+      maxRawInputTokens: 500_000,
+      maxSessionAgeHours: 4,
     });
   });
 

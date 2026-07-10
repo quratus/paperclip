@@ -39,7 +39,7 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
 // Hard cap for claude_local when running inside a Paperclip heartbeat session.
 const PAPERCLIP_HEARTBEAT_COMPACTION_POLICY: SessionCompactionPolicy = {
   enabled: true,
-  maxSessionRuns: 20,
+  maxSessionRuns: 9,
   maxRawInputTokens: 500_000,
   maxSessionAgeHours: 4,
 };
@@ -59,9 +59,7 @@ export const ADAPTER_SESSION_MANAGEMENT: Record<string, AdapterSessionManagement
   claude_local: {
     supportsSessionResume: true,
     nativeContextManagement: "confirmed",
-    defaultSessionCompaction: process.env.PAPERCLIP_RUN_ID
-      ? PAPERCLIP_HEARTBEAT_COMPACTION_POLICY
-      : ADAPTER_MANAGED_SESSION_POLICY,
+    defaultSessionCompaction: PAPERCLIP_HEARTBEAT_COMPACTION_POLICY,
   },
   codex_local: {
     supportsSessionResume: true,
