@@ -25,6 +25,8 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
+**Brain fallback:** If an org/agent procedure asks for `gbrain` and the command or service is unavailable, say that it failed once and continue by reading the relevant markdown files under `~/SQNCR_BRAIN` with shell tools. Use direct known paths when provided, otherwise discover with `rg --files ~/SQNCR_BRAIN | rg '<topic-slug-or-keyword>'`. `gbrain` is an accelerator, not a single point of failure.
+
 ## The Heartbeat Procedure
 
 Follow these steps every time you wake up:
@@ -122,6 +124,15 @@ If `currentParticipant` does **not** match you, do not try to advance the stage.
 
 **Step 8 — Update status and communicate.** Always include the run ID header.
 If you are blocked at any point, you MUST update the issue to `blocked` before exiting the heartbeat, with a comment that explains the blocker and who needs to act.
+
+**Failed quality gate handoff:** When you fail a quality gate and return implementation child tasks manually, do not leave those children dormant in `in_progress`. For each returned child:
+
+- PATCH it to `todo` for the responsible implementer unless an execution-policy review stage is handling the return automatically.
+- Include `assigneeAgentId` and a clear comment that starts with `@AgentName active reassignment trigger`.
+- State the exact failing evidence and the exact acceptance evidence needed before closure.
+- Set the quality-gate issue to `blocked` with `blockedByIssueIds` pointing at the returned child tasks so the gate wakes automatically when they are done.
+
+This is separate from execution-policy changes-requested flow above, where Paperclip records the decision and routes the executor back through `returnAssignee`.
 
 When writing issue descriptions or comments, follow the ticket-linking rule in **Comment Style** below.
 
@@ -296,6 +307,7 @@ If you are asked to create or manage routines you MUST read:
 - **Never cancel cross-team tasks.** Reassign to your manager with a comment.
 - **Always update blocked issues explicitly.** If blocked, PATCH status to `blocked` with a blocker comment before exiting, then escalate. On subsequent heartbeats, do NOT repeat the same blocked comment — see blocked-task dedup in Step 4.
 - **Use first-class blockers** when a task depends on other tasks. Set `blockedByIssueIds` on the dependent issue so Paperclip automatically wakes the assignee when all blockers are done. Prefer this over ad-hoc "blocked by X" comments.
+- **Returned work must wake the worker.** When reassigning work to another agent after review or quality-gate failure, status must be actionable (`todo`, unless an execution policy handles `in_progress`) and the comment must explicitly mention the assignee as an active reassignment trigger. Do not assume an assignee patch alone starts work.
 - **@-mentions** (`@AgentName` in comments) trigger heartbeats — use sparingly, they cost budget.
 - **Budget**: auto-paused at 100%. Above 80%, focus on critical tasks only.
 - **Escalate** via `chainOfCommand` when stuck. Reassign to manager or create a task for them.

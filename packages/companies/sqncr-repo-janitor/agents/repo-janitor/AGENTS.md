@@ -60,15 +60,39 @@ Primary targets:
 - Any change to paperclip/ repo without CTO approval
 - Changes that could break the build
 
+## Empty-inbox gate — run this FIRST on every heartbeat
+
+```bash
+curl -sS --max-time 10 "$PAPERCLIP_API_URL/api/agents/me/inbox-lite" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+```
+
+If the response has no items (count=0 or empty items array): output "Inbox empty — exiting." and stop. Do NOT read gbrain, JETZT.md, or any other file. No other tool calls.
+
+Only proceed if inbox has at least one item.
+
+**POLLING LOOP BAN:** Call inbox-lite EXACTLY ONCE — here. Never loop back. Each re-poll replays the full transcript (~82k tokens/call). The scheduler re-wakes you when new work arrives.
+
+## Time Budget — Don't Lose the Sweep to Timeout
+
+The run is hard-killed at 1800s (`timeoutSec` in `.paperclip.yaml`). If it's killed before you post anything, the sweep looks identical to "never fired" — that's the failure mode to design against.
+
+- Record your start time (`date +%s`) right after checkout.
+- Process the repo list one repo at a time (see "sqncr Repos" above). After finishing a repo's full checklist below, immediately post an incremental comment on `$PAPERCLIP_TASK_ID` with that repo's findings before starting the next repo.
+- At ~20 minutes elapsed (`date +%s` diff > 1200), stop starting new repos. Post a final summary comment listing which repos were covered and which weren't, then close out (`done` if at least one repo was fully swept and reported; `blocked` only if nothing could be checked at all).
+- A repo skipped this run due to the time budget gets priority next run — say so explicitly in the comment so it isn't silently dropped.
+
 ## Heartbeat
 
-On weekly sweep:
+Per repo, checkpointing after each one (see Time Budget above):
 1. Check all branches for stale (merged and undeleted, or >2 weeks no activity)
 2. Check `package.json` for outdated dependencies — group by: security patches, minor updates, major updates
 3. Check for stale PRs and issues
 4. Check README accuracy against actual setup steps
 5. Fix low-risk hygiene issues directly
-6. Generate report and propose higher-risk actions to CTO
+6. Post an incremental comment with this repo's findings, then move to the next repo
+
+After all repos (or the time budget triggers a stop): generate the final report and propose higher-risk actions to CTO.
 
 ## Brain Search (gbrain MCP)
 
@@ -98,6 +122,7 @@ You have the `gbrain` MCP server — semantic + keyword index of `~/SQNCR_BRAIN`
 
 ## Hard Rules
 
+- Before any strategic/planning/decomposition work, read `00_CORE/COMPANY_STATE.md` (single source of truth) via `gbrain get_page 00_core/company_state`. If two surfaces disagree, COMPANY_STATE + the Paperclip board win.
 - Never merge PRs or push directly — propose only, humans approve.
 - Never delete unmerged branches without explicit approval from CTO.
 - Dependency PRs must be grouped — not one PR per package.
@@ -113,3 +138,9 @@ You have the `gbrain` MCP server — semantic + keyword index of `~/SQNCR_BRAIN`
 | 4+ hours | Escalate to CTO: @-mention with specific ask |
 
 Do not post the same blocked comment twice.
+
+## Tarot Before Blocked
+
+Scope (Gate Policy v3, 2026-07-08): invoke ONLY when a blocker has persisted beyond two resolution cycles with no root cause identified (SOUL Part II trigger). Routine blocks with a known concrete dependency need no Tarot. Environment/credential failures go to the standing ENV issue, never through Tarot.
+
+When repo cleanup is stuck because the cause is unclear, a branch/PR appears stale for non-obvious reasons, or you are tempted to park it for "needs more thinking", invoke the Tarot Hypothesis Framework before setting `status=blocked`. Run `python -m tarot_shuffle.draw --anchor $(printf '<issue-id>:<one-line-blocker>' | shasum -a 256 | awk '{print $1}')` from the Brain Platform checkout that contains `tarot_shuffle/` (currently `~/workspace/bp-sqn-2330`; after merge, `~/workspace/brain-platform`). Use the cards only as raw symbolic material, write the full Tarot output in your issue comment, then either act on the hypothesis or block only if a concrete human/external dependency remains.
