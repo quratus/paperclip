@@ -1,9 +1,24 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { onboard } from "../commands/onboard.js";
 import type { PaperclipConfig } from "../config/schema.js";
+
+// Keep Tailscale detection hermetic: simulate a host without Tailscale so the
+// "keeps tailnet quickstart on loopback until tailscale is available" test does
+// not pick up a real tailnet IP when the machine is on a tailnet. Every other
+// execFileSync call passes through unchanged.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    execFileSync: ((file: string, args?: unknown, options?: unknown) => {
+      if (file === "tailscale") throw new Error("tailscale unavailable (mocked)");
+      return (actual.execFileSync as (...a: unknown[]) => unknown)(file, args, options);
+    }) as typeof actual.execFileSync,
+  };
+});
 
 const ORIGINAL_ENV = { ...process.env };
 

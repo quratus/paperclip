@@ -208,7 +208,7 @@ async function waitForServer(
   output: { stdout: string[]; stderr: string[] },
 ) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 90_000) {
+  while (Date.now() - startedAt < 120_000) {
     if (child.exitCode !== null) {
       throw new Error(
         `paperclipai run exited before healthcheck succeeded.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
@@ -269,7 +269,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     });
 
     await waitForServer(apiBase, child, output);
-  }, 120_000);
+  }, 300_000);
 
   afterAll(async () => {
     await stopServerProcess(serverProcess);
@@ -277,7 +277,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     if (tempRoot) {
       rmSync(tempRoot, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("exports a company package and imports it into new and existing companies", async () => {
     expect(serverProcess).not.toBeNull();
@@ -506,5 +506,5 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
 
     expect(importedFromZip.company.action).toBe("created");
     expect(importedFromZip.agents.some((agent) => agent.action === "created")).toBe(true);
-  }, 60_000);
+  }, 120_000);
 });

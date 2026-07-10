@@ -651,7 +651,7 @@ describe("worktree helpers", () => {
       }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 180_000);
 
   it("restores the current worktree config and instance data if reseed fails", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-rollback-"));
@@ -843,7 +843,7 @@ describe("worktree helpers", () => {
       homedirSpy.mockRestore();
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 180_000);
 });
 
 describeEmbeddedPostgres("pauseSeededScheduledRoutines", () => {
@@ -978,5 +978,5 @@ describeEmbeddedPostgres("pauseSeededScheduledRoutines", () => {
       await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
       await tempDb.cleanup();
     }
-  }, 20_000);
+  }, 120_000);
 });

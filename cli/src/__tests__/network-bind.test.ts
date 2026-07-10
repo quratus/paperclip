@@ -1,6 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { resolveRuntimeBind, validateConfiguredBindMode } from "@paperclipai/shared";
 import { buildPresetServerConfig } from "../config/server-bind.js";
+
+// Keep Tailscale detection hermetic: simulate a host without Tailscale so the
+// "no tailscale address available" fallback assertions don't pick up a real
+// tailnet IP when the dev/CI machine happens to be on a tailnet. Every other
+// execFileSync call passes through unchanged.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    execFileSync: ((file: string, args?: unknown, options?: unknown) => {
+      if (file === "tailscale") throw new Error("tailscale unavailable (mocked)");
+      return (actual.execFileSync as (...a: unknown[]) => unknown)(file, args, options);
+    }) as typeof actual.execFileSync,
+  };
+});
 
 describe("network bind helpers", () => {
   it("rejects non-loopback bind modes in local_trusted", () => {
