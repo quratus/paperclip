@@ -2512,6 +2512,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     const context = parseObject(input.latestRun?.contextSnapshot);
+    const latestRunErrorCode = readNonEmptyString(input.latestRun?.errorCode);
+    const transitionReason = latestRunErrorCode && TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(latestRunErrorCode)
+      ? "runtime_failure"
+      : null;
     const workspaceValidation = input.recoveryCause === "workspace_validation_failed"
       ? readWorkspaceValidationPayload(input.latestRun)
       : null;
@@ -2525,6 +2529,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       latestRunErrorCode: input.latestRun?.errorCode ?? null,
       retryReason: readNonEmptyString(context.retryReason) ?? null,
       recoveryCause: input.recoveryCause,
+      ...(transitionReason ? { transitionReason } : {}),
       sourceRunId: input.successfulRunHandoffEvidence?.sourceRunId ?? null,
       correctiveRunId: input.successfulRunHandoffEvidence?.correctiveRunId ?? null,
       missingDisposition: input.successfulRunHandoffEvidence?.missingDisposition ?? null,
