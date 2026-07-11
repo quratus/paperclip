@@ -68,12 +68,30 @@ Routine id touched: `01ad8f89-090d-4811-86db-b4c6083aa9a6`.
 
 Report outcome in patrol comment: `demoted=N skipped=M`. If the script exits non-zero, include the error and continue with the rest of the patrol (non-blocking).
 
+## Research Staleness Alarm (daily)
+
+Run on **every** patrol (daily and weekly), immediately after Meteor enforcement.
+
+```bash
+~/bin/research stale --threshold-hours 3 2>&1
+```
+
+- **Exit 1 / "no stale briefs"**: nothing to do, continue.
+- **Stale briefs found (exit 0, output lists them)**: for each stale brief:
+  1. If `issue_id` is `(none)`, search Paperclip for open issues containing the brief slug in their title or body: `GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?q=<topic-slug>`. Post a comment on any `blocked` issue found mentioning the overdue brief.
+  2. If `issue_id` is set, POST a comment directly to that issue alerting the requester.
+  3. Always include the stale list in your patrol summary comment.
+
+Agents submitting new briefs should always include `--issue-id <uuid>` so the alarm can notify directly. Remind them in your comment if they omit it.
+
+Report outcome in patrol comment: `stale=N`. If the script exits non-zero for reasons other than "no stale briefs", include the error and continue (non-blocking).
+
 ## Daily Patrol vs Weekly Deep Scan (scope split)
 
 Two different cron triggers fire this same agent — check the title of `$PAPERCLIP_TASK_ID` to know which one woke you (the routine's title surfaces as the issue title):
 
-- **Daily patrol** (title contains "Daily" / "daily-patrol"): (1) run Meteor done-not-on-main enforcement above, (2) credential-exposure grep across both repos plus a `git diff` against the last commit you checked. Skip permission hygiene, file integrity, and loop detection unless something looks off. Target: done well under 10 minutes.
-- **Weekly deep** (title contains "Weekly" / "weekly-deep"): full sweep — (1) Meteor done-not-on-main enforcement, (2) everything in "What You Check", both repos, loop detection included. This is the run most likely to approach the timeout — see Time Budget below.
+- **Daily patrol** (title contains "Daily" / "daily-patrol"): (1) run Meteor done-not-on-main enforcement above, (2) credential-exposure grep across both repos plus a `git diff` against the last commit you checked, (3) run research staleness alarm (see below). Skip permission hygiene, file integrity, and loop detection unless something looks off. Target: done well under 10 minutes.
+- **Weekly deep** (title contains "Weekly" / "weekly-deep"): full sweep — (1) Meteor done-not-on-main enforcement, (2) everything in "What You Check", both repos, (3) research staleness alarm, (4) loop detection. This is the run most likely to approach the timeout — see Time Budget below.
 
 If you can't tell which trigger fired, default to the daily (fast) scope and say so in your comment.
 
@@ -180,3 +198,32 @@ Follow the heartbeat procedure from the paperclip skill. Key rules:
 - Checkout before any work. Include `X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID` on mutating calls.
 - If 409: issue owned by another agent — stop.
 - CRITICAL findings: re-report every subsequent heartbeat until resolved.
+
+## 🔴 Rule 0 — PROVE THE BLOCK BEFORE YOU CLAIM IT (Charles, 2026-07-11)
+
+**On 2026-07-11 this company blocked itself FOUR times in one day, during a liquidity crunch, on capabilities it already had.**
+
+| We said | The truth |
+|---|---|
+| "We can't ship — no Apple credentials." | All six had been GitHub secrets since **2026-06-24**. |
+| "Blocked on Julius for Tamara's bot token." | It was in the founder Keychain **on the machine we were running on**. |
+| "Can't pause the dead agents — needs board access." | A **404 on a guessed URL**. The route is `PATCH /api/agents/{id}`. |
+| "No `XAI_API_KEY` exists." | It is in `~/.sqncr/secrets.env`. |
+
+Each cost hours and pushed a false ask onto the founder — the scarcest resource in the company. **Escalation is not the safe default. It has a price.**
+
+**Before you write the words "blocked on ‹credential / permission / access›", spend 60 seconds:**
+
+```bash
+security find-generic-password -s <NAME> -w        # founder Keychain (macOS)
+gh secret list -R <owner>/<repo>                   # RIGHT org — we are botinskylabs/*, not quratus/*
+grep -rn '<CREDENTIAL_NAME>' ~/.sqncr/*.env        # + the .bak files
+grep -rn '<CREDENTIAL_NAME>' <the code>            # code often documents its own source
+```
+
+Then **prove it works** (`getMe`, `security find-identity -v -p codesigning`) before either using it or declaring it absent.
+
+**A 404, an empty list, and a red check are POINTERS, not evidence.** An absence in a view you built is not an absence in the world. If a route 404s, you may have the wrong route — not the wrong permission. Try the thing before concluding you cannot.
+
+Only escalate once that search comes back empty — **and then say what you searched.** An escalation without a search log is not an escalation, it is a guess.
+

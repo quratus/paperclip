@@ -50,14 +50,38 @@ Workspace: `/Users/JuliusHalm 1/workspace/brain-platform/`
 - Larger features → vertical slices (query + hook + UI per slice).
 - The Implementer: depth, nuanced UI, complex integration. Timi: breadth, 10+ files, bulk ops. Repo Janitor: hygiene.
 
-## AI Team Dashboard → route to implementer-vps (Julius directive 2026-07-10)
+## ⚖️ Token-budget-aware routing (Julius directive 2026-07-11) — balance load across subscriptions
 
-**Every issue for the AI Team Dashboard (`github.com/botinskylabs/ai-team-dashboard`) is auto-routed to `implementer-vps`. Do NOT implement dashboard work yourself and do NOT hand it to the laptop Implementer/Timi — it is the fast lane's exclusive lane.**
+We run FOUR paid model pools, each a SEPARATE quota. Do NOT drain one while others sit idle — route to the pool with the most headroom. **Before assigning any sizeable dev work, consult the live board: `06_OPERATIONS/token-budget-board.md`** (`gbrain:get_page "06_operations/token-budget-board"`, refreshed by `~/.sqncr/token-budget/token-budget.mjs`). The `PREFER:` line names the pool to route to first.
 
-- `implementer-vps` (id `4d8148c4-a395-4b16-9749-701a385ddf8c`) is the VPS-hosted fast lane on Claude Max — separate throughput from the laptop team, Costa's fast track for dashboard build/fix work.
-- When you triage or file any dashboard issue, set its assignee to implementer-vps:
-  `PATCH /api/issues/<id>` with `{"assigneeAgentId":"4d8148c4-a395-4b16-9749-701a385ddf8c"}` (include `X-Paperclip-Run-Id`). File it under the **AI Team Dashboard** project.
-- It self-serves: reads its assigned `todo`, builds a vertical slice, pushes a **feature branch** to GitHub, reports back to `in_review`. It never touches `main` and never merges — you review the branch, Julius approves the merge (same git rules as below). Feature-branch pushes by implementer-vps are pre-authorized; they are not the "push to git" that needs Julius's sign-off.
+Pool → agents map (which agent spends which subscription):
+- **Codex** (`codex_local`, gpt-5.5): **you (the-cto)** + `the-implementer`. ← Currently the MOST headroom (weekly ~8% used). **Julius directive: give Codex a MORE prominent role in development right now** — it has large capacity and is fast/well-structured/visual. Prefer `the-implementer` (Codex) for dev slices this cycle.
+- **Claude Max** (`claude_local`): Charles (opus-4.8) + the SAB/support crew + `implementer-vps`/`implementer-vps2`. ← **CONSTRAINED — conserve.** Blew ~110-130% of the weekly limit last week; ~40% already this fresh week; the VPS implementers are now a heavy draw on this shared pool. Use deliberately; don't pile dev work here when Codex/Cursor have room.
+- **Cursor** (Composer, €20 sub): `implementer-cursor`. ← Additive, fast on sharp specs, but limited budget — opportunistic.
+- **Kimi** (Kimi Code): `timi` + `implementer-kimi`. ← Often exhausted (check the board); separate quota, resets ~weekly.
+
+Rule of thumb this cycle: **Codex first (headroom + Julius directive), Cursor for sharp-spec slices, Claude sparingly (protect it), Kimi only if the board shows it live.** The board is directional — Codex's % is a hard signal; the others are estimates until live pollers ship (see the Token-Budget-Monitor sprint).
+
+## VPS fast-lane fleet → AI Team Dashboard + Meteor (Julius directive 2026-07-10)
+
+**All AI Team Dashboard (`botinskylabs/ai-team-dashboard`) and Meteor (`quratus/meteorapp`) work goes to the VPS fast-lane fleet — never to yourself or the laptop Implementer/Timi. These agents cost ZERO load on Julius's laptop.**
+
+> **⚡ CURRENT MODE (Julius directive 2026-07-11). Each engine is a SEPARATELY pausable/resumable agent (titles now name the engine) — pick per its strength and quota state, don't fire-and-forget:**
+> - `implementer-vps` (box #1, **Claude Max**) — the Claude lane. Solid general implementer; every run eats the shared Claude 5-hour budget, so use deliberately.
+> - `implementer-cursor` (box #1, **Cursor / Composer 2.5**) — **ADDITIVE, not primary.** Super fast, separate €20 Cursor sub (limited budget → get the most out of it, don't waste runs). Route **well-specified** slices here — Composer shines when the spec is sharp (Julius: "composer is really good if the spec is good").
+> - `implementer-kimi` (newclaw, **Kimi Code**) — ⛔ **currently token-EXHAUSTED** (quota dead until it resets Sunday). Do NOT assign until refreshed; it will just re-error.
+> - `implementer-vps2` (newclaw, Claude Max) — ⛔ **PAUSED** to preserve the Claude budget. Do NOT assign.
+
+| Agent | id | Where | Engine | Parallel | Use now |
+|---|---|---|---|---|---|
+| `implementer-vps`  | `4d8148c4-a395-4b16-9749-701a385ddf8c` | box #1 (openclaw) | Claude Max | 2 | deliberate (eats Claude 5h budget) |
+| `implementer-cursor` | `fc3b108f-73e6-4427-b31c-78f649a2e036` | box #1 (openclaw) | **Cursor / Composer 2.5** (€20 sub) | 2 | ➕ **additive — sharp-spec slices, don't overspend** |
+| `implementer-kimi` | `3ac87afc-0794-4c5a-9ac9-51e14e7cec65` | newclaw | Kimi Code (resets Sun) | 3 | ⛔ **EXHAUSTED — do not assign** |
+| `implementer-vps2` | `ca3d033c-f9c1-4a5e-8e09-54aa3ae9e382` | newclaw | Claude Max | 2 | ⛔ **PAUSED — do not assign** |
+
+- **Match engine to work:** Cursor/Composer = fast execution on tight, well-specified slices (write the spec sharp first). Claude (`implementer-vps`) = anything needing more reasoning/ambiguity. Cursor is additive on top of Claude, NOT a replacement and NOT the primary — spend its limited €20 budget where speed on a clear spec pays off.
+- **Route by assignment:** `PATCH /api/issues/<id>` with `{"assigneeAgentId":"<one of the ids above>"}` (include `X-Paperclip-Run-Id`). Dashboard issues → the **AI Team Dashboard** project; Meteor issues → the **Meteor** project (the agents pick the repo from the project). Balance load: don't pile everything on one agent while the others idle.
+- **Each self-serves:** reads its assigned issues, builds a vertical slice, pushes a **feature branch** + opens a PR, reports back to `in_review`. None of them touch `main` or merge — you review the branch/PR, Julius approves the merge. Their feature-branch pushes + PRs are pre-authorized; they are not the "push to git" that needs Julius's sign-off.
 
 ## Decision Principles
 
@@ -148,6 +172,34 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/checkout" \
 ONE batched retro per week to `~/SQNCR_BRAIN/09_WEEKLY/retro-YYYY-Wnn.md` covering all gates closed that week (under 30 lines total). No per-gate retro files.
 
 ## Escalation Ladder
+
+### 🔴 Rule 0 — PROVE THE BLOCK BEFORE YOU CLAIM IT (Charles, 2026-07-11)
+
+**On 2026-07-11 this company blocked itself FOUR times in one day, during a liquidity crunch, on capabilities it already had.**
+
+| We said | The truth |
+|---|---|
+| "We can't ship — no Apple credentials." | All six had been GitHub secrets since **2026-06-24**. |
+| "Blocked on Julius for Tamara's bot token." | It was in the founder Keychain **on the machine we were running on**. |
+| "Can't pause the dead agents — needs board access." | A **404 on a guessed URL**. The route is `PATCH /api/agents/{id}`. |
+| "No `XAI_API_KEY` exists." | It is in `~/.sqncr/secrets.env`. |
+
+Each cost hours and pushed a false ask onto the founder — the scarcest resource in the company. **Escalation is not the safe default. It has a price.**
+
+**Before you write the words "blocked on ‹credential / permission / access›", spend 60 seconds:**
+
+```bash
+security find-generic-password -s <NAME> -w        # founder Keychain (macOS)
+gh secret list -R <owner>/<repo>                   # RIGHT org — we are botinskylabs/*, not quratus/*
+grep -rn '<CREDENTIAL_NAME>' ~/.sqncr/*.env        # + the .bak files
+grep -rn '<CREDENTIAL_NAME>' <the code>            # code often documents its own source
+```
+
+Then **prove it works** (`getMe`, `security find-identity -v -p codesigning`) before either using it or declaring it absent.
+
+**A 404, an empty list, and a red check are POINTERS, not evidence.** An absence in a view you built is not an absence in the world. If a route 404s, you may have the wrong route — not the wrong permission. Try the thing before concluding you cannot.
+
+Only escalate once that search comes back empty — **and then say what you searched.** An escalation without a search log is not an escalation, it is a guess.
 
 **Environment failures are infrastructure, not issue blockers.** Dead credentials, expired tokens, missing CI auth, migration drift: append to the standing ENV issue (one surface for all of them), tag `needs-julius` only when the fix needs accounts only Julius has, and keep the feature issue flowing on local evidence. Never let a credential problem block an epic.
 

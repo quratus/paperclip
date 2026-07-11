@@ -71,9 +71,40 @@ Start every task: `gbrain:get_page "00_core/jetzt"` to confirm priority, then `g
 
 Read the project's AGENTS.md before writing code on a new issue. It defines the stack, workspace layout, IPC/API architecture, design system, build/test commands, and project-specific rules.
 
+When claiming what is already built or merged, run `git fetch` and verify against `origin/main`. Do not treat the local branch or dated `_BUILD_AUDIT_*.md` files as current truth.
+
 **brain-platform (`~/workspace/brain-platform`):** Before any task: `git -C ~/workspace/brain-platform checkout v2.0 && git pull` — NEVER commit to `main`. Cut a feature branch from v2.0. For brain-shots: `BRAIN_SHOT=1 BRAIN_SHOT_BRAIN_ROOT=~/SQNCR_BRAIN pnpm --filter @brain-platform/ui dev`, wait for window, then `brain-shot --dashboard`.
 
 ## Escalation Ladder
+
+### 🔴 Rule 0 — PROVE THE BLOCK BEFORE YOU CLAIM IT (Charles, 2026-07-11)
+
+**On 2026-07-11 this company blocked itself FOUR times in one day, during a liquidity crunch, on capabilities it already had.**
+
+| We said | The truth |
+|---|---|
+| "We can't ship — no Apple credentials." | All six had been GitHub secrets since **2026-06-24**. |
+| "Blocked on Julius for Tamara's bot token." | It was in the founder Keychain **on the machine we were running on**. |
+| "Can't pause the dead agents — needs board access." | A **404 on a guessed URL**. The route is `PATCH /api/agents/{id}`. |
+| "No `XAI_API_KEY` exists." | It is in `~/.sqncr/secrets.env`. |
+
+Each cost hours and pushed a false ask onto the founder — the scarcest resource in the company. **Escalation is not the safe default. It has a price.**
+
+**Before you write the words "blocked on ‹credential / permission / access›", spend 60 seconds:**
+
+```bash
+security find-generic-password -s <NAME> -w        # founder Keychain (macOS)
+gh secret list -R <owner>/<repo>                   # RIGHT org — we are botinskylabs/*, not quratus/*
+grep -rn '<CREDENTIAL_NAME>' ~/.sqncr/*.env        # + the .bak files
+grep -rn '<CREDENTIAL_NAME>' <the code>            # code often documents its own source
+```
+
+Then **prove it works** (`getMe`, `security find-identity -v -p codesigning`) before either using it or declaring it absent.
+
+**A 404, an empty list, and a red check are POINTERS, not evidence.** An absence in a view you built is not an absence in the world. If a route 404s, you may have the wrong route — not the wrong permission. Try the thing before concluding you cannot.
+
+Only escalate once that search comes back empty — **and then say what you searched.** An escalation without a search log is not an escalation, it is a guess.
+
 
 | Time blocked | Action |
 |---|---|
