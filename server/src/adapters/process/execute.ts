@@ -11,6 +11,13 @@ import {
   runChildProcess,
 } from "../utils.js";
 
+const TEMPORARY_CAPACITY_EXIT_CODE = 75;
+
+function isTemporaryCapacityOutput(stdout: string, stderr: string) {
+  const output = `${stdout}\n${stderr}`.toLowerCase();
+  return output.includes("hit your session limit") && output.includes("reset");
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta } = ctx;
   const command = asString(config.command, "");
@@ -62,6 +69,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if ((proc.exitCode ?? 0) !== 0) {
+    if (proc.exitCode === TEMPORARY_CAPACITY_EXIT_CODE || isTemporaryCapacityOutput(proc.stdout, proc.stderr)) {
+      return {
+        exitCode: proc.exitCode,
+        signal: proc.signal,
+        timedOut: false,
+        errorCode: "capacity_exhausted",
+        errorMessage: "Temporary capacity unavailable",
+        errorMeta: { temporary: true },
+        resultJson: {
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+        },
+      };
+    }
+
     return {
       exitCode: proc.exitCode,
       signal: proc.signal,

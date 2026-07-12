@@ -10338,7 +10338,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out" | "capacity_exhausted",
     failureReason?: string | null,
     options?: { keepIdleOnFailure?: boolean },
   ) {
@@ -10355,6 +10355,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const nextStatus =
       runningCount > 0
         ? "running"
+        : outcome === "capacity_exhausted"
+          ? "at_capacity"
         : outcome === "succeeded" || outcome === "interrupted" || outcome === "cancelled" || (outcome === "failed" && options?.keepIdleOnFailure)
           ? "idle"
           : "error";
@@ -13084,7 +13086,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
+        if (livenessRun.status === "failed" && livenessRun.errorCode === "capacity_exhausted" && issueId) {
+          await requeueCapacityExhaustedIssue(livenessRun, issueId);
+        } else {
+          await releaseIssueExecutionAndPromote(livenessRun);
+        }
         await handleRunLivenessContinuation(livenessRun);
         await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
@@ -13155,7 +13161,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       await finalizeAgentStatus(
         agent.id,
-        outcome,
+        outcome === "failed" && runErrorCode === "capacity_exhausted" ? "capacity_exhausted" : outcome,
         outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
         {
           keepIdleOnFailure:
@@ -13507,6 +13513,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  async function requeueCapacityExhaustedIssue(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+    await db.transaction(async (tx) => {
+      const issue = await tx
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!issue || issue.status === "done" || issue.status === "cancelled") return;
+
+      const now = new Date();
+      await tx
+        .update(issues)
+        .set({
+          status: "todo",
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          checkoutRunId: null,
+          updatedAt: now,
+        })
+        .where(eq(issues.id, issue.id));
+
+      await tx.insert(issueComments).values({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        authorAgentId: issue.assigneeAgentId ?? run.agentId,
+        createdByRunId: run.id,
+        body: [
+          "Awaiting capacity: the assigned agent could not start because runner capacity or provider quota was unavailable.",
+          "",
+          `Issue: ${issue.title}`,
+          `Run: ${run.id}`,
+          "Paperclip requeued this issue to `todo` and cleared its execution lock. This is not an agent error; route elsewhere or retry when capacity is available.",
+        ].join("\n"),
+      });
+    });
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -13624,6 +13668,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+
+      if (run.status === "failed" && run.errorCode === "capacity_exhausted" && issue.status !== "done" && issue.status !== "cancelled") {
+        await tx
+          .update(issues)
+          .set({
+            status: "todo",
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            checkoutRunId: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(eq(issues.id, issue.id));
+
+        await tx.insert(issueComments).values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          authorAgentId: issue.assigneeAgentId ?? run.agentId,
+          createdByRunId: run.id,
+          body: [
+            "Awaiting capacity: the assigned agent could not start because runner capacity or provider quota was unavailable.",
+            "",
+            `Issue: ${issue.title}`,
+            `Run: ${run.id}`,
+            "Paperclip requeued this issue to `todo` and cleared its execution lock. This is not an agent error; route elsewhere or retry when capacity is available.",
+          ].join("\n"),
+        });
+
+        return null;
+      }
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
