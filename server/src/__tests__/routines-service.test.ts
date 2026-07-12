@@ -2511,7 +2511,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       );
       if (proposeResult.status !== "proposed") throw new Error("expected proposed result");
 
-      await svc.updateRoutine(
+      await svc.update(
         routine.id,
         { description: "Human edited instructions", baseRevisionId: routine.latestRevisionId },
         { userId: "board-user" },
