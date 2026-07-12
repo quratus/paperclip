@@ -18,6 +18,7 @@ export const AGENT_STATUSES = [
   "paused",
   "idle",
   "running",
+  "at_capacity",
   "error",
   "pending_approval",
   "terminated",

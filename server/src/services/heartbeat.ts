@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { classifyGate, plateauDetector, runVerifier, type BillingType, type ExecutionWorkspace, type ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -946,6 +946,8 @@ export function mergeCoalescedContextSnapshot(
 async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
+  agentId: string;
+  currentRunId: string;
   contextSnapshot: Record<string, unknown>;
   issueSummary?:
     | {
@@ -960,6 +962,14 @@ async function buildPaperclipWakePayload(input: {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
+  const siblingRun = issueId
+    ? await findEarlierLiveSiblingIssueRun(input.db, {
+        companyId: input.companyId,
+        agentId: input.agentId,
+        issueId,
+        currentRunId: input.currentRunId,
+      })
+    : null;
   const issueSummary =
     input.issueSummary ??
     (issueId
@@ -975,7 +985,9 @@ async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
-  if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
+  if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary && !siblingRun) {
+    return null;
+  }
 
   const commentRows =
     commentIds.length === 0
@@ -1055,6 +1067,8 @@ async function buildPaperclipWakePayload(input: {
     executionStage: Object.keys(executionStage).length > 0 ? executionStage : null,
     commentIds,
     latestCommentId: commentIds[commentIds.length - 1] ?? null,
+    siblingRunActive: siblingRun != null,
+    siblingRunId: siblingRun?.id ?? null,
     comments,
     commentWindow: {
       requestedCount: commentIds.length,
@@ -1064,6 +1078,44 @@ async function buildPaperclipWakePayload(input: {
     truncated,
     fallbackFetchNeeded: truncated || missingCommentCount > 0,
   };
+}
+
+async function findEarlierLiveSiblingIssueRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    currentRunId: string;
+  },
+) {
+  const currentRun = await db
+    .select({ createdAt: heartbeatRuns.createdAt })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, input.currentRunId))
+    .then((rows) => rows[0] ?? null);
+  if (!currentRun) return null;
+
+  return db
+    .select({
+      id: heartbeatRuns.id,
+      createdAt: heartbeatRuns.createdAt,
+      startedAt: heartbeatRuns.startedAt,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.status, "running"),
+        ne(heartbeatRuns.id, input.currentRunId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+        lt(heartbeatRuns.createdAt, currentRun.createdAt),
+      ),
+    )
+    .orderBy(asc(heartbeatRuns.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
 }
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
@@ -1819,6 +1871,25 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0]);
   }
 
+  async function recordRunFailureInRuntimeState(
+    run: typeof heartbeatRuns.$inferSelect,
+    message: string,
+  ) {
+    const agent = await getAgent(run.agentId);
+    if (!agent) return;
+    await ensureRuntimeState(agent);
+    await db
+      .update(agentRuntimeState)
+      .set({
+        adapterType: agent.adapterType,
+        lastRunId: run.id,
+        lastRunStatus: run.status,
+        lastError: message,
+        updatedAt: new Date(),
+      })
+      .where(eq(agentRuntimeState.agentId, agent.id));
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -2245,6 +2316,7 @@ export function heartbeatService(db: Db) {
           .update(issues)
           .set({
             executionRunId: retryRun.id,
+            checkoutRunId: retryRun.id,
             executionAgentNameKey: normalizeAgentNameKey(agent.name),
             executionLockedAt: now,
             updatedAt: now,
@@ -2380,7 +2452,7 @@ export function heartbeatService(db: Db) {
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "capacity_exhausted",
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -2395,6 +2467,8 @@ export function heartbeatService(db: Db) {
     const nextStatus =
       runningCount > 0
         ? "running"
+        : outcome === "capacity_exhausted"
+          ? "at_capacity"
         : outcome === "succeeded" || outcome === "cancelled"
           ? "idle"
           : "error";
@@ -2504,6 +2578,11 @@ export function heartbeatService(db: Db) {
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
+
+      await recordRunFailureInRuntimeState(
+        finalizedRun,
+        finalizedRun.error ?? (shouldRetry ? `${baseMessage}; retrying once` : baseMessage),
+      );
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       if (shouldRetry) {
@@ -2703,6 +2782,45 @@ export function heartbeatService(db: Db) {
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
+    if (issueId) {
+      const siblingRun = await findEarlierLiveSiblingIssueRun(db, {
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId,
+        currentRunId: run.id,
+      });
+      if (siblingRun) {
+        await issuesSvc.addComment(
+          issueId,
+          `Superseded by live sibling run ${siblingRun.id}.`,
+          { agentId: agent.id, runId: run.id },
+          { metadata: { kind: "heartbeat_live_sibling_exit", siblingRunId: siblingRun.id } },
+        );
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: `Skipped before discovery because live sibling run ${siblingRun.id} already owns this issue`,
+          payload: { issueId, siblingRunId: siblingRun.id },
+        });
+        await setRunStatus(run.id, "succeeded", {
+          finishedAt: new Date(),
+          error: null,
+          errorCode: null,
+          resultJson: {
+            skipped: true,
+            reason: "live_sibling_run",
+            issueId,
+            siblingRunId: siblingRun.id,
+          },
+        });
+        await setWakeupStatus(run.wakeupRequestId, "succeeded", {
+          finishedAt: new Date(),
+        });
+        await finalizeAgentStatus(run.agentId, "succeeded");
+        return;
+      }
+    }
     const issueContext = issueId
       ? await db
           .select({
@@ -2795,6 +2913,8 @@ export function heartbeatService(db: Db) {
     const paperclipWakePayload = await buildPaperclipWakePayload({
       db,
       companyId: agent.companyId,
+      agentId: agent.id,
+      currentRunId: run.id,
       contextSnapshot: context,
       issueSummary: issueRef
         ? {
@@ -3509,10 +3629,11 @@ export function heartbeatService(db: Db) {
 
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
+        const capacityExhausted = adapterResult.errorCode === "capacity_exhausted";
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
+          level: outcome === "succeeded" ? "info" : capacityExhausted ? "warn" : "error",
           message: `run ${outcome}`,
           payload: {
             status,
@@ -3560,7 +3681,12 @@ export function heartbeatService(db: Db) {
           }
         }
       }
-      await finalizeAgentStatus(agent.id, outcome);
+      await finalizeAgentStatus(
+        agent.id,
+        outcome === "failed" && adapterResult.errorCode === "capacity_exhausted"
+          ? "capacity_exhausted"
+          : outcome,
+      );
     } catch (err) {
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
@@ -3732,6 +3858,41 @@ export function heartbeatService(db: Db) {
 
       if (!issue) return;
 
+      if (run.status === "failed" && run.errorCode === "capacity_exhausted" && issue.status !== "done" && issue.status !== "cancelled") {
+        const now = new Date();
+        await tx
+          .update(issues)
+          .set({
+            status: "todo",
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            checkoutRunId: null,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, issue.id));
+
+        await tx.insert(issueComments).values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          authorAgentId: issue.assigneeAgentId ?? run.agentId,
+          createdByRunId: run.id,
+          body: [
+            "Awaiting capacity: the assigned agent could not start because all runner slots were busy.",
+            "",
+            `Issue: ${issue.title}`,
+            `Run: ${run.id}`,
+            "Paperclip requeued this issue to `todo` and cleared its execution lock. This is not an agent error; route elsewhere or retry when capacity is available.",
+          ].join("\n"),
+          metadata: {
+            kind: "capacity_exhausted_requeue",
+            transitionReason: "runner_at_capacity",
+          },
+        });
+
+        return null;
+      }
+
       if ((run.status === "failed" || run.status === "timed_out") && issue.status !== "done" && issue.status !== "cancelled") {
         const recentRuns = await tx
           .select({
@@ -3767,10 +3928,12 @@ export function heartbeatService(db: Db) {
 
         if (plateau.isStuck && !verifier.verified && gateState === "batched_escalate") {
           const now = new Date();
+          const isRuntimeFailure = plateau.reason === "repeating_error";
+          const nextStatus = isRuntimeFailure ? "blocked" : "blocked_pending_human";
           await tx
             .update(issues)
             .set({
-              status: "blocked_pending_human",
+              status: nextStatus,
               executionRunId: null,
               executionAgentNameKey: null,
               executionLockedAt: null,
@@ -3784,20 +3947,32 @@ export function heartbeatService(db: Db) {
             issueId: issue.id,
             authorAgentId: issue.assigneeAgentId ?? run.agentId,
             createdByRunId: run.id,
-            body: [
-              "Blocked pending human: stuck execution loop detected.",
-              "",
-              `Issue: ${issue.title}`,
-              `Detector: ${plateau.reason}`,
-              `Verifier: ${verifier.method} (${verifier.evidence})`,
-              `Gate: ${gateState}`,
-              "",
-              "Paperclip stopped promoting queued execution for this issue because the last two live runs produced the same failing outcome.",
-            ].join("\n"),
+            body: isRuntimeFailure
+              ? [
+                  "Blocked: runtime failure loop detected.",
+                  "",
+                  `Issue: ${issue.title}`,
+                  `Detector: ${plateau.reason}`,
+                  `Verifier: ${verifier.method} (${verifier.evidence})`,
+                  `Gate: ${gateState}`,
+                  "",
+                  "Paperclip stopped promoting queued execution for this issue because the last two live runs produced the same failing runtime outcome. Reassign this issue to a healthy lane before resuming.",
+                ].join("\n")
+              : [
+                  "Blocked pending human: stuck execution loop detected.",
+                  "",
+                  `Issue: ${issue.title}`,
+                  `Detector: ${plateau.reason}`,
+                  `Verifier: ${verifier.method} (${verifier.evidence})`,
+                  `Gate: ${gateState}`,
+                  "",
+                  "Paperclip stopped promoting queued execution for this issue because the last two live runs produced the same non-runtime outcome.",
+                ].join("\n"),
             metadata: {
               kind: "stuck_detection_transition",
               gateState,
               plateauReason: plateau.reason,
+              transitionReason: isRuntimeFailure ? "runtime_failure" : "human_review_required",
               verifier,
             },
           });
