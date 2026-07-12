@@ -84,7 +84,6 @@ export interface Routine {
   concurrencyPolicy: string;
   catchUpPolicy: string;
   evolutionMode: string;
-  consecutiveAutoEvolutions: number;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];

@@ -273,7 +273,6 @@ function createRoutine(overrides: Partial<RoutineListItem>): RoutineListItem {
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
     evolutionMode: "off",
-    consecutiveAutoEvolutions: 0,
     variables: [],
     latestRevisionId: null,
     latestRevisionNumber: 1,
