@@ -63,6 +63,59 @@ describeEmbeddedPostgres("companyService", () => {
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
 
+  it("exposes operating mode, pilot allowlist, and draining run count", async () => {
+    const companyId = randomUUID();
+    const allowedAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Operating Mode Co",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      operatingMode: "pilot",
+      pilotAllowlist: [allowedAgentId],
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: allowedAgentId,
+        companyId,
+        name: "Allowed Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      { id: randomUUID(), companyId, agentId: allowedAgentId, invocationSource: "timer", status: "queued" },
+      { id: randomUUID(), companyId, agentId: allowedAgentId, invocationSource: "timer", status: "running" },
+      { id: randomUUID(), companyId, agentId: otherAgentId, invocationSource: "timer", status: "scheduled_retry" },
+      { id: randomUUID(), companyId, agentId: otherAgentId, invocationSource: "timer", status: "succeeded" },
+    ]);
+
+    const company = await companyService(db).getById(companyId);
+
+    expect(company).toMatchObject({
+      operatingMode: "pilot",
+      pilotAllowlist: [allowedAgentId],
+      drainingRunCount: 3,
+    });
+  });
+
   it("archives companies by pausing runnable agents and cancelling active runs", async () => {
     const companyId = randomUUID();
     const runningAgentId = randomUUID();

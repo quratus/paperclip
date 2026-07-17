@@ -166,6 +166,10 @@ import {
   type AgentOrgRow,
 } from "./agent-invokability.js";
 import {
+  evaluateCompanyAdmission,
+  OPERATING_MODE_DENIAL_REASON,
+} from "./company-operating-mode.js";
+import {
   redactQuarantinedBodyForHigherTrust,
   sanitizeQuarantinedCommentForHigherTrust,
 } from "./source-trust.js";
@@ -10140,7 +10144,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     const company = await db
-      .select({ status: companies.status })
+      .select({
+        status: companies.status,
+        operatingMode: companies.operatingMode,
+        pilotAllowlist: companies.pilotAllowlist,
+      })
       .from(companies)
       .where(eq(companies.id, agent.companyId))
       .then((rows) => rows[0] ?? null);
@@ -10152,6 +10160,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       await writeSkippedRequest("company.inactive", {
         error: `Wake suppressed because company status is ${companyStatus}`,
+      });
+      return null;
+    }
+
+    const admission = evaluateCompanyAdmission(company, agent.id);
+    if (!admission.admitted) {
+      if (opts.requestedByActorType === "user") {
+        throw conflict(admission.message ?? "Company operating mode blocks this wakeup", {
+          operatingMode: admission.mode,
+          agentId: agent.id,
+        });
+      }
+      await writeSkippedRequest(admission.reason ?? OPERATING_MODE_DENIAL_REASON, {
+        error: admission.message ?? "Wake suppressed by company operating mode",
       });
       return null;
     }

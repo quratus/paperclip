@@ -133,6 +133,46 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     return { companyId, managerId, childId };
   }
 
+  async function insertOperatingModeAgent(input: {
+    operatingMode: "active" | "pilot" | "frozen";
+    pilotAllowlist?: string[];
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Operating Mode Co",
+      status: "active",
+      operatingMode: input.operatingMode,
+      pilotAllowlist: input.pilotAllowlist ?? [],
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Operating Mode Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          intervalSec: 60,
+          wakeOnDemand: true,
+        },
+      },
+      permissions: {},
+      createdAt: new Date("2026-06-04T00:00:00Z"),
+      lastHeartbeatAt: new Date("2026-06-04T00:00:00Z"),
+    });
+
+    return { companyId, agentId };
+  }
+
   it("does not iterate archived-company agents in tickTimers", async () => {
     const { agentId } = await insertArchivedAgent();
 
@@ -260,6 +300,56 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
       .from(heartbeatRuns)
       .then((rows) => rows.filter((row) => row.agentId === agentId).length);
     expect(runCount).toBe(0);
+  });
+
+  it("rejects explicit user invokes when company operating mode is frozen", async () => {
+    const { agentId } = await insertOperatingModeAgent({ operatingMode: "frozen" });
+
+    const heartbeat = heartbeatService(db);
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { operatingMode: "frozen", agentId },
+    });
+
+    const runCount = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.filter((row) => row.agentId === agentId).length);
+    expect(runCount).toBe(0);
+  });
+
+  it("records skipped scheduler wakeups for pilot agents outside the allowlist", async () => {
+    const { agentId } = await insertOperatingModeAgent({ operatingMode: "pilot", pilotAllowlist: [] });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2026-06-04T00:10:00Z"));
+
+    expect(result).toMatchObject({
+      checked: 1,
+      enqueued: 0,
+      skipped: 1,
+    });
+
+    const wakeup = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .then((rows) => rows[0] ?? null);
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "company.operating_mode",
+      error: "Company operating mode is pilot; this agent is not in the pilot allowlist",
+    });
   });
 
   it("rejects explicit user invokes for invalid-org-chain agents", async () => {

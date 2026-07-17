@@ -1,10 +1,13 @@
-import type { CompanyStatus, PauseReason } from "../constants.js";
+import type { CompanyOperatingMode, CompanyStatus, PauseReason } from "../constants.js";
 
 export interface Company {
   id: string;
   name: string;
   description: string | null;
   status: CompanyStatus;
+  operatingMode: CompanyOperatingMode;
+  pilotAllowlist: string[];
+  drainingRunCount: number;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   issuePrefix: string;

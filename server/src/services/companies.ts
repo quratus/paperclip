@@ -33,6 +33,7 @@ import { notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
+import { normalizeCompanyOperatingMode, normalizePilotAllowlist } from "./company-operating-mode.js";
 
 export interface CompanyActivityActor {
   actorType: "user" | "agent" | "system" | "plugin";
@@ -126,6 +127,14 @@ export function companyService(db: Db) {
     name: companies.name,
     description: companies.description,
     status: companies.status,
+    operatingMode: companies.operatingMode,
+    pilotAllowlist: companies.pilotAllowlist,
+    drainingRunCount: sql<number>`(
+      select count(*)::int
+      from ${heartbeatRuns}
+      where ${heartbeatRuns.companyId} = ${companies.id}
+        and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+    )`,
     issuePrefix: companies.issuePrefix,
     issueCounter: companies.issueCounter,
     budgetMonthlyCents: companies.budgetMonthlyCents,
@@ -145,6 +154,9 @@ export function companyService(db: Db) {
   function enrichCompany<T extends { logoAssetId: string | null }>(company: T) {
     return {
       ...company,
+      operatingMode: normalizeCompanyOperatingMode((company as T & { operatingMode?: string | null }).operatingMode),
+      pilotAllowlist: normalizePilotAllowlist((company as T & { pilotAllowlist?: unknown }).pilotAllowlist),
+      drainingRunCount: Number((company as T & { drainingRunCount?: number | string | null }).drainingRunCount ?? 0),
       logoUrl: company.logoAssetId ? `/api/assets/${company.logoAssetId}/content` : null,
     };
   }

@@ -42,6 +42,7 @@ export {
 } from "./trust-policy.js";
 export {
   COMPANY_STATUSES,
+  COMPANY_OPERATING_MODES,
   DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
   DEPLOYMENT_MODES,
@@ -176,6 +177,7 @@ export {
   PLUGIN_EVENT_TYPES,
   PLUGIN_BRIDGE_ERROR_CODES,
   type CompanyStatus,
+  type CompanyOperatingMode,
   type DeploymentMode,
   type DeploymentExposure,
   type BindMode,

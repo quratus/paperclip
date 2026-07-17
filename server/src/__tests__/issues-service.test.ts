@@ -317,6 +317,136 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("allows checkout in active mode and pilot mode for allowlisted agents", async () => {
+    const activeCompanyId = await seedAssignableAgentCompany();
+    const activeAgentId = randomUUID();
+    await db.insert(agents).values(agentRow(activeCompanyId, {
+      id: activeAgentId,
+      name: "ActiveModeCoder",
+    }));
+    const activeIssue = await svc.create(activeCompanyId, {
+      title: "Active mode checkout",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: activeAgentId,
+    });
+    const activeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId: activeCompanyId,
+      agentId: activeAgentId,
+      invocationSource: "assignment",
+      status: "running",
+    });
+
+    const activeCheckout = await svc.checkout(activeIssue.id, activeAgentId, ["todo"], activeRunId);
+    expect(activeCheckout.status).toBe("in_progress");
+
+    const pilotCompanyId = await seedAssignableAgentCompany();
+    const pilotAgentId = randomUUID();
+    await db
+      .update(companies)
+      .set({ operatingMode: "pilot", pilotAllowlist: [pilotAgentId] })
+      .where(eq(companies.id, pilotCompanyId));
+    await db.insert(agents).values(agentRow(pilotCompanyId, {
+      id: pilotAgentId,
+      name: "PilotModeCoder",
+    }));
+    const pilotIssue = await svc.create(pilotCompanyId, {
+      title: "Pilot mode checkout",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: pilotAgentId,
+    });
+    const pilotRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: pilotRunId,
+      companyId: pilotCompanyId,
+      agentId: pilotAgentId,
+      invocationSource: "assignment",
+      status: "running",
+    });
+
+    const pilotCheckout = await svc.checkout(pilotIssue.id, pilotAgentId, ["todo"], pilotRunId);
+    expect(pilotCheckout.status).toBe("in_progress");
+  });
+
+  it("rejects checkout in frozen mode before mutating issue state", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.update(companies).set({ operatingMode: "frozen" }).where(eq(companies.id, companyId));
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "FrozenModeCoder",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Frozen mode checkout",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    await expect(svc.checkout(issue.id, agentId, ["todo"], randomUUID()))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          operatingMode: "frozen",
+          agentId,
+        },
+      });
+
+    const persisted = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0] ?? null);
+    expect(persisted).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("rejects checkout in pilot mode for agents outside the allowlist", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.update(companies).set({ operatingMode: "pilot", pilotAllowlist: [] }).where(eq(companies.id, companyId));
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "NonPilotCoder",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Pilot denied checkout",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    await expect(svc.checkout(issue.id, agentId, ["todo"], randomUUID()))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          operatingMode: "pilot",
+          agentId,
+        },
+      });
+
+    const persisted = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0] ?? null);
+    expect(persisted).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
   it("rejects moving an existing terminated assignment into progress without clearing it", async () => {
     const companyId = await seedAssignableAgentCompany();
     const assigneeAgentId = randomUUID();

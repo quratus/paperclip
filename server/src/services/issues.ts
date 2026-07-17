@@ -86,6 +86,7 @@ import {
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { evaluateCompanyAdmission } from "./company-operating-mode.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -5439,12 +5440,26 @@ export function issueService(db: Db) {
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({
+          companyId: issues.companyId,
+          operatingMode: companies.operatingMode,
+          pilotAllowlist: companies.pilotAllowlist,
+        })
         .from(issues)
+        .innerJoin(companies, eq(companies.id, issues.companyId))
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
+      const admission = evaluateCompanyAdmission(issueCompany, agentId);
+      if (!admission.admitted) {
+        throw conflict(admission.message ?? "Company operating mode blocks issue checkout", {
+          issueId: id,
+          companyId: issueCompany.companyId,
+          operatingMode: admission.mode,
+          agentId,
+        });
+      }
 
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
