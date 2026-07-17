@@ -463,6 +463,15 @@ function isSpawnLikeFailureMessage(value: unknown) {
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
 }
 
+function isProcessCapacityExhaustionResultJson(resultJson: unknown): boolean {
+  const result = parseObject(resultJson);
+  return result.processCapacityExhausted === true || result.capacityStatus === "at_capacity";
+}
+
+function isProcessCapacityExhaustionAdapterResult(result: AdapterExecutionResult): boolean {
+  return isProcessCapacityExhaustionResultJson(result.resultJson);
+}
+
 function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
@@ -10352,7 +10361,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean },
+    options?: { keepIdleOnFailure?: boolean; capacityExhausted?: boolean },
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -10365,8 +10374,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runningCount = await countRunningRunsForAgent(agentId);
     const nextStatus =
-      runningCount > 0
-        ? "running"
+      options?.capacityExhausted
+        ? "at_capacity"
+        : runningCount > 0
+          ? "running"
         : outcome === "succeeded" || outcome === "interrupted" || outcome === "cancelled" || (outcome === "failed" && options?.keepIdleOnFailure)
           ? "idle"
           : "error";
@@ -12873,6 +12884,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       let outcome: RunSessionOutcome;
       const latestRun = await getRun(run.id);
+      const capacityExhausted = isProcessCapacityExhaustionAdapterResult(adapterResult);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
       } else if (adapterResult.timedOut) {
@@ -13018,6 +13030,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       let persistedRun = persistedRunWrite.run;
+      if (capacityExhausted) {
+        await db
+          .update(agents)
+          .set({
+            status: "at_capacity",
+            errorReason: null,
+            lastHeartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(and(eq(agents.id, agent.id), notInArray(agents.status, ["paused", "terminated"])));
+        if (issueId) {
+          const [capacityIssue] = await db
+            .update(issues)
+            .set({
+              status: "todo",
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              checkoutRunId: null,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.id, issueId),
+                eq(issues.assigneeAgentId, agent.id),
+                isNull(issues.assigneeUserId),
+                inArray(issues.status, ["todo", "in_progress"]),
+              ),
+            )
+            .returning();
+          if (capacityIssue) {
+            await issuesSvc.addComment(
+              capacityIssue.id,
+              [
+                "Capacity unavailable: the assigned fast-lane runner reported all slots busy.",
+                "",
+                "Paperclip returned this issue to `todo` so a later wake, scheduler, or human can pick it up instead of leaving it assigned-and-idle with no trace.",
+              ].join("\n"),
+              { agentId: agent.id, runId: run.id },
+            );
+          }
+        }
+      }
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
@@ -13178,6 +13233,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           keepIdleOnFailure:
             outcome === "failed" &&
             (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
+          capacityExhausted,
         },
       );
     } catch (err) {
@@ -13665,7 +13721,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
         };
       }
-
 
       while (true) {
         const deferred = await tx

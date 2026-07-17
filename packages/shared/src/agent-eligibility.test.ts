@@ -64,6 +64,18 @@ describe("agent work eligibility", () => {
     });
   });
 
+  it("allows at-capacity agents to keep assignments and be invoked later", () => {
+    const target = agent({ status: "at_capacity" });
+    const manager = agent({ id: "manager-1", name: "CTO", status: "active", reportsTo: null });
+
+    expect(getAgentWorkEligibility({ agent: target, agents: [target, manager] })).toMatchObject({
+      assignable: true,
+      invokable: true,
+      assignabilityReason: "eligible",
+      invokabilityReason: "eligible",
+    });
+  });
+
   it("reports unknown lifecycle statuses explicitly", () => {
     const target = agent({ status: "sabbatical" });
     const manager = agent({ id: "manager-1", name: "CTO", status: "active", reportsTo: null });

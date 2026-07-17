@@ -186,6 +186,14 @@ function defaultStateDir(companyId: string, agentId: string): string {
   return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "acp-engine", "agents", agentId);
 }
 
+function hasShellTokenWhitespace(value: string): boolean {
+  return /\s/.test(value);
+}
+
+function wrapperCommandAliasDir(stateDir: string): string {
+  return path.join(os.tmpdir(), "paperclip-acpx-wrappers", shortHash(path.resolve(stateDir)));
+}
+
 function resolveManagedCodexHomeDir(companyId: string): string {
   return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "codex-home");
 }
@@ -861,7 +869,7 @@ async function writeAgentWrapper(input: {
   agentCommandShell: string;
   env: Record<string, string>;
   childStderrDir: string;
-}): Promise<{ wrapperPath: string; envFilePath: string }> {
+}): Promise<{ wrapperPath: string; envFilePath: string; commandPath: string }> {
   const wrappersDir = path.join(input.stateDir, "wrappers");
   await fs.mkdir(wrappersDir, { recursive: true });
   const envLines = Object.entries(input.env)
@@ -909,7 +917,32 @@ async function writeAgentWrapper(input: {
     wrappersDir,
     currentFileNames: new Set([path.basename(wrapperPath), path.basename(envFilePath)]),
   });
-  return { wrapperPath, envFilePath };
+  const commandPath = await ensureWhitespaceSafeWrapperCommandPath({
+    stateDir: input.stateDir,
+    wrapperPath,
+  });
+  return { wrapperPath, envFilePath, commandPath };
+}
+
+async function ensureWhitespaceSafeWrapperCommandPath(input: {
+  stateDir: string;
+  wrapperPath: string;
+}): Promise<string> {
+  if (!hasShellTokenWhitespace(input.wrapperPath)) return input.wrapperPath;
+
+  const aliasDir = wrapperCommandAliasDir(input.stateDir);
+  await fs.mkdir(aliasDir, { recursive: true, mode: 0o700 });
+  const aliasPath = path.join(aliasDir, path.basename(input.wrapperPath));
+  const currentTarget = await fs.readlink(aliasPath).catch(() => null);
+  if (currentTarget !== input.wrapperPath) {
+    await fs.rm(aliasPath, { force: true });
+    await fs.symlink(input.wrapperPath, aliasPath);
+  }
+  await cleanupStaleAgentWrappers({
+    wrappersDir: aliasDir,
+    currentFileNames: new Set([path.basename(aliasPath)]),
+  });
+  return aliasPath;
 }
 
 async function cleanupStaleAgentWrappers(input: { wrappersDir: string; currentFileNames: Set<string> }) {
@@ -1177,7 +1210,8 @@ async function buildRuntime(input: {
     await paperclipBridge?.stop().catch(() => {});
     throw err;
   }
-  const overrideCommand = processSessionBridge?.agentCommand ?? wrapperPath;
+  const wrapperCommandPath = wrapper?.commandPath ?? null;
+  const overrideCommand = processSessionBridge?.agentCommand ?? wrapperCommandPath;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
   const agentRegistry = createAgentRegistry({ overrides });
   const fingerprint = shortHash({
@@ -1207,7 +1241,7 @@ async function buildRuntime(input: {
   const loggedEnv = buildInvocationEnvForLogs(env, {
     runtimeEnv,
     includeRuntimeKeys: ["HOME"],
-    resolvedCommand: wrapperPath ?? agentCommand ?? acpxAgent,
+    resolvedCommand: wrapperCommandPath ?? agentCommand ?? acpxAgent,
   });
 
   return {
@@ -1640,6 +1674,12 @@ function classifyError(
     ...(phase ? { phase } : {}),
   };
   const lower = message.toLowerCase();
+  if (isAcpxMaxTurnsSignal(lower)) {
+    return {
+      errorCode: "acpx_max_turns",
+      errorMeta: { category: "max_turns", ...baseMeta },
+    };
+  }
   const authLike = lower.includes("auth") || lower.includes("login") || lower.includes("credential");
   if (authLike) {
     return {
@@ -1673,6 +1713,28 @@ function classifyError(
     errorCode: "acpx_runtime_error",
     errorMeta: { category: "runtime", ...baseMeta },
   };
+}
+
+function isAcpxMaxTurnsSignal(value: unknown): boolean {
+  const lower = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return (
+    lower === "error_max_turns" ||
+    lower === "max_turns" ||
+    lower === "max_turns_exhausted" ||
+    lower === "turn_limit_exhausted" ||
+    lower.includes("subtype=error_max_turns")
+  );
+}
+
+function terminalErrorCode(input: {
+  status: "completed" | "failed" | "cancelled";
+  timedOut: boolean;
+  stopReason: string | null | undefined;
+}): AdapterExecutionResult["errorCode"] {
+  if (input.timedOut) return "acpx_timeout";
+  if (input.status !== "failed") return null;
+  if (isAcpxMaxTurnsSignal(input.stopReason)) return "acpx_max_turns";
+  return "acpx_turn_failed";
 }
 
 async function readChildStderrTail(input: {
@@ -2156,7 +2218,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         signal: timedOut ? "SIGTERM" : null,
         timedOut,
         errorMessage,
-        errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+        errorCode: terminalErrorCode({
+          status: terminal.status,
+          timedOut,
+          stopReason: terminalStopReason,
+        }),
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,

@@ -603,6 +603,45 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("allows delegated agent configuration changes when agent and responsible user have configure grants", async () => {
+    const company = await createCompany(db, "ResponsibleUserAgentConfig");
+    const actorAgent = await createAgent(db, company.id, { role: "ceo" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const responsibleUserId = await createUser(db);
+    await grantAgentPermission(db, company.id, actorAgent.id, "agents:configure");
+    await grantUserPermission(db, company.id, responsibleUserId, "agents:configure");
+
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      onBehalfOfUserId: responsibleUserId,
+      source: "agent_jwt" as const,
+    };
+    const resource = { type: "agent" as const, companyId: company.id, agentId: targetAgent.id };
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "agent_config:read",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_explicit_grant",
+      grant: { permissionKey: "agents:configure" },
+    });
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "agent_config:update",
+      resource,
+      scope: { requiresChangeGrant: true },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_direct_change",
+      grant: { permissionKey: "agents:configure" },
+    });
+  });
+
   it("limits low-trust issue reads to the configured project and root issue boundary", async () => {
     const company = await createCompany(db, "LowTrustIssueReads");
     const project = await createProject(db, company.id, "Allowed");

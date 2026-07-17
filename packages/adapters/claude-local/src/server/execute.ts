@@ -1017,10 +1017,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
-    const resolvedErrorCode = loginMeta.requiresLogin
-      ? "claude_auth_required"
-      : failed && clearSessionForMaxTurns
+    const resolvedErrorCode = failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
+      : loginMeta.requiresLogin
+      ? "claude_auth_required"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
       : providerQuota

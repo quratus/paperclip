@@ -104,6 +104,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
+const mockRoutineService = vi.hoisted(() => ({
+  syncRunStatusForIssue: vi.fn(async () => undefined),
+}));
 const mockExternalObjectService = vi.hoisted(() => ({
   getIssueSummaries: vi.fn(async () => new Map()),
   getIssueSummary: vi.fn(async () => ({
@@ -222,9 +225,7 @@ function registerRouteMocks() {
     taskWatchdogService: () => mockTaskWatchdogService,
     logActivity: mockLogActivity,
     projectService: () => ({}),
-    routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
-    }),
+    routineService: () => mockRoutineService,
     workProductService: () => mockWorkProductService,
   }));
 }
@@ -489,6 +490,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockReset();
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockRoutineService.syncRunStatusForIssue.mockReset();
+    mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
     mockIssueApprovalService.link.mockReset();
     mockIssueApprovalService.unlink.mockReset();
     mockIssueApprovalService.listApprovalsForIssue.mockReset();
@@ -1437,6 +1440,65 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
     expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", { title: "Updated product" });
   });
+
+  it("preserves committed issue updates when post-commit activity logging fails", async () => {
+    const app = await createApp(ownerActor());
+
+    mockLogActivity.mockRejectedValueOnce(new Error("activity write failed"));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Updated despite activity log failure" })
+      .expect(200);
+
+    expect(res.body.title).toBe("Updated despite activity log failure");
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ title: "Updated despite activity log failure" }),
+    );
+  }, 20_000);
+
+  it("preserves committed issue updates when routine sync fails after commit", async () => {
+    const app = await createApp(ownerActor());
+
+    mockRoutineService.syncRunStatusForIssue.mockRejectedValueOnce(new Error("routine sync failed"));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Updated despite routine sync failure" })
+      .expect(200);
+
+    expect(res.body.title).toBe("Updated despite routine sync failure");
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ title: "Updated despite routine sync failure" }),
+    );
+  }, 20_000);
+
+  it("preserves committed issue updates and comments when comment activity logging fails", async () => {
+    const app = await createApp(ownerActor());
+
+    mockLogActivity
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("comment activity write failed"));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Updated with comment", comment: "status update" })
+      .expect(200);
+
+    expect(res.body.title).toBe("Updated with comment");
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ title: "Updated with comment" }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "status update",
+      expect.any(Object),
+      expect.any(Object),
+    );
+  }, 20_000);
 
   it("preserves board mutations on active checkouts", async () => {
     const app = await createApp(boardActor());

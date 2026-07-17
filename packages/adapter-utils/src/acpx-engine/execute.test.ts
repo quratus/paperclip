@@ -554,6 +554,35 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(env).not.toContain("old-key");
   });
 
+  it("uses a whitespace-safe command alias when the wrapper path contains spaces", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state with spaces");
+
+    const { runtimeOptions } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+    });
+
+    const wrappersDir = path.join(stateDir, "wrappers");
+    const wrappers = await fs.readdir(wrappersDir);
+    const realWrapperPath = path.join(
+      wrappersDir,
+      wrappers.find((name) => name.endsWith(".sh"))!,
+    );
+    expect(realWrapperPath).toContain(" ");
+
+    const agentRegistry = runtimeOptions[0]?.agentRegistry as
+      | { resolve?: (agent: string) => { command?: string } | string | null }
+      | undefined;
+    const resolved = agentRegistry?.resolve?.("custom");
+    const command = typeof resolved === "string" ? resolved : resolved?.command;
+
+    expect(command).toBeTruthy();
+    expect(command).not.toContain(" ");
+    expect(await fs.readlink(command!)).toBe(realWrapperPath);
+  });
+
   it("shapes ACPX wrapper workspace env for remote execution identities", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
@@ -1444,6 +1473,60 @@ describe("shared ACP engine execution timeouts", () => {
     expect(result.errorMessage).toBe(expectedMessage);
     expect(cancelReasons).toContain(expectedMessage);
   }, 15_000);
+
+  it("classifies ACPX max-turn terminal failures distinctly from auth failures", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({
+            status: "failed",
+            error: {
+              message:
+                "Claude run failed: subtype=error_max_turns: Reached maximum number of turns (30)",
+            },
+          }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-max-turns-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "claude",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_max_turns");
+    expect(result.errorCode).not.toBe("acpx_auth_required");
+    expect(result.errorCode).not.toBe("acpx_turn_failed");
+    expect(result.resultJson).toMatchObject({
+      status: "failed",
+      stopReason: expect.stringContaining("subtype=error_max_turns"),
+    });
+    expect(result.summary).toContain("subtype=error_max_turns");
+  });
 });
 
 describe("summarizeAcpxTurnUsage", () => {

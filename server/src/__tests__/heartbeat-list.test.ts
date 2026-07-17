@@ -71,6 +71,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
       lastUsefulActionAt: new Date("2026-04-18T12:00:00Z"),
       nextAction: "continue implementation",
       contextSnapshot: { issueId: randomUUID() },
+      resultJson: { stdout: "x".repeat(10_000), summary: "expensive payload" },
     });
 
     const originalDescriptor = Object.getOwnPropertyDescriptor(heartbeatRuns, "processGroupId");
@@ -84,6 +85,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
       const runs = await heartbeatService(db).list(companyId, agentId, 5);
       expect(runs).toHaveLength(1);
       expect(runs[0]?.id).toBe(runId);
+      expect(runs[0]?.resultJson).toBeNull();
       expect(runs[0]?.processGroupId ?? null).toBeNull();
       expect(runs[0]).toMatchObject({
         livenessState: "advanced",

@@ -11,8 +11,11 @@ import {
   assets,
   companies,
   companyMemberships,
+  costEvents,
   documentRevisions,
   documents,
+  feedbackVotes,
+  financeEvents,
   goals,
   heartbeatRuns,
   routineRuns,
@@ -6514,6 +6517,23 @@ export function issueService(db: Db) {
           .select({ documentId: issueDocuments.documentId })
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
+
+        // Several issueId FKs in this schema have no onDelete cascade/set-null
+        // (unlike most others, which do), so a hard issue delete violates whichever
+        // one has a row first: issue_comments (soft-delete elsewhere leaves the row
+        // in place), issue_thread_interactions, issue_read_states,
+        // issue_inbox_archives, feedback_votes, cost_events, finance_events.
+        // Pure interaction/UI-state rows are hard-deleted with the issue. cost/finance
+        // events represent real spend tracking, so those are detached (issueId -> null)
+        // rather than deleted, matching this schema's existing set-null convention for
+        // similar non-owning links (e.g. heartbeatRunWatchdogDecisions.evaluationIssueId).
+        await tx.delete(issueComments).where(eq(issueComments.issueId, id));
+        await tx.delete(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, id));
+        await tx.delete(issueReadStates).where(eq(issueReadStates.issueId, id));
+        await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.issueId, id));
+        await tx.delete(feedbackVotes).where(eq(feedbackVotes.issueId, id));
+        await tx.update(costEvents).set({ issueId: null }).where(eq(costEvents.issueId, id));
+        await tx.update(financeEvents).set({ issueId: null }).where(eq(financeEvents.issueId, id));
 
         const removedIssue = await tx
           .delete(issues)

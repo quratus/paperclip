@@ -18,7 +18,7 @@ import type {
   SkillTestAgentKeyScope,
   TaskBridgeAgentKeyScope,
 } from "@paperclipai/shared";
-import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, isUuidLike, type LowTrustBoundary } from "@paperclipai/shared";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   isIssueWithinLowTrustBoundary,
@@ -719,6 +719,7 @@ export function authorizationService(db: Db) {
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
+    if (!isUuidLike(runId)) return null;
     const row = await db
       .select({
         id: heartbeatRuns.id,
@@ -1520,6 +1521,21 @@ export function authorizationService(db: Db) {
           });
         }
       }
+      if (input.action === "agent_config:read") {
+        return decideWithAgentConfigReadGrant("user", input.actor.userId);
+      }
+      if (input.action === "agent_config:update") {
+        return decideWithProtectedChangeGrants("user", input.actor.userId, {
+          direct: "agents:configure",
+          suggest: "agents:suggest-changes",
+        });
+      }
+      if (input.action === "skill_config:update") {
+        return decideWithProtectedChangeGrants("user", input.actor.userId, {
+          direct: "skills:create",
+          suggest: "skills:suggest-changes",
+        });
+      }
       if (!permissionKey) {
         if (
           input.action === "agent:read" ||
@@ -1566,21 +1582,6 @@ export function authorizationService(db: Db) {
         const policyEffect = taskAssignmentPolicyEffect ?? await assignmentPolicyEffect(input.resource);
         if (policyEffect.kind === "restricted") return denyRestrictedAssignmentPolicy(policyEffect);
         return grantDecision;
-      }
-      if (input.action === "agent_config:read") {
-        return decideWithAgentConfigReadGrant("user", input.actor.userId);
-      }
-      if (input.action === "agent_config:update") {
-        return decideWithProtectedChangeGrants("user", input.actor.userId, {
-          direct: "agents:configure",
-          suggest: "agents:suggest-changes",
-        });
-      }
-      if (input.action === "skill_config:update") {
-        return decideWithProtectedChangeGrants("user", input.actor.userId, {
-          direct: "skills:create",
-          suggest: "skills:suggest-changes",
-        });
       }
       return decidePrincipalGrant({
         companyId,

@@ -1038,13 +1038,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId: input.companyId,
       reason: "source_scoped_recovery_action",
       source: "assignment",
-      payload: expect.objectContaining({
+    });
+    const expectsNormalModelRecovery = input.kind === "missing_disposition" ||
+      input.cause === SUCCESSFUL_RUN_MISSING_STATE_REASON;
+    if (expectsNormalModelRecovery) {
+      expect(recoveryWakeup?.payload).not.toMatchObject({
+        recoveryIntent: "status_only",
+        resumeRequiresNormalModel: true,
+      });
+    } else {
+      expect(recoveryWakeup?.payload).toMatchObject({
         modelProfile: "cheap",
         allowDeliverableWork: false,
         allowDocumentUpdates: false,
         resumeRequiresNormalModel: true,
-      }),
-    });
+      });
+    }
 
     const recoveryRun = recoveryWakeup?.runId
       ? await db
@@ -1060,11 +1069,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       recoveryActionId: action.id,
       sourceIssueId: input.issueId,
       strandedRunId: input.runId,
-      modelProfile: "cheap",
-      allowDeliverableWork: false,
-      allowDocumentUpdates: false,
-      resumeRequiresNormalModel: true,
     });
+    if (expectsNormalModelRecovery) {
+      expect(recoveryRun?.contextSnapshot).not.toMatchObject({
+        recoveryIntent: "status_only",
+        resumeRequiresNormalModel: true,
+      });
+    } else {
+      expect(recoveryRun?.contextSnapshot).toMatchObject({
+        modelProfile: "cheap",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      });
+    }
     await waitForHeartbeatIdle(db);
     const sourceIssue = await db
       .select()
@@ -1831,6 +1849,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("marks process capacity exhaustion as at_capacity and returns assigned work to todo", async () => {
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "Process adapter reported temporary capacity exhaustion.",
+      provider: "process",
+      model: "process",
+      resultJson: {
+        processCapacityExhausted: true,
+        capacityStatus: "at_capacity",
+        stdout: "[vps-run] all 2 slots still busy after 3480s - leaving work queued for a later wake\n",
+        stderr: "",
+      },
+    });
+
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForValue(async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      return run && run.status !== "queued" && run.status !== "running" ? run : null;
+    }, 30_000);
+    expect(settledRun?.status).toBe("succeeded");
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+    expect((run?.resultJson as Record<string, unknown> | null)?.capacityStatus).toBe("at_capacity");
+
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent?.status).toBe("at_capacity");
+    expect(agent?.errorReason).toBeNull();
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("todo");
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body.includes("all slots busy"))).toBe(true);
   });
 
   it("schedules bounded retries for failed accepted interaction continuation wakes", async () => {
@@ -2858,6 +2920,25 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       sourceRunId,
       latestRunStatus: "succeeded",
       missingDisposition: "clear_next_step",
+    });
+
+    const recoveryWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "source_scoped_recovery_action"))
+      .then((rows) => rows.find((row) => row.payload?.recoveryActionId === recoveryAction.id) ?? null);
+    expect(recoveryWake?.payload).toMatchObject({
+      issueId,
+      recoveryActionId: recoveryAction.id,
+      recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+    });
+    expect(recoveryWake?.payload).not.toMatchObject({
+      recoveryIntent: "status_only",
+      resumeRequiresNormalModel: true,
+    });
+    expect(recoveryWake?.contextSnapshot).not.toMatchObject({
+      recoveryIntent: "status_only",
+      resumeRequiresNormalModel: true,
     });
   });
 

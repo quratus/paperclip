@@ -39,6 +39,7 @@ server/src/**/*.d.ts.map
 tmp/
 feedback-export-*
 diagnostics/
+*.heapsnapshot
 
 # Editor / tool temp files
 *.tmp

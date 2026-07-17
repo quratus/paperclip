@@ -78,6 +78,7 @@ const mockBudgetService = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
+  list: vi.fn(),
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
@@ -1805,5 +1806,25 @@ describe.sequential("agent permission routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("defaults and caps company heartbeat run history", async () => {
+    mockHeartbeatService.list.mockResolvedValue([]);
+
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const defaultRes = await request(app).get(`/api/companies/${companyId}/heartbeat-runs`);
+    const cappedRes = await request(app).get(`/api/companies/${companyId}/heartbeat-runs?limit=1000`);
+
+    expect(defaultRes.status).toBe(200);
+    expect(cappedRes.status).toBe(200);
+    expect(mockHeartbeatService.list).toHaveBeenNthCalledWith(1, companyId, undefined, 50);
+    expect(mockHeartbeatService.list).toHaveBeenNthCalledWith(2, companyId, undefined, 100);
   });
 });

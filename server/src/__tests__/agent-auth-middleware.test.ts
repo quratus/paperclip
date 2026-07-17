@@ -90,12 +90,12 @@ function createDbState(input: {
   return { db, activity };
 }
 
-function createApp(db: any) {
+function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = "authenticated") {
   const app = express();
   app.use(express.json());
   app.use(
     actorMiddleware(db, {
-      deploymentMode: "authenticated",
+      deploymentMode,
       resolveSession: async () => null,
     }),
   );
@@ -195,6 +195,26 @@ describe("agent auth middleware", () => {
       onBehalfOfUserId: "user-claim",
       source: "agent_jwt",
     });
+  });
+
+  it("ignores non-UUID run headers on local trusted board requests", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+    });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("X-Paperclip-Run-Id", "manual-codex-20260713-paperclip-guard-fix");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+    });
+    expect(res.body.runId).toBeUndefined();
   });
 
   it("preserves signed skill_test JWT scope on the request actor", async () => {
@@ -343,6 +363,37 @@ describe("agent auth middleware", () => {
       onBehalfOfUserId: "user-key",
       source: "agent_key",
     });
+  });
+
+  it("ignores non-UUID run headers on agent-key actors", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_agent_key_bad_run_header";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+      },
+    });
+
+    const res = await request(createApp(db))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", "implementer-codex-slot-1-20260713");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      type: "agent",
+      agentId,
+      companyId,
+      onBehalfOfUserId: "user-key",
+      source: "agent_key",
+    });
+    expect(res.body.runId).toBeUndefined();
   });
 
   it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {

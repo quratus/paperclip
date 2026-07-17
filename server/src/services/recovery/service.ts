@@ -2613,6 +2613,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (input.recoveryCause === "workspace_validation_failed") return;
     if (input.recoveryCause === "configuration_incomplete") return;
     if (!input.action.ownerAgentId) return;
+    const recoveryWorkClass = input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+      ? "normal_model"
+      : "status_only";
     await deps.enqueueWakeup(input.action.ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",
@@ -2624,7 +2627,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         recoveryActionId: input.action.id,
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause: input.recoveryCause,
-      }, "status_only"),
+      }, recoveryWorkClass),
       requestedByActorType: "system",
       requestedByActorId: null,
       contextSnapshot: withRecoveryModelProfileHint({
@@ -2637,7 +2640,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         sourceIssueId: input.issue.id,
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause: input.recoveryCause,
-      }, "status_only"),
+      }, recoveryWorkClass),
     });
   }
 

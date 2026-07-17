@@ -12,12 +12,15 @@ import {
 
 async function writeFailingClaudeCommand(
   commandPath: string,
-  options: { resultEvent: Record<string, unknown>; exitCode?: number },
+  options: { resultEvent: Record<string, unknown>; exitCode?: number; stderr?: string },
 ): Promise<void> {
   const payload = JSON.stringify(options.resultEvent);
   const exit = options.exitCode ?? 1;
   const script = `#!/usr/bin/env node
 console.log(${JSON.stringify(payload)});
+if (${JSON.stringify(options.stderr ?? "")}) {
+  process.stderr.write(${JSON.stringify(options.stderr ?? "")});
+}
 process.exit(${exit});
 `;
   await fs.writeFile(commandPath, script, "utf8");
@@ -580,6 +583,50 @@ describe("claude execute", () => {
       expect(result.exitCode).toBe(1);
       expect(result.errorCode).toBe("max_turns_exhausted");
       expect(result.errorFamily).toBeNull();
+      expect(result.resultJson).toMatchObject({ stopReason: "max_turns_exhausted" });
+      expect(result.clearSession).toBe(true);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps structured max-turn results ahead of auth diagnostics", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-max-turns-auth-"));
+    const resultEvent = {
+      type: "result",
+      subtype: "error_max_turns",
+      session_id: "11111111-1111-4111-8111-111111111111",
+      is_error: true,
+      result: "Maximum turns reached.",
+    };
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+      commandWriter: (commandPath) =>
+        writeFailingClaudeCommand(commandPath, {
+          resultEvent,
+          stderr: "Authentication required. Please run claude login.\n",
+        }),
+    });
+
+    try {
+      const result = await execute({
+        runId: "run-max-turns-auth",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("max_turns_exhausted");
+      expect(result.errorCode).not.toBe("claude_auth_required");
       expect(result.resultJson).toMatchObject({ stopReason: "max_turns_exhausted" });
       expect(result.clearSession).toBe(true);
     } finally {

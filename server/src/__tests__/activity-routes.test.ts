@@ -158,8 +158,53 @@ describe.sequential("activity routes", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("PC1A2-475");
     expect(mockIssueService.getById).not.toHaveBeenCalled();
-    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1");
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", {
+      includeResult: false,
+      limit: 25,
+    });
     expect(res.body).toEqual([{ runId: "run-1", adapterType: "codex_local" }]);
+  });
+
+  it("defaults and caps company activity history", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const defaultRes = await request(app).get("/api/companies/company-1/activity");
+    const cappedRes = await request(app).get("/api/companies/company-1/activity?limit=5000");
+
+    expect(defaultRes.status).toBe(200);
+    expect(cappedRes.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenNthCalledWith(1, {
+      companyId: "company-1",
+      agentId: undefined,
+      entityType: undefined,
+      entityId: undefined,
+      limit: 100,
+    });
+    expect(mockActivityService.list).toHaveBeenNthCalledWith(2, {
+      companyId: "company-1",
+      agentId: undefined,
+      entityType: undefined,
+      entityId: undefined,
+      limit: 500,
+    });
+  });
+
+  it("caps issue run history and requires explicit heavy result payload opt-in", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "issue-uuid-1",
+      companyId: "company-1",
+    });
+    mockActivityService.runsForIssue.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await request(app).get("/api/issues/issue-uuid-1/runs?limit=500&includeResult=true");
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", {
+      includeResult: true,
+      limit: 100,
+    });
   });
 
   it("requires company access before creating activity events", async () => {

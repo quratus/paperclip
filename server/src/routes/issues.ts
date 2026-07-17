@@ -2539,6 +2539,20 @@ export function issueRoutes(
       });
   }
 
+  async function runAfterCommittedIssueWrite<T>(
+    issue: { id: string },
+    label: string,
+    callback: () => Promise<T>,
+    fallback: T,
+  ): Promise<T> {
+    try {
+      return await callback();
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id, hook: label }, "post-commit issue update hook failed");
+      return fallback;
+    }
+  }
+
   async function sourceTrustForActorWrite(
     issue: { id: string; companyId: string; projectId?: string | null; executionPolicy?: unknown },
     actor: ReturnType<typeof getActorInfo>,
@@ -7917,40 +7931,68 @@ export function issueRoutes(
         const cancelled = await heartbeat.cancelRun(runToCancelForCancelledStatus.id);
         if (cancelled) {
           cancelledStatusRunId = cancelled.id;
-          await logActivity(db, {
-            companyId: cancelled.companyId,
+          await runAfterCommittedIssueWrite(
+            issue,
+            "activity.heartbeat.cancelled",
+            () => logActivity(db, {
+              companyId: cancelled.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              action: "heartbeat.cancelled",
+              entityType: "heartbeat_run",
+              entityId: cancelled.id,
+              details: { agentId: cancelled.agentId, source: "issue_status_cancelled", issueId: existing.id },
+            }),
+            undefined,
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: existing.id, runId: runToCancelForCancelledStatus.id },
+          "failed to cancel run for cancelled issue",
+        );
+        await runAfterCommittedIssueWrite(
+          issue,
+          "activity.heartbeat.cancel_failed",
+          () => logActivity(db, {
+            companyId: existing.companyId,
             actorType: actor.actorType,
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
-            action: "heartbeat.cancelled",
+            action: "heartbeat.cancel_failed",
             entityType: "heartbeat_run",
-            entityId: cancelled.id,
-            details: { agentId: cancelled.agentId, source: "issue_status_cancelled", issueId: existing.id },
-          });
-        }
-      } catch (err) {
-        logger.warn({ err, issueId: existing.id, runId: runToCancelForCancelledStatus.id }, "failed to cancel run for cancelled issue");
-        await logActivity(db, {
-          companyId: existing.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          action: "heartbeat.cancel_failed",
-          entityType: "heartbeat_run",
-          entityId: runToCancelForCancelledStatus.id,
-          details: { source: "issue_status_cancelled", issueId: existing.id },
-        });
+            entityId: runToCancelForCancelledStatus.id,
+            details: { source: "issue_status_cancelled", issueId: existing.id },
+          }),
+          undefined,
+        );
       }
     }
 
     if (titleOrDescriptionChanged) {
-      await issueReferencesSvc.syncIssue(issue.id);
-      await externalObjectsSvc.syncIssueSafely(issue.id);
+      await runAfterCommittedIssueWrite(
+        issue,
+        "references.syncIssue",
+        () => issueReferencesSvc.syncIssue(issue.id),
+        undefined,
+      );
+      await runAfterCommittedIssueWrite(
+        issue,
+        "externalObjects.syncIssueSafely",
+        () => externalObjectsSvc.syncIssueSafely(issue.id),
+        undefined,
+      );
     }
     const updateReferenceSummaryAfter = titleOrDescriptionChanged
-      ? await issueReferencesSvc.listIssueReferenceSummary(issue.id)
+      ? await runAfterCommittedIssueWrite(
+          issue,
+          "references.listIssueReferenceSummary.afterUpdate",
+          () => issueReferencesSvc.listIssueReferenceSummary(issue.id),
+          null,
+        )
       : null;
     const updateReferenceDiff = updateReferenceSummaryBefore && updateReferenceSummaryAfter
       ? issueReferencesSvc.diffIssueReferenceSummary(updateReferenceSummaryBefore, updateReferenceSummaryAfter)
@@ -7964,14 +8006,28 @@ export function issueRoutes(
     } = issue;
     let updatedRelations: Awaited<ReturnType<typeof svc.getRelationSummaries>> | null = null;
     if (issue && Array.isArray(req.body.blockedByIssueIds)) {
-      updatedRelations = await svc.getRelationSummaries(issue.id);
+      updatedRelations = await runAfterCommittedIssueWrite(
+        issue,
+        "issues.getRelationSummaries.afterUpdate",
+        () => svc.getRelationSummaries(issue.id),
+        null,
+      );
       issueResponse = {
         ...issue,
-        blockedBy: updatedRelations.blockedBy,
-        blocks: updatedRelations.blocks,
+        ...(updatedRelations
+          ? {
+              blockedBy: updatedRelations.blockedBy,
+              blocks: updatedRelations.blocks,
+            }
+          : {}),
       };
     }
-    await routinesSvc.syncRunStatusForIssue(issue.id);
+    await runAfterCommittedIssueWrite(
+      issue,
+      "routines.syncRunStatusForIssue",
+      () => routinesSvc.syncRunStatusForIssue(issue.id),
+      undefined,
+    );
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
@@ -8041,7 +8097,7 @@ export function issueRoutes(
         activeRecoveryAction: null,
       };
     }
-    await logActivity(db, {
+    await runAfterCommittedIssueWrite(issue, "activity.issue.updated", () => logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
@@ -8077,7 +8133,7 @@ export function issueRoutes(
             : null,
         ),
       },
-    });
+    }), undefined);
 
     if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])
@@ -8114,7 +8170,7 @@ export function issueRoutes(
       const nextBlockedByRelations = updatedRelations?.blockedBy ?? [];
       const previousBlockedByRelations = existingRelations?.blockedBy ?? [];
       if (addedBlockedByIssueIds.length > 0 || removedBlockedByIssueIds.length > 0) {
-        await logActivity(db, {
+        await runAfterCommittedIssueWrite(issue, "activity.issue.blockers_updated", () => logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
           actorId: actor.actorId,
@@ -8136,13 +8192,13 @@ export function issueRoutes(
               .filter((relation) => removedBlockedByIssueIds.includes(relation.id))
               .map(summarizeIssueRelationForActivity),
           },
-        });
+        }), undefined);
       }
     }
 
     const reviewerChanges = diffExecutionParticipants(previousExecutionPolicy, nextExecutionPolicy, "review");
     if (reviewerChanges.addedParticipants.length > 0 || reviewerChanges.removedParticipants.length > 0) {
-      await logActivity(db, {
+      await runAfterCommittedIssueWrite(issue, "activity.issue.reviewers_updated", () => logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -8157,12 +8213,12 @@ export function issueRoutes(
           addedParticipants: reviewerChanges.addedParticipants,
           removedParticipants: reviewerChanges.removedParticipants,
         },
-      });
+      }), undefined);
     }
 
     const approverChanges = diffExecutionParticipants(previousExecutionPolicy, nextExecutionPolicy, "approval");
     if (approverChanges.addedParticipants.length > 0 || approverChanges.removedParticipants.length > 0) {
-      await logActivity(db, {
+      await runAfterCommittedIssueWrite(issue, "activity.issue.approvers_updated", () => logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -8177,7 +8233,7 @@ export function issueRoutes(
           addedParticipants: approverChanges.addedParticipants,
           removedParticipants: approverChanges.removedParticipants,
         },
-      });
+      }), undefined);
     }
 
     const nextStoredExecutionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
@@ -8185,7 +8241,7 @@ export function issueRoutes(
     const nextMonitor = summarizeIssueMonitor(issue, nextStoredExecutionPolicy);
     const monitorScheduledChanged = previousMonitor.nextCheckAt !== nextMonitor.nextCheckAt;
     if (nextMonitor.nextCheckAt && (monitorScheduledChanged || previousMonitor.notes !== nextMonitor.notes)) {
-      await logActivity(db, {
+      await runAfterCommittedIssueWrite(issue, "activity.issue.monitor_scheduled", () => logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -8205,9 +8261,9 @@ export function issueRoutes(
           maxAttempts: nextMonitor.maxAttempts,
           recoveryPolicy: nextMonitor.recoveryPolicy,
         },
-      });
+      }), undefined);
     } else if (!nextMonitor.nextCheckAt && previousMonitor.nextCheckAt) {
-      await logActivity(db, {
+      await runAfterCommittedIssueWrite(issue, "activity.issue.monitor_cleared", () => logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -8222,7 +8278,7 @@ export function issueRoutes(
           reason: nextMonitor.clearReason ?? "manual",
           notes: previousMonitor.notes,
         },
-      });
+      }), undefined);
     }
 
     if (issue.status === "done" && existing.status !== "done") {
@@ -8246,35 +8302,50 @@ export function issueRoutes(
       existing.status !== issue.status &&
       (issue.status === "done" || issue.status === "cancelled")
     ) {
-      const completedRun = await companySkillsSvc.completeTestRunForIssue({
-        companyId: issue.companyId,
-        issueId: issue.id,
-        outcome: issue.status === "done" ? "succeeded" : "cancelled",
-        error: issue.status === "cancelled" ? "Harness issue was cancelled" : null,
-      });
-      if (completedRun) {
-        await logActivity(db, {
+      const completedRun = await runAfterCommittedIssueWrite(
+        issue,
+        "companySkills.completeTestRunForIssue",
+        () => companySkillsSvc.completeTestRunForIssue({
           companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          action: "company.skill_test_run_completed",
-          entityType: "company_skill_test_run",
-          entityId: completedRun.id,
-          details: {
-            issueId: issue.id,
-            status: completedRun.status,
-            outputDocumentKey: completedRun.outputDocumentKey,
-          },
-        });
+          issueId: issue.id,
+          outcome: issue.status === "done" ? "succeeded" : "cancelled",
+          error: issue.status === "cancelled" ? "Harness issue was cancelled" : null,
+        }),
+        null,
+      );
+      if (completedRun) {
+        await runAfterCommittedIssueWrite(
+          issue,
+          "activity.company.skill_test_run_completed",
+          () => logActivity(db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "company.skill_test_run_completed",
+            entityType: "company_skill_test_run",
+            entityId: completedRun.id,
+            details: {
+              issueId: issue.id,
+              status: completedRun.status,
+              outputDocumentKey: completedRun.outputDocumentKey,
+            },
+          }),
+          undefined,
+        );
       }
     }
 
-    let comment = null;
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
     if (commentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
-        ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+        ?? await runAfterCommittedIssueWrite(
+          issue,
+          "references.listIssueReferenceSummary.beforeComment",
+          () => issueReferencesSvc.listIssueReferenceSummary(issue.id),
+          issueReferencesSvc.emptySummary(),
+        );
       comment = await svc.addComment(id, commentBody, {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
@@ -8282,9 +8353,25 @@ export function issueRoutes(
       }, {
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
       });
-      await issueReferencesSvc.syncComment(comment.id);
-      await externalObjectsSvc.syncCommentSafely(comment.id);
-      const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+      const insertedComment = comment;
+      await runAfterCommittedIssueWrite(
+        issue,
+        "references.syncComment",
+        () => issueReferencesSvc.syncComment(insertedComment.id),
+        undefined,
+      );
+      await runAfterCommittedIssueWrite(
+        issue,
+        "externalObjects.syncCommentSafely",
+        () => externalObjectsSvc.syncCommentSafely(insertedComment.id),
+        undefined,
+      );
+      const commentReferenceSummaryAfter = await runAfterCommittedIssueWrite(
+        issue,
+        "references.listIssueReferenceSummary.afterComment",
+        () => issueReferencesSvc.listIssueReferenceSummary(issue.id),
+        commentReferenceSummaryBefore,
+      );
       const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
         commentReferenceSummaryBefore,
         commentReferenceSummaryAfter,
@@ -8297,53 +8384,68 @@ export function issueRoutes(
         ),
       };
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "issue.comment_added",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
-          identifier: issue.identifier,
-          issueTitle: issue.title,
-          ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-          ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
-          ...(scheduledRetrySupersededByComment
-            ? {
-                scheduledRetrySupersededByComment: true,
-                scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
-                ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
-              }
-            : {}),
-          ...(interruptedRunId ? { interruptedRunId } : {}),
-          ...(hasFieldChanges ? { updated: true } : {}),
-          ...summarizeIssueReferenceActivityDetails({
-            addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-            removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-            currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-          }),
-        },
-      });
-
-      const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
+      await runAfterCommittedIssueWrite(
         issue,
-        comment,
-        {
+        "activity.issue.comment_added",
+        () => logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
           agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
+          runId: actor.runId,
+          action: "issue.comment_added",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            commentId: insertedComment.id,
+            bodySnippet: insertedComment.body.slice(0, 120),
+            identifier: issue.identifier,
+            issueTitle: issue.title,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+            ...(scheduledRetrySupersededByComment
+              ? {
+                  scheduledRetrySupersededByComment: true,
+                  scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                  ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+                }
+              : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+            ...(hasFieldChanges ? { updated: true } : {}),
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+              removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+              currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+            }),
+          },
+        }),
+        undefined,
       );
-      await logExpiredRequestConfirmations({
+
+      const expiredInteractions = await runAfterCommittedIssueWrite(
         issue,
-        interactions: expiredInteractions,
-        actor,
-        source: "issue.comment",
-      });
+        "issueThreadInteractions.expireRequestConfirmationsSupersededByComment",
+        () => issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
+          issue,
+          insertedComment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        ),
+        [],
+      );
+      await runAfterCommittedIssueWrite(
+        issue,
+        "activity.issue.request_confirmations_expired",
+        () => logExpiredRequestConfirmations({
+          issue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.comment",
+        }),
+        undefined,
+      );
 
     } else if (updateReferenceSummaryAfter) {
       issueResponse = {

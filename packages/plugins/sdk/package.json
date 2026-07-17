@@ -123,5 +123,7 @@
     "react": {
       "optional": true
     }
-  }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts"
 }

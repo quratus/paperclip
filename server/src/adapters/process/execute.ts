@@ -11,6 +11,12 @@ import {
   runChildProcess,
 } from "../utils.js";
 
+const VPS_CAPACITY_EXHAUSTED_RE = /\[vps-run\]\s+all\s+\d+\s+slots\s+(?:still\s+)?busy\b/i;
+
+function processCapacityExhausted(stdout: string, stderr: string): boolean {
+  return VPS_CAPACITY_EXHAUSTED_RE.test(`${stdout}\n${stderr}`);
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta } = ctx;
   const command = asString(config.command, "");
@@ -68,6 +74,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage: `Process exited with code ${proc.exitCode ?? -1}`,
       resultJson: {
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+      },
+    };
+  }
+
+  if (processCapacityExhausted(proc.stdout, proc.stderr)) {
+    return {
+      exitCode: proc.exitCode,
+      signal: proc.signal,
+      timedOut: false,
+      summary: "Process adapter reported temporary capacity exhaustion.",
+      resultJson: {
+        processCapacityExhausted: true,
+        capacityStatus: "at_capacity",
         stdout: proc.stdout,
         stderr: proc.stderr,
       },
