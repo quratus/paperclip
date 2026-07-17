@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import {
   agents,
   agentWakeupRequests,
   companies,
   createDb,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -34,12 +36,20 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companies);
+    await db.execute(sql.raw(`
+      TRUNCATE TABLE
+        "environment_leases",
+        "environments",
+        "activity_log",
+        "heartbeat_run_events",
+        "heartbeat_runs",
+        "agent_wakeup_requests",
+        "agent_runtime_state",
+        "issues",
+        "agents",
+        "companies"
+      RESTART IDENTITY CASCADE
+    `));
   });
 
   afterAll(async () => {
@@ -136,9 +146,10 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
   async function insertOperatingModeAgent(input: {
     operatingMode: "active" | "pilot" | "frozen";
     pilotAllowlist?: string[];
+    agentId?: string;
   }) {
     const companyId = randomUUID();
-    const agentId = randomUUID();
+    const agentId = input.agentId ?? randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -156,8 +167,11 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
       name: "Operating Mode Agent",
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+      },
       runtimeConfig: {
         heartbeat: {
           enabled: true,
@@ -171,6 +185,47 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     });
 
     return { companyId, agentId };
+  }
+
+  async function waitForRunToFinish(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    runId: string,
+    timeoutMs = 5_000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const run = await heartbeat.getRun(runId);
+      if (run && !["queued", "running"].includes(run.status)) return run;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return await heartbeat.getRun(runId);
+  }
+
+  async function waitForRunLeasesToRelease(runId: string, timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const leases = await db
+        .select()
+        .from(environmentLeases)
+        .where(sql`${environmentLeases.heartbeatRunId} = ${runId}`);
+      if (leases.length > 0 && leases.every((lease) => lease.status !== "active")) return leases;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return await db
+      .select()
+      .from(environmentLeases)
+      .where(sql`${environmentLeases.heartbeatRunId} = ${runId}`);
+  }
+
+  async function expectRunSucceededAndSettled(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    runId: string,
+  ) {
+    const finished = await waitForRunToFinish(heartbeat, runId);
+    expect(finished?.status).toBe("succeeded");
+    const leases = await waitForRunLeasesToRelease(runId);
+    expect(leases.length).toBeGreaterThan(0);
+    expect(leases.every((lease) => lease.status !== "active")).toBe(true);
   }
 
   it("does not iterate archived-company agents in tickTimers", async () => {
@@ -322,6 +377,128 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
       .from(heartbeatRuns)
       .then((rows) => rows.filter((row) => row.agentId === agentId).length);
     expect(runCount).toBe(0);
+  });
+
+  it("admits explicit user invokes when company operating mode is active", async () => {
+    const { agentId } = await insertOperatingModeAgent({ operatingMode: "active" });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+
+    expect(run).not.toBeNull();
+    await expectRunSucceededAndSettled(heartbeat, run!.id);
+  });
+
+  it("admits explicit user invokes for pilot agents in the allowlist", async () => {
+    const agentId = randomUUID();
+    await insertOperatingModeAgent({ operatingMode: "pilot", pilotAllowlist: [agentId], agentId });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+
+    expect(run).not.toBeNull();
+    await expectRunSucceededAndSettled(heartbeat, run!.id);
+  });
+
+  it("rejects explicit user invokes for pilot agents outside the allowlist", async () => {
+    const { agentId } = await insertOperatingModeAgent({ operatingMode: "pilot", pilotAllowlist: [] });
+
+    const heartbeat = heartbeatService(db);
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { operatingMode: "pilot", agentId },
+    });
+
+    const runCount = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.filter((row) => row.agentId === agentId).length);
+    expect(runCount).toBe(0);
+  });
+
+  it("admits scheduler wakeups when company operating mode is active", async () => {
+    const { agentId } = await insertOperatingModeAgent({ operatingMode: "active" });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2026-06-04T00:10:00Z"));
+
+    expect(result).toMatchObject({
+      checked: 1,
+      enqueued: 1,
+      skipped: 0,
+    });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.find((row) => row.agentId === agentId) ?? null);
+    expect(run).not.toBeNull();
+    await expectRunSucceededAndSettled(heartbeat, run!.id);
+  });
+
+  it("records skipped scheduler wakeups when company operating mode is frozen", async () => {
+    const { agentId } = await insertOperatingModeAgent({ operatingMode: "frozen" });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2026-06-04T00:10:00Z"));
+
+    expect(result).toMatchObject({
+      checked: 1,
+      enqueued: 0,
+      skipped: 1,
+    });
+
+    const wakeup = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests)
+      .then((rows) => rows[0] ?? null);
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "company.operating_mode",
+      error: "Company operating mode is frozen; new agent work admission is blocked",
+    });
+  });
+
+  it("admits scheduler wakeups for pilot agents in the allowlist", async () => {
+    const agentId = randomUUID();
+    await insertOperatingModeAgent({ operatingMode: "pilot", pilotAllowlist: [agentId], agentId });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2026-06-04T00:10:00Z"));
+
+    expect(result).toMatchObject({
+      checked: 1,
+      enqueued: 1,
+      skipped: 0,
+    });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.find((row) => row.agentId === agentId) ?? null);
+    expect(run).not.toBeNull();
+    await expectRunSucceededAndSettled(heartbeat, run!.id);
   });
 
   it("records skipped scheduler wakeups for pilot agents outside the allowlist", async () => {
