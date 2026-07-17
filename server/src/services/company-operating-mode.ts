@@ -50,4 +50,3 @@ export function evaluateCompanyAdmission(
     message: "Company operating mode is pilot; this agent is not in the pilot allowlist",
   };
 }
-
