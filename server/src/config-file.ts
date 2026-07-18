@@ -5,6 +5,8 @@ import { resolvePaperclipConfigPath } from "./paths.js";
 export function readConfigFile(): PaperclipConfig | null {
   const configPath = resolvePaperclipConfigPath();
 
+  if (!fs.existsSync(configPath)) return null;
+
   let contents: string;
   try {
     contents = fs.readFileSync(configPath, "utf-8");
