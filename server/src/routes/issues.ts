@@ -36,6 +36,7 @@ import {
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
+  activatePlanningIssueSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
@@ -198,11 +199,6 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
-const activatePlanningIssueSchema = z.object({
-  agentId: z.string().uuid(),
-  expectedUpdatedAt: z.string().datetime().optional(),
-  activationKey: z.string().trim().min(1).max(255),
-}).strict();
 const planningWorkContractEnvelopeSchema = z.object({
   version: z.string().trim().min(1).max(100),
   phase: z.enum(["seed", "ready"]),
