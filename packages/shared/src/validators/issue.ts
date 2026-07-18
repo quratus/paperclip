@@ -500,6 +500,14 @@ export const checkoutIssueSchema = z.object({
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
+export const activatePlanningIssueSchema = z.object({
+  agentId: z.string().uuid(),
+  expectedUpdatedAt: z.string().datetime().optional(),
+  activationKey: z.string().trim().min(1).max(255),
+}).strict();
+
+export type ActivatePlanningIssue = z.infer<typeof activatePlanningIssueSchema>;
+
 const commentMetadataLabelSchema = z.string().trim().min(1).max(120);
 const commentMetadataTextSchema = z.string().trim().min(1).max(2000);
 
