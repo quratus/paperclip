@@ -487,23 +487,33 @@ function activeResponsibleUserCanAuthorizeIssueAction(
   );
 }
 
-function activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
+function activeResponsibleUserCanAuthorizeAgentGrantedConfigAction(
   action: AuthorizationAction,
   membership: ResponsibleUserSnapshot["activeMembership"],
   agentDecision: AuthorizationDecision,
   actorAgentId: string | null | undefined,
 ) {
+  const allowedGrantKeys =
+    action === "skill_config:update"
+      ? new Set<PermissionKey>(["skills:create", "skills:suggest-changes"])
+      : action === "agent_config:read" || action === "agent_config:update"
+        ? new Set<PermissionKey>(["agents:configure", "agents:suggest-changes"])
+        : null;
+  if (!allowedGrantKeys) return false;
+
   return Boolean(
-    action === "skill_config:update" &&
     membership &&
     membership.status === "active" &&
     membership.membershipRole !== "viewer" &&
     agentDecision.allowed &&
-    (agentDecision.reason === "allow_direct_change" || agentDecision.reason === "allow_consented_change") &&
+    (
+      agentDecision.reason === "allow_explicit_grant" ||
+      agentDecision.reason === "allow_direct_change" ||
+      agentDecision.reason === "allow_consented_change"
+    ) &&
     agentDecision.grant?.principalType === "agent" &&
     agentDecision.grant.principalId === actorAgentId &&
-    (agentDecision.grant.permissionKey === "skills:create" ||
-      agentDecision.grant.permissionKey === "skills:suggest-changes"),
+    allowedGrantKeys.has(agentDecision.grant.permissionKey),
   );
 }
 
@@ -2019,17 +2029,17 @@ export function authorizationService(db: Db) {
         : "RESPONSIBLE_USER_UNAVAILABLE";
 
     if (
-      activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
+      activeResponsibleUserCanAuthorizeAgentGrantedConfigAction(
         input.action,
         snapshot.activeMembership,
         agentDecision,
         input.actor.agentId,
       )
     ) {
-      // Skill mutations are governed by the agent's explicit skill-change
-      // grant. The responsible-user intersection still requires an active
-      // non-viewer user, but does not require duplicating that grant on the
-      // responsible user's board account for standard heartbeat JWTs.
+      // Privileged agent-owned configuration APIs are governed by the agent's
+      // explicit grant. The responsible-user intersection still requires an
+      // active non-viewer user, but does not require duplicating that grant on
+      // the responsible user's board account for standard heartbeat JWTs.
       return agentDecision;
     }
 

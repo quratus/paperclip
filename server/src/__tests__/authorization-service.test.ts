@@ -739,6 +739,84 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("allows delegated agent configuration when the agent has configure and the responsible user is an active operator", async () => {
+    const company = await createCompany(db, "ResponsibleUserAgentConfigOperator");
+    const actorAgent = await createAgent(db, company.id, { role: "ceo" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const responsibleUserId = await createUser(db);
+    await grantAgentPermission(db, company.id, actorAgent.id, "agents:configure");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
+
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      onBehalfOfUserId: responsibleUserId,
+      source: "agent_jwt" as const,
+    };
+    const resource = { type: "agent" as const, companyId: company.id, agentId: targetAgent.id };
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "agent_config:read",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_explicit_grant",
+      grant: { principalType: "agent", permissionKey: "agents:configure" },
+    });
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "agent_config:update",
+      resource,
+      scope: { requiresChangeGrant: true },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_direct_change",
+      grant: { principalType: "agent", permissionKey: "agents:configure" },
+    });
+  });
+
+  it("denies delegated agent configuration when the responsible user is only a viewer", async () => {
+    const company = await createCompany(db, "ResponsibleUserAgentConfigViewer");
+    const actorAgent = await createAgent(db, company.id, { role: "ceo" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const responsibleUserId = await createUser(db);
+    await grantAgentPermission(db, company.id, actorAgent.id, "agents:configure");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "viewer",
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: {
+        type: "agent",
+        agentId: actorAgent.id,
+        companyId: company.id,
+        onBehalfOfUserId: responsibleUserId,
+        source: "agent_jwt",
+      },
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
+      scope: { requiresChangeGrant: true },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      code: "RESPONSIBLE_USER_UNAUTHORIZED",
+    });
+  });
+
   it("limits low-trust issue reads to the configured project and root issue boundary", async () => {
     const company = await createCompany(db, "LowTrustIssueReads");
     const project = await createProject(db, company.id, "Allowed");
