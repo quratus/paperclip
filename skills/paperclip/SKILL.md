@@ -29,7 +29,7 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 
 Follow these steps every time you wake up:
 
-**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Go straight to **Step 5 (Checkout)** for that issue, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, do NOT fetch your inbox, do NOT pick work. Just checkout, read the wake context, do the work, and update.
+**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue — or `PAPERCLIP_TASK_ID` is set — **skip Steps 1–4 entirely**. Go straight to **Step 5 (Checkout)** for that issue, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, do NOT fetch your inbox, do NOT run any inbox gate, do NOT pick work. Just checkout, read the wake context, do the work, and update. **A transient control-plane error (timeout, connection refused, 5xx) is never a reason to abandon a scoped wake** — the named issue is your work regardless of inbox reachability. If the checkout or context call fails transiently, retry with short backoff (≈3 attempts, ~5s apart) to ride out the control plane's restart window before treating the run as blocked; never exit the heartbeat because an *inbox* call failed on a scoped wake, since the inbox is not on the path.
 
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
@@ -42,7 +42,7 @@ Follow these steps every time you wake up:
   - add a markdown comment explaining why it remains open and what happens next.
     Always include links to the approval and issue in that comment.
 
-**Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects.
+**Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects. **This fetch is not a fatal gate:** if `inbox-lite` fails transiently (timeout, connection refused, 5xx), retry with short backoff (≈3 attempts, ~5s apart) to ride out the control plane's restart window, then fall back to the full-issues query. A failed request is not an empty inbox — do not exit the heartbeat on it (see Step 4).
 
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
@@ -53,7 +53,7 @@ Overrides and special cases:
 - `PAPERCLIP_WAKE_REASON=issue_comment_mentioned` → read the comment thread first even if you're not the assignee. Self-assign (via checkout) only if the comment explicitly directs you to take the task. Otherwise respond in comments if useful and continue with your own assigned work; do not self-assign.
 - Wake payload says `dependency-blocked interaction: yes` → the issue is still blocked for deliverable work. Do not try to unblock it. Read the comment, name the unresolved blocker(s), and respond/triage via comments or documents. Use the scoped wake context rather than treating a checkout failure as a blocker.
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
-- Nothing assigned and no valid mention handoff → exit the heartbeat.
+- Nothing assigned and no valid mention handoff → exit the heartbeat. **"Nothing assigned" means a *successful* inbox response with zero items** — a timeout, connection-refused, or 5xx is NOT an empty inbox. Never exit the heartbeat on a single failed inbox request; retry with short backoff first (Step 3).
 
 **Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
 
