@@ -117,6 +117,7 @@ const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "bloc
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
+export const ISSUE_SUBTREE_ROOT_MAX = 25;
 export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
 export const ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS = 50;
 export const ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS = 50;
@@ -458,6 +459,36 @@ export function parseStatusFilter(input: string | readonly string[] | undefined)
     .filter(Boolean);
 }
 
+export function parseIssueSubtreeRoots(
+  input: unknown,
+): string[] {
+  if (input === undefined) return [];
+  if (typeof input !== "string" && !Array.isArray(input)) {
+    throw unprocessable("subtreeOf must be a UUID or repeated UUID query parameter");
+  }
+  const entries = typeof input === "string" ? [input] : input;
+  if (entries.length === 0 || entries.some((entry) => typeof entry !== "string")) {
+    throw unprocessable("subtreeOf must contain at least one UUID issue ID");
+  }
+  const roots = [...new Set(
+    entries
+      .flatMap((entry) => entry.split(","))
+      .map((root) => root.trim())
+      .filter(Boolean),
+  )];
+
+  if (roots.length === 0) {
+    throw unprocessable("subtreeOf must contain at least one UUID issue ID");
+  }
+  if (roots.length > ISSUE_SUBTREE_ROOT_MAX) {
+    throw unprocessable(`subtreeOf accepts at most ${ISSUE_SUBTREE_ROOT_MAX} unique issue IDs`);
+  }
+  if (roots.some((root) => !isUuidLike(root))) {
+    throw unprocessable("subtreeOf must contain only UUID issue IDs");
+  }
+  return roots;
+}
+
 export interface IssueFilters {
   attention?: "blocked";
   status?: string | readonly string[];
@@ -481,6 +512,7 @@ export interface IssueFilters {
   executionWorkspaceId?: string;
   parentId?: string;
   descendantOf?: string;
+  subtreeOf?: readonly string[];
   labelId?: string;
   originKind?: string;
   originKindPrefix?: string;
@@ -3484,6 +3516,28 @@ function assertValidAssigneeAgentFilter(assigneeAgentFilter: string | null | und
   }
 }
 
+function issueSubtreeCondition(companyId: string, subtreeRoots: readonly string[]): SQL<boolean> | null {
+  if (subtreeRoots.length === 0) return null;
+  return sql<boolean>`
+    ${issues.id} IN (
+      WITH RECURSIVE subtree(id) AS (
+        SELECT ${issues.id}
+        FROM ${issues}
+        WHERE ${issues.companyId} = ${companyId}
+          AND ${visibleIssueCondition()}
+          AND ${inArray(issues.id, subtreeRoots)}
+        UNION
+        SELECT ${issues.id}
+        FROM ${issues}
+        JOIN subtree ON ${issues.parentId} = subtree.id
+        WHERE ${issues.companyId} = ${companyId}
+          AND ${visibleIssueCondition()}
+      )
+      SELECT id FROM subtree
+    )
+  `;
+}
+
 async function blockedInboxIssueConditions(
   dbOrTx: any,
   companyId: string,
@@ -4762,6 +4816,11 @@ export function issueService(db: Db) {
           )
         `);
       }
+      const subtreeCondition = issueSubtreeCondition(
+        companyId,
+        filters?.subtreeOf ?? [],
+      );
+      if (subtreeCondition) conditions.push(subtreeCondition);
       const lowTrustCondition = lowTrustBoundaryIssueCondition(companyId, filters?.lowTrustBoundary);
       if (lowTrustCondition) conditions.push(lowTrustCondition);
       const statuses = parseStatusFilter(filters?.status);
