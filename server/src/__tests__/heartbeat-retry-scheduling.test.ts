@@ -99,6 +99,27 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await tempDb?.cleanup();
   });
 
+  async function deleteHeartbeatRunsAfterDependents() {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(heartbeatRunEvents);
+      await db.delete(activityLog);
+      try {
+        await db.delete(heartbeatRuns);
+        return;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          attempt < 4 &&
+          message.includes("heartbeat_runs")
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
   async function cleanupRetryFixture() {
     await db.delete(activityLog);
     await db.delete(environmentLeases);
@@ -106,8 +127,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
+    await deleteHeartbeatRunsAfterDependents();
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(budgetPolicies);
