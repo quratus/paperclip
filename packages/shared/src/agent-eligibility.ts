@@ -57,8 +57,8 @@ export interface AgentWorkEligibility {
 
 const NON_ASSIGNABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval"]);
 const NON_INVOKABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval", "paused"]);
-const ASSIGNABLE_AGENT_STATUSES = new Set<string>(["active", "paused", "idle", "running", "error"]);
-const INVOKABLE_AGENT_STATUSES = new Set<string>(["active", "idle", "running", "error"]);
+const ASSIGNABLE_AGENT_STATUSES = new Set<string>(["active", "paused", "idle", "running", "error", "at_capacity"]);
+const INVOKABLE_AGENT_STATUSES = new Set<string>(["active", "idle", "running", "error", "at_capacity"]);
 
 export function isAgentStatusAssignableToWork(status: AgentStatus | string): boolean {
   return ASSIGNABLE_AGENT_STATUSES.has(status) && !NON_ASSIGNABLE_AGENT_STATUSES.has(status);

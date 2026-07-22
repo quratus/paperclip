@@ -23,6 +23,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   linkManyForApproval: vi.fn(),
 }));
 
+const mockIssueService = vi.hoisted(() => ({
+  addComment: vi.fn(),
+}));
+
 const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
@@ -38,6 +42,7 @@ function registerModuleMocks() {
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => mockIssueApprovalService,
+    issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
   }));
@@ -61,12 +66,32 @@ async function createApp(actorOverrides: Record<string, unknown> = {}) {
     };
     next();
   });
-  app.use("/api", approvalRoutes({} as any));
+  app.use("/api", approvalRoutes(createRouteDb()));
   app.use(errorHandler);
   return app;
 }
 
-async function createAgentApp() {
+function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "run-1", agentId = "agent-1") {
+  const runRows = [{
+    id: runId,
+    companyId: "company-1",
+    agentId,
+    contextSnapshot,
+  }];
+  return {
+    select: vi.fn((selection: Record<string, unknown> = {}) => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          then: async (resolve: (rows: unknown[]) => unknown) => resolve(
+            Object.keys(selection).includes("contextSnapshot") ? runRows : [],
+          ),
+        })),
+      })),
+    })),
+  } as any;
+}
+
+async function createAgentApp(options: { runId?: string; contextSnapshot?: Record<string, unknown> } = {}) {
   const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
     import("../middleware/index.js"),
     import("../routes/approvals.js"),
@@ -78,12 +103,13 @@ async function createAgentApp() {
       type: "agent",
       agentId: "agent-1",
       companyId: "company-1",
+      runId: options.runId ?? "run-1",
       source: "api_key",
       isInstanceAdmin: false,
     };
     next();
   });
-  app.use("/api", approvalRoutes({} as any));
+  app.use("/api", approvalRoutes(createRouteDb(options.contextSnapshot, options.runId ?? "run-1")));
   app.use(errorHandler);
   return app;
 }
@@ -109,6 +135,7 @@ describe("approval routes idempotent retries", () => {
     mockHeartbeatService.wakeup.mockReset();
     mockIssueApprovalService.listIssuesForApproval.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
+    mockIssueService.addComment.mockReset();
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
     mockLogActivity.mockReset();
     mockAccessService.decide.mockReset();
@@ -120,6 +147,7 @@ describe("approval routes idempotent retries", () => {
     });
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -154,6 +182,24 @@ describe("approval routes idempotent retries", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
+  it("rejects approval rejections without a decision note", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-empty",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-empty/reject")
+      .send({ decisionNote: "   " });
+
+    expect(res.status).toBe(400);
+    expect(mockApprovalService.reject).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it("does not emit duplicate rejection logs when reject is already resolved", async () => {
     mockApprovalService.getById.mockResolvedValue({
       id: "approval-1",
@@ -175,7 +221,7 @@ describe("approval routes idempotent retries", () => {
 
     const res = await request(await createApp())
       .post("/api/approvals/approval-1/reject")
-      .send({});
+      .send({ decisionNote: "Already rejected." });
 
     expect(res.status).toBe(200);
     expect(mockLogActivity).not.toHaveBeenCalled();
@@ -194,7 +240,8 @@ describe("approval routes idempotent retries", () => {
       .post("/api/approvals/approval-2/approve")
       .send({});
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Approval not found");
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
   });
 
@@ -211,7 +258,8 @@ describe("approval routes idempotent retries", () => {
       .post("/api/approvals/approval-3/request-revision")
       .send({ decisionNote: "Need changes" });
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Approval not found");
     expect(mockApprovalService.requestRevision).not.toHaveBeenCalled();
   });
 
@@ -269,6 +317,62 @@ describe("approval routes idempotent retries", () => {
 
     expect(res.status).toBe(200);
     expect(mockApprovalService.reject).toHaveBeenCalledWith("approval-5", "user-1", "not now");
+  });
+
+  it("posts rejection rationale to each linked issue when the rejection is applied", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-linked",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    mockApprovalService.reject.mockResolvedValue({
+      approval: {
+        id: "approval-linked",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "rejected",
+        payload: {},
+      },
+      applied: true,
+    });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([
+      { id: "issue-1" },
+      { id: "issue-2" },
+    ]);
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-linked/reject")
+      .send({ decisionNote: "Wrong quality: missing visual proof." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(2);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "issue-1",
+      "Approval rejected: Wrong quality: missing visual proof.",
+      { userId: "user-1" },
+      expect.objectContaining({
+        authorType: "user",
+        metadata: expect.objectContaining({
+          version: 1,
+          sections: expect.any(Array),
+        }),
+      }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "issue-2",
+      "Approval rejected: Wrong quality: missing visual proof.",
+      { userId: "user-1" },
+      expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "approval.rejected",
+        details: expect.objectContaining({ linkedIssueIds: ["issue-1", "issue-2"] }),
+      }),
+    );
   });
 
   it("derives approval attribution from the authenticated actor on request revision", async () => {
@@ -346,5 +450,81 @@ describe("approval routes idempotent retries", () => {
         action: "approval.created",
       }),
     );
+  });
+
+  it("blocks status-only recovery runs from creating approvals", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: {
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Approve hosting spend" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  it("blocks status-only recovery runs from resubmitting approvals", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-7",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "revision_requested",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: {
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      },
+    }))
+      .post("/api/approvals/approval-7/resubmit")
+      .send({ payload: { title: "Retry" } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
+  it("blocks status-only recovery runs from commenting on approvals", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-8",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: {
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      },
+    }))
+      .post("/api/approvals/approval-8/comments")
+      .send({ body: "please approve" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot create or modify approvals");
+    expect(mockApprovalService.addComment).not.toHaveBeenCalled();
   });
 });

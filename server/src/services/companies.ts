@@ -28,11 +28,16 @@ import {
   companyMemberships,
   companySkills,
   documents,
+  routineRuns,
+  routineTriggers,
+  routineRevisions,
+  routines,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
+import { builtInAgentService } from "./built-in-agents.js";
 
 export interface CompanyActivityActor {
   actorType: "user" | "agent" | "system" | "plugin";
@@ -52,6 +57,7 @@ export function companyService(db: Db) {
   const ISSUE_PREFIX_FALLBACK = "CMP";
   const environmentsSvc = environmentService(db);
   const heartbeat = heartbeatService(db);
+  const builtInAgents = builtInAgentService(db);
 
   type CompanyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -126,11 +132,14 @@ export function companyService(db: Db) {
     name: companies.name,
     description: companies.description,
     status: companies.status,
+    operatingMode: companies.operatingMode,
+    pilotAllowlist: companies.pilotAllowlist,
     issuePrefix: companies.issuePrefix,
     issueCounter: companies.issueCounter,
     budgetMonthlyCents: companies.budgetMonthlyCents,
     spentMonthlyCents: companies.spentMonthlyCents,
     attachmentMaxBytes: companies.attachmentMaxBytes,
+    defaultResponsibleUserId: companies.defaultResponsibleUserId,
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
     feedbackDataSharingConsentAt: companies.feedbackDataSharingConsentAt,
@@ -147,6 +156,32 @@ export function companyService(db: Db) {
       ...company,
       logoUrl: company.logoAssetId ? `/api/assets/${company.logoAssetId}/content` : null,
     };
+  }
+
+  async function hydrateCompanyOperatingState<T extends { id: string }>(
+    rows: T[],
+    database: Pick<Db, "select"> = db,
+  ) {
+    if (rows.length === 0) return [];
+    const companyIds = rows.map((row) => row.id);
+    const drainingRows = await database
+      .select({
+        companyId: heartbeatRuns.companyId,
+        drainingRunCount: count(),
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.companyId, companyIds),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+      ))
+      .groupBy(heartbeatRuns.companyId);
+    const drainingByCompanyId = new Map(
+      drainingRows.map((row) => [row.companyId, Number(row.drainingRunCount ?? 0)]),
+    );
+    return rows.map((row) => ({
+      ...row,
+      drainingRunCount: drainingByCompanyId.get(row.id) ?? 0,
+    }));
   }
 
   function currentUtcMonthWindow(now = new Date()) {
@@ -246,7 +281,7 @@ export function companyService(db: Db) {
   return {
     list: async () => {
       const rows = await getCompanyQuery(db);
-      const hydrated = await hydrateCompanySpend(rows);
+      const hydrated = await hydrateCompanyOperatingState(await hydrateCompanySpend(rows));
       return hydrated.map((row) => enrichCompany(row));
     },
 
@@ -255,18 +290,19 @@ export function companyService(db: Db) {
         .where(eq(companies.id, id))
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
-      const [hydrated] = await hydrateCompanySpend([row], db);
+      const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([row], db), db);
       return enrichCompany(hydrated);
     },
 
     create: async (data: typeof companies.$inferInsert) => {
       const created = await createCompanyWithUniquePrefix(data);
       await environmentsSvc.ensureLocalEnvironment(created.id);
+      await builtInAgents.autoProvisionBundledAgents(created.id);
       const row = await getCompanyQuery(db)
         .where(eq(companies.id, created.id))
         .then((rows) => rows[0] ?? null);
       if (!row) throw notFound("Company not found after creation");
-      const [hydrated] = await hydrateCompanySpend([row], db);
+      const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([row], db), db);
       return enrichCompany(hydrated);
     },
 
@@ -348,10 +384,10 @@ export function companyService(db: Db) {
           await tx.delete(assets).where(eq(assets.id, existing.logoAssetId));
         }
 
-        const [hydrated] = await hydrateCompanySpend([{
+        const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([{
           ...updated,
           logoAssetId: logoAssetId === undefined ? existing.logoAssetId : logoAssetId,
-        }], tx);
+        }], tx), tx);
 
         const shouldLogReactivation = willReactivate &&
           (existing.status === "archived" || agentsRestored > 0);
@@ -406,7 +442,7 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
-        const [hydrated] = await hydrateCompanySpend([row], tx);
+        const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([row], tx), tx);
         return {
           company: enrichCompany(hydrated),
           cascade,
@@ -452,6 +488,10 @@ export function companyService(db: Db) {
         await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
         await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
         await tx.delete(companySkills).where(eq(companySkills.companyId, id));
+        await tx.delete(routineRuns).where(eq(routineRuns.companyId, id));
+        await tx.delete(routineTriggers).where(eq(routineTriggers.companyId, id));
+        await tx.delete(routineRevisions).where(eq(routineRevisions.companyId, id));
+        await tx.delete(routines).where(eq(routines.companyId, id));
         await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
         await tx.delete(documents).where(eq(documents.companyId, id));
         await tx.delete(issues).where(eq(issues.companyId, id));

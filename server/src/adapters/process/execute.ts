@@ -11,18 +11,28 @@ import {
   runChildProcess,
 } from "../utils.js";
 
+const VPS_CAPACITY_EXHAUSTED_RE = /\[vps-run\]\s+all\s+\d+\s+slots\s+(?:still\s+)?busy\b/i;
+
+function processCapacityExhausted(stdout: string, stderr: string): boolean {
+  return VPS_CAPACITY_EXHAUSTED_RE.test(`${stdout}\n${stderr}`);
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, config, onLog, onMeta } = ctx;
+  const { runId, agent, config, onLog, onMeta, authToken } = ctx;
   const command = asString(config.command, "");
   if (!command) throw new Error("Process adapter missing command");
 
   const args = asStringArray(config.args);
   const cwd = asString(config.cwd, process.cwd());
   const envConfig = parseObject(config.env);
-  const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+  const env: Record<string, string> = {
+    ...buildPaperclipEnv(agent),
+  };
   for (const [k, v] of Object.entries(envConfig)) {
     if (typeof v === "string") env[k] = v;
   }
+  env.PAPERCLIP_RUN_ID = runId;
+  if (authToken && !env.PAPERCLIP_API_KEY?.trim()) env.PAPERCLIP_API_KEY = authToken;
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
   const loggedEnv = buildInvocationEnvForLogs(env, {
@@ -50,6 +60,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutSec,
     graceSec,
     onLog,
+    onSpawn: ctx.onSpawn,
   });
 
   if (proc.timedOut) {
@@ -68,6 +79,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage: `Process exited with code ${proc.exitCode ?? -1}`,
       resultJson: {
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+      },
+    };
+  }
+
+  if (processCapacityExhausted(proc.stdout, proc.stderr)) {
+    return {
+      exitCode: proc.exitCode,
+      signal: proc.signal,
+      timedOut: false,
+      summary: "Process adapter reported temporary capacity exhaustion.",
+      resultJson: {
+        processCapacityExhausted: true,
+        capacityStatus: "at_capacity",
         stdout: proc.stdout,
         stderr: proc.stderr,
       },

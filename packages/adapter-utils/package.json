@@ -13,8 +13,14 @@
   },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./*": "./src/*.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./*": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
+    }
   },
   "publishConfig": {
     "access": "public",
@@ -35,12 +41,18 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp src/codex-auth-merge-decision.cjs src/codex-auth-merge-extract.sh dist/",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "acpx": "^0.12.0",
+    "picocolors": "^1.1.1"
+  },
   "devDependencies": {
-    "@types/node": "^24.6.0",
+    "@types/node": "^22.19.21",
     "typescript": "^5.7.3"
-  }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts"
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addApprovalCommentSchema,
+  rejectApprovalSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
 } from "./approval.js";
@@ -18,6 +19,14 @@ describe("approval validators", () => {
     expect(resolveApprovalSchema.parse({}).decisionNote).toBeUndefined();
     expect(requestApprovalRevisionSchema.parse({ decisionNote: null }).decisionNote).toBeNull();
     expect(requestApprovalRevisionSchema.parse({}).decisionNote).toBeUndefined();
+  });
+
+  it("requires a non-empty rejection decision note", () => {
+    expect(rejectApprovalSchema.parse({ decisionNote: "  Wrong scope  " }).decisionNote).toBe("Wrong scope");
+    expect(() => rejectApprovalSchema.parse({ decisionNote: "" })).toThrow();
+    expect(() => rejectApprovalSchema.parse({ decisionNote: "   " })).toThrow();
+    expect(() => rejectApprovalSchema.parse({ decisionNote: null })).toThrow();
+    expect(() => rejectApprovalSchema.parse({})).toThrow();
   });
 
   it("normalizes escaped line breaks in approval comments and decision notes", () => {
