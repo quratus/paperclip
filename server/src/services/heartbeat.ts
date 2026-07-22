@@ -89,6 +89,7 @@ import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
+import { companyOperatingModeService } from "./company-operating-mode.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -5450,6 +5451,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
+  const companyOperatingMode = companyOperatingModeService(db);
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
@@ -15232,6 +15234,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
+    const operatingDecision = await companyOperatingMode.decide(agent.companyId, agentId);
+    if (operatingDecision && !operatingDecision.admitted) {
+      if (opts.requestedByActorType === "user") {
+        throw conflict(
+          operatingDecision.operatingMode === "frozen"
+            ? "Company operating mode is frozen"
+            : "Agent is not in the company pilot allowlist",
+          {
+            code: operatingDecision.reason,
+            companyId: agent.companyId,
+            agentId,
+            operatingMode: operatingDecision.operatingMode,
+            drainingRunCount: operatingDecision.drainingRunCount,
+          },
+        );
+      }
+      await writeSkippedRequest(operatingDecision.reason ?? "company.operating_mode.denied", {
+        error:
+          operatingDecision.operatingMode === "frozen"
+            ? "Wake suppressed because company operating mode is frozen"
+            : "Wake suppressed because agent is not in the company pilot allowlist",
+      });
+      return null;
+    }
+
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
     if (explicitResumeSession) {
       enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
@@ -17018,6 +17045,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let skipped = 0;
 
       for (const agent of allAgents) {
+        const operatingDecision = await companyOperatingMode.decide(agent.companyId, agent.id);
+        if (operatingDecision && !operatingDecision.admitted) {
+          skipped += 1;
+          continue;
+        }
         const invokability = evaluateAgentInvokability(toAgentOrgRow(agent), agentsByCompany.get(agent.companyId) ?? []);
         if (!invokability.invokable) continue;
         const policy = parseHeartbeatPolicy(agent);

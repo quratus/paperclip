@@ -314,9 +314,19 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
+  if (policy.stages.length === 0) {
+    return policy.workClass
+      ? {
+          mode: policy.mode,
+          workClass: policy.workClass,
+          commentRequired: policy.commentRequired,
+          stages: [],
+        }
+      : null;
+  }
   return {
     mode: policy.mode,
+    ...(policy.workClass ? { workClass: policy.workClass } : {}),
     commentRequired: policy.commentRequired,
     stages: policy.stages,
   };
@@ -389,11 +399,13 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
 
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
+  const workClass = parsed.data.workClass;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && !workClass) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
+    ...(workClass ? { workClass } : {}),
     commentRequired: true,
     stages,
     ...(monitor ? { monitor } : {}),

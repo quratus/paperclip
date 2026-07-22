@@ -324,13 +324,14 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedAssignableAgentCompany() {
+  async function seedAssignableAgentCompany(companyPatch: Partial<typeof companies.$inferInsert> = {}) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      ...companyPatch,
     });
     return companyId;
   }
@@ -354,6 +355,114 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       permissions: {},
     };
   }
+
+  it("rejects checkout for pilot agents outside the company allowlist before mutating issue state", async () => {
+    const allowedAgentId = randomUUID();
+    const companyId = await seedAssignableAgentCompany({
+      operatingMode: "pilot",
+      pilotAllowlist: [allowedAgentId],
+    });
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "Non Pilot Agent",
+      status: "idle",
+    }));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pilot denied checkout",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["todo"], randomUUID())).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "company.operating_mode.pilot_denied",
+        operatingMode: "pilot",
+        agentId,
+      },
+    });
+
+    const [issue] = await db.select({ status: issues.status, checkoutRunId: issues.checkoutRunId }).from(issues);
+    expect(issue).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
+    });
+  });
+
+  it("allows checkout for pilot agents in the company allowlist", async () => {
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const companyId = await seedAssignableAgentCompany({
+      operatingMode: "pilot",
+      pilotAllowlist: [agentId],
+    });
+    const issueId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "Pilot Checkout Agent",
+      status: "idle",
+    }));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pilot allowed checkout",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+    });
+
+    const checkedOut = await svc.checkout(issueId, agentId, ["todo"], runId);
+
+    expect(checkedOut).toMatchObject({
+      id: issueId,
+      status: "in_progress",
+      checkoutRunId: runId,
+    });
+  });
+
+  it("rejects checkout for frozen companies before mutating issue state", async () => {
+    const companyId = await seedAssignableAgentCompany({
+      operatingMode: "frozen",
+    });
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "Frozen Checkout Agent",
+      status: "idle",
+    }));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Frozen denied checkout",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["todo"], randomUUID())).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "company.operating_mode.frozen",
+        operatingMode: "frozen",
+        agentId,
+      },
+    });
+
+    const [issue] = await db.select({ status: issues.status, checkoutRunId: issues.checkoutRunId }).from(issues);
+    expect(issue).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
+    });
+  });
 
   it("rejects direct terminated assignees with structured conflict details", async () => {
     const companyId = await seedAssignableAgentCompany();

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  COMPANY_OPERATING_MODES,
   COMPANY_STATUSES,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
 } from "../constants.js";
@@ -12,6 +13,7 @@ const attachmentMaxBytesSchema = z
   .int()
   .min(1)
   .max(MAX_COMPANY_ATTACHMENT_MAX_BYTES);
+const pilotAllowlistSchema = z.array(z.string().uuid()).max(500).optional();
 
 export const createCompanySchema = z.object({
   name: z.string().min(1),
@@ -36,6 +38,8 @@ export const updateCompanySchema = createCompanySchema
     brandColor: brandColorSchema,
     logoAssetId: logoAssetIdSchema,
     attachmentMaxBytes: attachmentMaxBytesSchema.optional(),
+    operatingMode: z.enum(COMPANY_OPERATING_MODES).optional(),
+    pilotAllowlist: pilotAllowlistSchema,
   });
 
 export type UpdateCompany = z.infer<typeof updateCompanySchema>;

@@ -132,6 +132,8 @@ export function companyService(db: Db) {
     name: companies.name,
     description: companies.description,
     status: companies.status,
+    operatingMode: companies.operatingMode,
+    pilotAllowlist: companies.pilotAllowlist,
     issuePrefix: companies.issuePrefix,
     issueCounter: companies.issueCounter,
     budgetMonthlyCents: companies.budgetMonthlyCents,
@@ -154,6 +156,32 @@ export function companyService(db: Db) {
       ...company,
       logoUrl: company.logoAssetId ? `/api/assets/${company.logoAssetId}/content` : null,
     };
+  }
+
+  async function hydrateCompanyOperatingState<T extends { id: string }>(
+    rows: T[],
+    database: Pick<Db, "select"> = db,
+  ) {
+    if (rows.length === 0) return [];
+    const companyIds = rows.map((row) => row.id);
+    const drainingRows = await database
+      .select({
+        companyId: heartbeatRuns.companyId,
+        drainingRunCount: count(),
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.companyId, companyIds),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+      ))
+      .groupBy(heartbeatRuns.companyId);
+    const drainingByCompanyId = new Map(
+      drainingRows.map((row) => [row.companyId, Number(row.drainingRunCount ?? 0)]),
+    );
+    return rows.map((row) => ({
+      ...row,
+      drainingRunCount: drainingByCompanyId.get(row.id) ?? 0,
+    }));
   }
 
   function currentUtcMonthWindow(now = new Date()) {
@@ -253,7 +281,7 @@ export function companyService(db: Db) {
   return {
     list: async () => {
       const rows = await getCompanyQuery(db);
-      const hydrated = await hydrateCompanySpend(rows);
+      const hydrated = await hydrateCompanyOperatingState(await hydrateCompanySpend(rows));
       return hydrated.map((row) => enrichCompany(row));
     },
 
@@ -262,7 +290,7 @@ export function companyService(db: Db) {
         .where(eq(companies.id, id))
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
-      const [hydrated] = await hydrateCompanySpend([row], db);
+      const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([row], db), db);
       return enrichCompany(hydrated);
     },
 
@@ -274,7 +302,7 @@ export function companyService(db: Db) {
         .where(eq(companies.id, created.id))
         .then((rows) => rows[0] ?? null);
       if (!row) throw notFound("Company not found after creation");
-      const [hydrated] = await hydrateCompanySpend([row], db);
+      const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([row], db), db);
       return enrichCompany(hydrated);
     },
 
@@ -356,10 +384,10 @@ export function companyService(db: Db) {
           await tx.delete(assets).where(eq(assets.id, existing.logoAssetId));
         }
 
-        const [hydrated] = await hydrateCompanySpend([{
+        const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([{
           ...updated,
           logoAssetId: logoAssetId === undefined ? existing.logoAssetId : logoAssetId,
-        }], tx);
+        }], tx), tx);
 
         const shouldLogReactivation = willReactivate &&
           (existing.status === "archived" || agentsRestored > 0);
@@ -414,7 +442,7 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
-        const [hydrated] = await hydrateCompanySpend([row], tx);
+        const [hydrated] = await hydrateCompanyOperatingState(await hydrateCompanySpend([row], tx), tx);
         return {
           company: enrichCompany(hydrated),
           cascade,

@@ -1,6 +1,9 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
+export const COMPANY_OPERATING_MODES = ["active", "frozen", "pilot"] as const;
+export type CompanyOperatingMode = (typeof COMPANY_OPERATING_MODES)[number];
+
 export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 export const MAX_COMPANY_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 
@@ -275,9 +278,11 @@ export type IssueThreadInteractionContinuationPolicy =
   (typeof ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES)[number];
 
 export const TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND = "task_watchdog_product_bug";
+export const SOURCE_NOTE_ORIGIN_KIND = "source_note";
 
 export const ISSUE_ORIGIN_KINDS = [
   "manual",
+  SOURCE_NOTE_ORIGIN_KIND,
   "routine_execution",
   "stale_active_run_evaluation",
   "harness_liveness_escalation",
@@ -434,6 +439,9 @@ export type ExternalObjectMentionConfidence = (typeof EXTERNAL_OBJECT_MENTION_CO
 
 export const ISSUE_EXECUTION_POLICY_MODES = ["normal", "auto"] as const;
 export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[number];
+
+export const ISSUE_WORK_CLASSES = ["product_ui", "backend", "security", "docs_ops"] as const;
+export type IssueWorkClass = (typeof ISSUE_WORK_CLASSES)[number];
 
 export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];

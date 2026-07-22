@@ -125,6 +125,61 @@ describeEmbeddedPostgres("companyService", () => {
     expect(afterReconcileRows.filter((row) => readBuiltInAgentMarker(row.metadata)?.key === "reflection-coach")).toHaveLength(1);
   });
 
+  it("exposes operating mode, pilot allowlist, and draining run count", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const allowlistedAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Pilot Truth Co",
+      status: "active",
+      operatingMode: "pilot",
+      pilotAllowlist: [allowlistedAgentId],
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Draining Agent",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "queued",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "running",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "succeeded",
+      },
+    ]);
+
+    const company = await companyService(db).getById(companyId);
+
+    expect(company).toMatchObject({
+      operatingMode: "pilot",
+      pilotAllowlist: [allowlistedAgentId],
+      drainingRunCount: 2,
+    });
+  });
+
   it("archives companies by pausing runnable agents and cancelling active runs", async () => {
     const companyId = randomUUID();
     const runningAgentId = randomUUID();

@@ -1,4 +1,5 @@
 export { companyService } from "./companies.js";
+export { companyOperatingModeService } from "./company-operating-mode.js";
 export { companyArtifactsService } from "./company-artifacts.js";
 export { companySearchService } from "./company-search.js";
 export { companySearchExtractService } from "./company-search-extract.js";

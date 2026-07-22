@@ -23,6 +23,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   linkManyForApproval: vi.fn(),
 }));
 
+const mockIssueService = vi.hoisted(() => ({
+  addComment: vi.fn(),
+}));
+
 const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
@@ -38,6 +42,7 @@ function registerModuleMocks() {
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => mockIssueApprovalService,
+    issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
   }));
@@ -130,6 +135,7 @@ describe("approval routes idempotent retries", () => {
     mockHeartbeatService.wakeup.mockReset();
     mockIssueApprovalService.listIssuesForApproval.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
+    mockIssueService.addComment.mockReset();
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
     mockLogActivity.mockReset();
     mockAccessService.decide.mockReset();
@@ -141,6 +147,7 @@ describe("approval routes idempotent retries", () => {
     });
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -175,6 +182,24 @@ describe("approval routes idempotent retries", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
+  it("rejects approval rejections without a decision note", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-empty",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-empty/reject")
+      .send({ decisionNote: "   " });
+
+    expect(res.status).toBe(400);
+    expect(mockApprovalService.reject).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it("does not emit duplicate rejection logs when reject is already resolved", async () => {
     mockApprovalService.getById.mockResolvedValue({
       id: "approval-1",
@@ -196,7 +221,7 @@ describe("approval routes idempotent retries", () => {
 
     const res = await request(await createApp())
       .post("/api/approvals/approval-1/reject")
-      .send({});
+      .send({ decisionNote: "Already rejected." });
 
     expect(res.status).toBe(200);
     expect(mockLogActivity).not.toHaveBeenCalled();
@@ -292,6 +317,62 @@ describe("approval routes idempotent retries", () => {
 
     expect(res.status).toBe(200);
     expect(mockApprovalService.reject).toHaveBeenCalledWith("approval-5", "user-1", "not now");
+  });
+
+  it("posts rejection rationale to each linked issue when the rejection is applied", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-linked",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    mockApprovalService.reject.mockResolvedValue({
+      approval: {
+        id: "approval-linked",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "rejected",
+        payload: {},
+      },
+      applied: true,
+    });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([
+      { id: "issue-1" },
+      { id: "issue-2" },
+    ]);
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-linked/reject")
+      .send({ decisionNote: "Wrong quality: missing visual proof." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(2);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "issue-1",
+      "Approval rejected: Wrong quality: missing visual proof.",
+      { userId: "user-1" },
+      expect.objectContaining({
+        authorType: "user",
+        metadata: expect.objectContaining({
+          version: 1,
+          sections: expect.any(Array),
+        }),
+      }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "issue-2",
+      "Approval rejected: Wrong quality: missing visual proof.",
+      { userId: "user-1" },
+      expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "approval.rejected",
+        details: expect.objectContaining({ linkedIssueIds: ["issue-1", "issue-2"] }),
+      }),
+    );
   });
 
   it("derives approval attribution from the authenticated actor on request revision", async () => {

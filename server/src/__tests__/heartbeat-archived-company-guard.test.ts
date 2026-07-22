@@ -47,13 +47,31 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
   });
 
   async function insertArchivedAgent() {
+    return insertAgentForCompanyMode({
+      companyName: "Archived Co",
+      companyStatus: "archived",
+      operatingMode: "active",
+      agentName: "Archived Agent",
+    });
+  }
+
+  async function insertAgentForCompanyMode(input: {
+    companyName: string;
+    companyStatus?: "active" | "paused" | "archived";
+    operatingMode?: "active" | "frozen" | "pilot";
+    pilotAllowlist?: string[];
+    agentId?: string;
+    agentName: string;
+  }) {
     const companyId = randomUUID();
-    const agentId = randomUUID();
+    const agentId = input.agentId ?? randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
-      name: "Archived Co",
-      status: "archived",
+      name: input.companyName,
+      status: input.companyStatus ?? "active",
+      operatingMode: input.operatingMode ?? "active",
+      pilotAllowlist: input.pilotAllowlist ?? [],
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
@@ -61,7 +79,7 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     await db.insert(agents).values({
       id: agentId,
       companyId,
-      name: "Archived Agent",
+      name: input.agentName,
       role: "engineer",
       status: "idle",
       adapterType: "codex_local",
@@ -74,6 +92,8 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
         },
       },
       permissions: {},
+      createdAt: new Date("2026-06-04T00:00:00Z"),
+      lastHeartbeatAt: new Date("2026-06-04T00:00:00Z"),
     });
 
     return { companyId, agentId };
@@ -184,6 +204,64 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     });
   });
 
+  it("skips background wakeups for frozen companies with a mode-specific reason", async () => {
+    const { agentId } = await insertAgentForCompanyMode({
+      companyName: "Frozen Co",
+      operatingMode: "frozen",
+      agentName: "Frozen Agent",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: randomUUID(), commentId: randomUUID() },
+      requestedByActorType: "system",
+      requestedByActorId: "comment_wake",
+    });
+
+    expect(run).toBeNull();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        error: agentWakeupRequests.error,
+      })
+      .from(agentWakeupRequests);
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "company.operating_mode.frozen",
+      error: "Wake suppressed because company operating mode is frozen",
+    });
+  });
+
+  it("skips timer scheduler admission for pilot agents outside the allowlist", async () => {
+    const { agentId } = await insertAgentForCompanyMode({
+      companyName: "Pilot Co",
+      operatingMode: "pilot",
+      pilotAllowlist: [randomUUID()],
+      agentName: "Non Pilot Agent",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2026-06-04T00:10:00Z"));
+
+    expect(result).toMatchObject({
+      checked: 0,
+      enqueued: 0,
+      skipped: 1,
+    });
+
+    const runCount = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.filter((row) => row.agentId === agentId).length);
+    expect(runCount).toBe(0);
+  });
+
   it("does not advance issue monitors for archived companies", async () => {
     const { companyId, agentId } = await insertArchivedAgent();
     const issueId = randomUUID();
@@ -253,6 +331,66 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
     })).rejects.toMatchObject({
       status: 409,
       details: { status: "archived" },
+    });
+
+    const runCount = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.filter((row) => row.agentId === agentId).length);
+    expect(runCount).toBe(0);
+  });
+
+  it("rejects explicit user invokes for frozen companies", async () => {
+    const { agentId } = await insertAgentForCompanyMode({
+      companyName: "Frozen User Invoke Co",
+      operatingMode: "frozen",
+      agentName: "Frozen User Agent",
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "company.operating_mode.frozen",
+        operatingMode: "frozen",
+      },
+    });
+
+    const runCount = await db
+      .select()
+      .from(heartbeatRuns)
+      .then((rows) => rows.filter((row) => row.agentId === agentId).length);
+    expect(runCount).toBe(0);
+  });
+
+  it("rejects explicit user invokes for pilot agents outside the allowlist", async () => {
+    const { agentId } = await insertAgentForCompanyMode({
+      companyName: "Pilot User Invoke Co",
+      operatingMode: "pilot",
+      pilotAllowlist: [randomUUID()],
+      agentName: "Non Pilot User Agent",
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "company.operating_mode.pilot_denied",
+        operatingMode: "pilot",
+        agentId,
+      },
     });
 
     const runCount = await db

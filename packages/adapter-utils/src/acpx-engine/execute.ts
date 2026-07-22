@@ -245,6 +245,27 @@ export async function findAncestorBin(startDir: string, binName: string): Promis
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// pnpm regenerates `node_modules/.bin/<name>` non-atomically (unlink, then
+// re-symlink) during install/rebuild, so a spawn racing a concurrent rebuild
+// can see a transient ENOENT here even though the package is correctly
+// installed (ETR-54). Retry across a short window before treating the bin as
+// genuinely absent.
+const ANCESTOR_BIN_RETRY_ATTEMPTS = 3;
+const ANCESTOR_BIN_RETRY_DELAY_MS = 250;
+
+export async function findAncestorBinWithRetry(startDir: string, binName: string): Promise<string | null> {
+  for (let attempt = 1; attempt <= ANCESTOR_BIN_RETRY_ATTEMPTS; attempt += 1) {
+    const resolved = await findAncestorBin(startDir, binName);
+    if (resolved) return resolved;
+    if (attempt < ANCESTOR_BIN_RETRY_ATTEMPTS) await sleep(ANCESTOR_BIN_RETRY_DELAY_MS);
+  }
+  return null;
+}
+
 interface BuiltInAgentCommand {
   command: string;
   shellCommand: string;
@@ -254,8 +275,9 @@ async function resolveBuiltInAgentCommand(input: {
   agent: string;
   packageRootDir: string;
   executionTargetIsRemote: boolean;
+  onLog?: AdapterExecutionContext["onLog"];
 }): Promise<BuiltInAgentCommand | null> {
-  const { agent, packageRootDir, executionTargetIsRemote } = input;
+  const { agent, packageRootDir, executionTargetIsRemote, onLog } = input;
   if (agent === "gemini") {
     return { command: "gemini --acp", shellCommand: "gemini --acp" };
   }
@@ -264,7 +286,14 @@ async function resolveBuiltInAgentCommand(input: {
   if (executionTargetIsRemote) {
     return { command: binName, shellCommand: binName };
   }
-  const resolved = (await findAncestorBin(packageRootDir, binName)) ?? binName;
+  const ancestorBin = await findAncestorBinWithRetry(packageRootDir, binName);
+  if (!ancestorBin && onLog) {
+    await onLog(
+      "stderr",
+      `[paperclip] Could not find "${binName}" under any node_modules/.bin ancestor of ${packageRootDir}; falling back to ambient PATH resolution for exec. If the spawned process exits with 127, the host process's PATH is missing the directory that hoists this binary.\n`,
+    );
+  }
+  const resolved = ancestorBin ?? binName;
   return { command: resolved, shellCommand: shellQuote(resolved) };
 }
 
@@ -1256,6 +1285,7 @@ async function buildRuntime(input: {
     agent: acpxAgent,
     packageRootDir: input.engine.packageRootDir,
     executionTargetIsRemote,
+    onLog: input.ctx.onLog,
   });
   let agentCommand = configuredCommand || builtInCommand?.command || null;
   let agentCommandShell = configuredCommand || builtInCommand?.shellCommand || "";

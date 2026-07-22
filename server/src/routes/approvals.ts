@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  rejectApprovalSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -15,6 +16,7 @@ import {
   accessService,
   heartbeatService,
   issueApprovalService,
+  issueService,
   logActivity,
   secretService,
 } from "../services/index.js";
@@ -50,6 +52,7 @@ export function approvalRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const issueApprovalsSvc = issueApprovalService(db);
+  const issuesSvc = issueService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
@@ -281,7 +284,7 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
-  router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
+  router.post("/approvals/:id/reject", validate(rejectApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     if (!(await requireApprovalAccess(req, id))) {
@@ -289,9 +292,31 @@ export function approvalRoutes(
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
+    const decisionNote = req.body.decisionNote;
+    const { approval, applied } = await svc.reject(id, decidedByUserId, decisionNote);
 
     if (applied) {
+      const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+      const linkedIssueIds = linkedIssues.map((issue) => issue.id);
+      await Promise.all(linkedIssueIds.map((issueId) => issuesSvc.addComment(
+        issueId,
+        `Approval rejected: ${decisionNote}`,
+        { userId: req.actor.userId ?? "board" },
+        {
+          authorType: "user",
+          metadata: {
+            version: 1,
+            sections: [{
+              title: "Approval decision",
+              rows: [
+                { type: "key_value", label: "Outcome", value: "Rejected" },
+                { type: "key_value", label: "Approval", value: approval.id },
+              ],
+            }],
+          },
+        },
+      )));
+
       await logActivity(db, {
         companyId: approval.companyId,
         actorType: "user",
@@ -299,7 +324,7 @@ export function approvalRoutes(
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
-        details: { type: approval.type },
+        details: { type: approval.type, linkedIssueIds },
       });
     }
 

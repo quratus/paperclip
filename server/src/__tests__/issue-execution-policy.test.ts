@@ -132,6 +132,18 @@ describe("normalizeIssueExecutionPolicy", () => {
       },
     });
   });
+
+  it("keeps workClass-only docs_ops policies for admission exemptions", () => {
+    const result = normalizeIssueExecutionPolicy({
+      workClass: "docs_ops",
+      stages: [],
+    });
+
+    expect(result).toMatchObject({
+      workClass: "docs_ops",
+      stages: [],
+    });
+  });
 });
 
 describe("parseIssueExecutionState", () => {

@@ -532,11 +532,13 @@ export {
 
 export {
   createApprovalSchema,
+  rejectApprovalSchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
+  type RejectApproval,
   type ResolveApproval,
   type RequestApprovalRevision,
   type ResubmitApproval,

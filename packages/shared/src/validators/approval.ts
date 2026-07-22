@@ -17,6 +17,12 @@ export const resolveApprovalSchema = z.object({
 
 export type ResolveApproval = z.infer<typeof resolveApprovalSchema>;
 
+export const rejectApprovalSchema = z.object({
+  decisionNote: multilineTextSchema.pipe(z.string().trim().min(1)),
+});
+
+export type RejectApproval = z.infer<typeof rejectApprovalSchema>;
+
 export const requestApprovalRevisionSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
 });

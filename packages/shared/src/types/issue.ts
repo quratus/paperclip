@@ -10,6 +10,7 @@ import type {
   IssueExecutionDecisionOutcome,
   IssueMonitorScheduledBy,
   IssueExecutionPolicyMode,
+  IssueWorkClass,
   IssueReferenceSourceKind,
   IssueExecutionStageType,
   IssueExecutionStateStatus,
@@ -617,6 +618,7 @@ export interface IssueExecutionMonitorPolicy {
 
 export interface IssueExecutionPolicy {
   mode: IssueExecutionPolicyMode;
+  workClass?: IssueWorkClass;
   commentRequired: boolean;
   stages: IssueExecutionStage[];
   monitor?: IssueExecutionMonitorPolicy | null;

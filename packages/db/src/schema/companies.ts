@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex, jsonb } from "drizzle-orm/pg-core";
+import type { CompanyOperatingMode } from "@paperclipai/shared";
 
 export const companies = pgTable(
   "companies",
@@ -7,6 +8,8 @@ export const companies = pgTable(
     name: text("name").notNull(),
     description: text("description"),
     status: text("status").notNull().default("active"),
+    operatingMode: text("operating_mode").$type<CompanyOperatingMode>().notNull().default("active"),
+    pilotAllowlist: jsonb("pilot_allowlist").$type<string[]>().notNull().default([]),
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     issuePrefix: text("issue_prefix").notNull().default("PAP"),
