@@ -3248,6 +3248,59 @@ export function issueRoutes(
     });
   }
 
+  function hasProductTruthContract(description: string | null | undefined) {
+    return /^##[ \t]+Product Truth Contract[ \t]*$/im.test(description ?? "");
+  }
+
+  function assertIssueAdmissionContract(input: {
+    issue: {
+      id: string;
+      description?: string | null;
+      executionPolicy?: unknown;
+    };
+    nextDescription?: string | null;
+    nextExecutionPolicy?: unknown;
+    source: "status_transition" | "checkout" | "assignment";
+    actorType?: string;
+  }) {
+    // Board/founder-authenticated requests are the one-way-door override for the
+    // Issue Refinery admission contract (Julius directive, 2026-07-22): the gate
+    // exists to keep agent-authored product work disciplined, not to lock the
+    // board out of its own backlog. Agents (including Charles running as an
+    // agent) still need either the still-backlog refinement path above or a
+    // real contract to reach todo. Matches the board exemption pattern used
+    // elsewhere in this file (see assertCanManageIssueMonitor above).
+    if (input.actorType === "board") return;
+
+    const policy = normalizeIssueExecutionPolicy(
+      input.nextExecutionPolicy === undefined ? input.issue.executionPolicy ?? null : input.nextExecutionPolicy,
+    );
+    const workClass = policy?.workClass ?? null;
+    if (workClass === "docs_ops") return;
+
+    const hasContract = hasProductTruthContract(
+      input.nextDescription === undefined ? input.issue.description ?? null : input.nextDescription,
+    );
+    const hasReviewChain = Boolean(policy?.stages?.length);
+    if (hasContract && hasReviewChain) return;
+
+    throw unprocessable(
+      "Product admission rejected: run this issue through the Issue Refinery before build. Product-class issues need a ## Product Truth Contract section and an executionPolicy review chain; docs_ops is the only exempt workClass.",
+      {
+        code: "missing_product_truth_contract",
+        source: input.source,
+        issueId: input.issue.id,
+        refinery: "Issue Refinery",
+        missing: [
+          ...(!workClass ? ["executionPolicy.workClass"] : []),
+          ...(!hasContract ? ["## Product Truth Contract"] : []),
+          ...(!hasReviewChain ? ["executionPolicy.stages"] : []),
+        ],
+        validWorkClasses: ["product_ui", "backend", "security", "docs_ops"],
+      },
+    );
+  }
+
   async function logExpiredRequestConfirmations(input: {
     issue: { id: string; companyId: string; identifier?: string | null };
     interactions: Array<{ id: string; kind: string; status: string; result?: unknown }>;
@@ -7073,10 +7126,10 @@ export function issueRoutes(
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
-    let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+    let deduplicationReason: "idempotency_key" | "source_note" | "recent_open_title" | null = null;
     const issue = await svc.create(companyId, {
-      ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
+      ...createBody,
       id: issueId,
       originRunId: createBody.originRunId ?? actor.runId,
       executionPolicy,
@@ -7853,6 +7906,28 @@ export function issueRoutes(
       existing.assigneeAgentId,
       req.body.executionPolicy !== undefined && monitorChanged,
     );
+
+    const admissionStatusTransitionRequested = existing.status === "backlog" && updateFields.status === "todo";
+    // Assigning someone to a still-backlog issue is how refinement happens (e.g. Charles
+    // picking up a backlog issue to add the Product Truth Contract) — that handoff must not
+    // itself require the contract to already exist. Only gate assignment when it coincides
+    // with actually leaving backlog.
+    const resultingStatus = updateFields.status ?? existing.status;
+    const admissionAssignmentRequested =
+      typeof normalizedAssigneeAgentId === "string" &&
+      normalizedAssigneeAgentId !== existing.assigneeAgentId &&
+      resultingStatus !== "backlog";
+    if (admissionStatusTransitionRequested || admissionAssignmentRequested) {
+      assertIssueAdmissionContract({
+        issue: existing,
+        nextDescription: updateFields.description === undefined
+          ? undefined
+          : updateFields.description as string | null,
+        nextExecutionPolicy: updateFields.executionPolicy,
+        source: admissionStatusTransitionRequested ? "status_transition" : "assignment",
+        actorType: req.actor.type,
+      });
+    }
 
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
@@ -8941,6 +9016,14 @@ export function issueRoutes(
         assigneeAgentId: req.body.agentId,
         assigneeUserId: null,
       });
+    }
+
+    // Checking out a still-backlog issue is the refinement pickup itself (e.g. Charles
+    // checking it out to add the Product Truth Contract) — don't demand the contract
+    // already exist to start that work. The real admission gate is the backlog->todo
+    // status transition and cross-status reassignment, both enforced in PATCH above.
+    if (issue.status !== "backlog") {
+      assertIssueAdmissionContract({ issue, source: "checkout", actorType: req.actor.type });
     }
 
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);

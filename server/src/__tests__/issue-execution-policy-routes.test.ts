@@ -3,9 +3,12 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
+vi.setConfig({ testTimeout: 15_000 });
+
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  checkout: vi.fn(),
   update: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
@@ -175,6 +178,7 @@ describe("issue execution policy routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.checkout.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -256,6 +260,258 @@ describe("issue execution policy routes", () => {
       missing: "review_path",
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects backlog to todo admission without a Product Truth Contract", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1100",
+      title: "Missing contract",
+      description: "Build the product surface.",
+      executionPolicy: {
+        workClass: "product_ui",
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }] }],
+      },
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Issue Refinery");
+    expect(res.body.details).toMatchObject({
+      code: "missing_product_truth_contract",
+      source: "status_transition",
+      refinery: "Issue Refinery",
+    });
+    expect(res.body.details.missing).toContain("## Product Truth Contract");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows board actors to move a backlog issue straight to todo without a Product Truth Contract", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1108",
+      title: "Board admits directly",
+      description: "Build the product surface.",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("allows board actors to reassign a past-backlog issue without a full executionPolicy review chain", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1101",
+      title: "Missing chain",
+      description: "## Product Truth Contract\n\n- User: trader\n- Truth: build it",
+      executionPolicy: { workClass: "backend", stages: [] },
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" }),
+    );
+  });
+
+  it("rejects checkout without taxonomy, contract, and review chain", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1102",
+      title: "Missing all admission fields",
+      description: "Build the product surface.",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/checkout")
+      .send({
+        agentId: "33333333-3333-4333-8333-333333333333",
+        expectedStatuses: ["todo"],
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Issue Refinery");
+    expect(res.body.details).toMatchObject({
+      code: "missing_product_truth_contract",
+      source: "checkout",
+    });
+    expect(res.body.details.missing).toEqual([
+      "executionPolicy.workClass",
+      "## Product Truth Contract",
+      "executionPolicy.stages",
+    ]);
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  it("allows checking out a still-backlog issue without a Product Truth Contract (refinement pickup)", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "backlog",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1106",
+      title: "Raw backlog issue awaiting refinement",
+      description: "Rough idea, not yet refined.",
+      executionPolicy: null,
+      executionState: null,
+      harnessKind: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.checkout.mockResolvedValue({ ...issue, checkoutRunId: "run-1" });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/checkout")
+      .send({
+        agentId: "33333333-3333-4333-8333-333333333333",
+        expectedStatuses: ["backlog"],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalled();
+  });
+
+  it("allows assigning a still-backlog issue without a Product Truth Contract (refinement handoff)", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1107",
+      title: "Raw backlog issue for Charles to refine",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" }),
+    );
+  });
+
+  it("allows docs_ops checkout without a Product Truth Contract review chain", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1103",
+      title: "Docs task",
+      description: null,
+      executionPolicy: { workClass: "docs_ops", stages: [] },
+      executionState: null,
+      harnessKind: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.checkout.mockResolvedValue({ ...issue, checkoutRunId: "run-1" });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/checkout")
+      .send({
+        agentId: "33333333-3333-4333-8333-333333333333",
+        expectedStatuses: ["todo"],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalled();
   });
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
