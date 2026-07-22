@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { and, eq, or, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -196,6 +196,58 @@ async function waitForHeartbeatIdle(
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+}
+
+async function waitForCapacityRequeue(
+  db: ReturnType<typeof createDb>,
+  input: { agentId: string; issueId: string; agentStatus?: "at_capacity" | "running" },
+  timeoutMs = 4_000,
+) {
+  const readState = async () => {
+    const [agent, issue, comments] = await Promise.all([
+      db.select().from(agents).where(eq(agents.id, input.agentId)).then((rows) => rows[0] ?? null),
+      db.select().from(issues).where(eq(issues.id, input.issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(issueComments).where(eq(issueComments.issueId, input.issueId)),
+    ]);
+    return {
+      agent,
+      issue,
+      comment: comments.find((comment) => comment.body.includes("Awaiting capacity")) ?? null,
+    };
+  };
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await readState();
+    if (
+      state.agent?.status === (input.agentStatus ?? "at_capacity") &&
+      state.issue?.status === "todo" &&
+      state.issue.executionRunId === null &&
+      state.issue.checkoutRunId === null &&
+      state.comment
+    ) {
+      return state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  return readState();
+}
+
+async function waitForAgentStatus(
+  db: ReturnType<typeof createDb>,
+  agentId: string,
+  status: string,
+  timeoutMs = 4_000,
+) {
+  const readAgent = () => db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const agent = await readAgent();
+    if (agent?.status === status) return agent;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return readAgent();
 }
 
 async function cancelActiveRunsForCleanup(
@@ -944,6 +996,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       id: companyId,
       name: "Paperclip",
       issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
 
@@ -1438,7 +1491,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   async function withTempPaperclipHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hot-restart-"));
+    const home = await fs.mkdtemp(path.join(tmpdir(), "paperclip-hot-restart-"));
     const previousHome = process.env.PAPERCLIP_HOME;
     process.env.PAPERCLIP_HOME = home;
     try {
@@ -1629,6 +1682,285 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       });
     });
+  });
+
+  it("marks process capacity exits as at_capacity and requeues the issue with a comment", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cwd = await fs.mkdtemp(path.join(tmpdir(), "paperclip-capacity-"));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Implementer VPS",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: process.execPath, args: ["-e", "process.exit(75)"], cwd },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Run saturated fast-lane work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 75,
+      signal: null,
+      timedOut: false,
+      errorCode: "capacity_exhausted",
+      errorMessage: "Temporary capacity unavailable",
+      resultJson: { stdout: "", stderr: "" },
+    });
+    const heartbeat = heartbeatService(db);
+    const queuedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+    });
+    const run = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
+    expect(run?.errorCode).toBe("capacity_exhausted");
+    expect(run?.exitCode).toBe(75);
+
+    const { agent, issue, comment } = await waitForCapacityRequeue(db, { agentId, issueId });
+    expect(agent?.status).toBe("at_capacity");
+    expect(issue?.status).toBe("todo");
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+    expect(comment?.body).toContain("Awaiting capacity");
+  });
+
+  it("classifies Claude session quota output as capacity and requeues the issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cwd = await fs.mkdtemp(path.join(tmpdir(), "paperclip-quota-"));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Implementer VPS",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", "process.stderr.write(\"You've hit your session limit - resets at 5pm\\n\"); process.exit(1)"],
+        cwd,
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Run quota-limited fast-lane work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "capacity_exhausted",
+      errorMessage: "Temporary capacity unavailable",
+      resultJson: { stdout: "", stderr: "You've hit your session limit - resets at 5pm\n" },
+    });
+    const heartbeat = heartbeatService(db);
+    const queuedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+    });
+    const run = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
+    expect(run?.errorCode).toBe("capacity_exhausted");
+    expect(run?.exitCode).toBe(1);
+
+    const { agent, issue, comment } = await waitForCapacityRequeue(db, { agentId, issueId });
+    expect(agent?.status).toBe("at_capacity");
+    expect(issue?.status).toBe("todo");
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+    expect(comment?.body).toContain("Awaiting capacity");
+  });
+
+  it("keeps the agent running when a capacity failure has a healthy sibling run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const siblingRunId = randomUUID();
+    const siblingWakeupId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cwd = await fs.mkdtemp(path.join(tmpdir(), "paperclip-quota-sibling-"));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Implementer VPS",
+      role: "engineer",
+      status: "running",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", "process.stderr.write(\"You've hit your session limit - resets soon\\n\"); process.exit(1)"],
+        cwd,
+      },
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: siblingWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      status: "claimed",
+      runId: siblingRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: siblingRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: siblingWakeupId,
+      contextSnapshot: { issueId: randomUUID() },
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Run quota-limited work beside healthy sibling",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "capacity_exhausted",
+      errorMessage: "Temporary capacity unavailable",
+      resultJson: { stdout: "", stderr: "You've hit your session limit - resets soon\n" },
+    });
+    const heartbeat = heartbeatService(db);
+    const queuedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+    });
+    const run = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
+    expect(run?.errorCode).toBe("capacity_exhausted");
+
+    const { agent, issue, comment } = await waitForCapacityRequeue(db, { agentId, issueId, agentStatus: "running" });
+    expect(agent?.status).toBe("running");
+    expect(issue?.status).toBe("todo");
+    expect(comment?.body).toContain("Awaiting capacity");
+  });
+
+  it("keeps ordinary process crashes as agent errors", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cwd = await fs.mkdtemp(path.join(tmpdir(), "paperclip-crash-"));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Broken Process",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: process.execPath, args: ["-e", "process.stderr.write(\"boom\\n\"); process.exit(1)"], cwd },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Run broken process",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Process exited with code 1",
+      resultJson: { stdout: "", stderr: "boom\n" },
+    });
+    const heartbeat = heartbeatService(db);
+    const queuedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+    });
+    const run = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
+    expect(run?.errorCode).toBe("adapter_failed");
+
+    const agent = await waitForAgentStatus(db, agentId, "error");
+    expect(agent?.status).toBe("error");
   });
 
   it("interrupts running runs on graceful shutdown and queues restart recovery without recording a failure", async () => {
