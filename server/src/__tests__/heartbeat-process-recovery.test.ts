@@ -980,6 +980,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     kind?: string;
     previousOwnerAgentId?: string | null;
     returnOwnerAgentId?: string | null;
+    transitionReason?: "runtime_failure";
   }) {
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
@@ -1005,12 +1006,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       attemptCount: 1,
       maxAttempts: null,
     });
-    expect(action.evidence).toMatchObject({
+    const expectedEvidence: Record<string, unknown> = {
       sourceIssueId: input.issueId,
       previousStatus: input.previousStatus,
       latestRunId: input.runId,
       retryReason: input.retryReason ?? null,
-    });
+    };
+    if (input.transitionReason) {
+      expectedEvidence.transitionReason = input.transitionReason;
+    }
+    expect(action.evidence).toMatchObject(expectedEvidence);
     if (input.cause === "execution_review_participant_recovery") {
       expect(action.nextAction).toContain("failed review participant path");
     } else if (input.cause === "process_lost") {
@@ -5424,6 +5429,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("blocked");
+    expect(issue?.status).not.toBe("blocked_pending_human");
+    expect(issue?.assigneeAgentId).toBe(agentId);
 
     await expectSourceScopedStrandedRecoveryAction({
       companyId,
@@ -5432,6 +5439,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId,
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      transitionReason: "runtime_failure",
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -5439,6 +5447,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("retried continuation");
     expect(comments[0]?.body).toContain("3× attempts");
     expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
+    expect(comments[0]?.body).not.toContain("pending human");
   });
 
   it("does not count mixed-cause continuation failures toward the transient cap", async () => {
