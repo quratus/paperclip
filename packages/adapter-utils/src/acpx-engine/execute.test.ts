@@ -10,6 +10,7 @@ import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter
 import {
   createAcpxEngineExecutor,
   findAncestorBin,
+  findAncestorBinWithRetry,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
   rewriteGeminiAcpFlagForVersion,
@@ -1421,6 +1422,39 @@ describe("findAncestorBin", () => {
 
   it("terminates at the filesystem root instead of looping forever", async () => {
     const resolved = await findAncestorBin("/", "definitely-not-a-real-bin-name-xyz");
+    expect(resolved).toBeNull();
+  });
+});
+
+describe("findAncestorBinWithRetry", () => {
+  async function writeFakeBin(dir: string, name: string) {
+    const binDir = path.join(dir, "node_modules", ".bin");
+    await fs.mkdir(binDir, { recursive: true });
+    const binPath = path.join(binDir, name);
+    await fs.writeFile(binPath, "#!/usr/bin/env bash\necho ok\n", { mode: 0o755 });
+    return binPath;
+  }
+
+  it("recovers from a transient miss (e.g. a pnpm rebuild racing the lookup)", async () => {
+    const root = await makeTempRoot();
+    const packageDir = path.join(root, "node_modules", "@paperclipai", "adapter-utils");
+    await fs.mkdir(packageDir, { recursive: true });
+
+    // Simulate the bin symlink not existing yet on the first lookup, then
+    // landing before the retry window elapses (ETR-54).
+    const resolvePromise = findAncestorBinWithRetry(packageDir, "claude-agent-acp");
+    const expectedBin = await writeFakeBin(root, "claude-agent-acp");
+
+    expect(await resolvePromise).toBe(expectedBin);
+  });
+
+  it("returns null when the binary never appears within the retry window", async () => {
+    const root = await makeTempRoot();
+    const packageDir = path.join(root, "node_modules", "@paperclipai", "adapter-utils");
+    await fs.mkdir(packageDir, { recursive: true });
+
+    const resolved = await findAncestorBinWithRetry(packageDir, "claude-agent-acp");
+
     expect(resolved).toBeNull();
   });
 });
