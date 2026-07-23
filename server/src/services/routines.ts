@@ -21,6 +21,7 @@ import {
   pluginManagedResources,
   plugins,
   projects,
+  routineEvolutionProposals,
   routineRevisions,
   routineRuns,
   routineDocuments,
@@ -30,9 +31,13 @@ import {
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
+  DecideRoutineEvolutionProposal,
+  EvolveRoutine,
   Routine,
   RoutineDetail,
   RoutineDescriptionDocument,
+  RoutineEvolutionProposal,
+  RoutineEvolveResult,
   RoutineListItem,
   RoutineManagedByPlugin,
   RoutineRevision,
@@ -522,6 +527,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     status: routine.status as RoutineRevisionSnapshotV1["routine"]["status"],
     concurrencyPolicy: routine.concurrencyPolicy as RoutineRevisionSnapshotV1["routine"]["concurrencyPolicy"],
     catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
+    evolutionMode: routine.evolutionMode as RoutineRevisionSnapshotV1["routine"]["evolutionMode"],
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
@@ -578,6 +584,15 @@ function mapRoutineRevision(row: typeof routineRevisions.$inferSelect): RoutineR
   return {
     ...row,
     snapshot: row.snapshot as RoutineRevisionSnapshotV1,
+  };
+}
+
+function mapRoutineEvolutionProposal(
+  row: typeof routineEvolutionProposals.$inferSelect,
+): RoutineEvolutionProposal {
+  return {
+    ...row,
+    status: row.status as RoutineEvolutionProposal["status"],
   };
 }
 
@@ -1608,6 +1623,58 @@ export function routineService(
       );
   }
 
+  /**
+   * The self-rewrite step injected into a run's issue description when the routine's
+   * evolutionMode is not "off". This is orchestration on top of the existing revision
+   * spine: it never edits routine.description directly — it only tells the run's agent
+   * how to call POST /routines/:id/evolve, which reuses appendRoutineRevision (auto) or
+   * creates a gated proposal (gated).
+   *
+   * The framing is TRIAGE, not "await approval by default": in auto mode the agent
+   * proceeds autonomously on reversible improvements (every evolution is a reversible
+   * revision — a two-way door) and only escalates a change for human decision when it is
+   * genuinely critical or irreversible. Routines whose changes are inherently critical
+   * can be set to gated mode so EVERY change routes to a human first.
+   */
+  function buildRoutineEvolutionStepSection(routine: RoutineRow): string {
+    const modeNote = routine.evolutionMode === "gated"
+      ? "This routine runs in GATED evolution mode: it is opted in to human review, so your proposed "
+        + "change is recorded and held for human approval. It will NOT change this routine's live behavior "
+        + "until a board member approves it (or is discarded if rejected)."
+      : "This routine runs in AUTO evolution mode: apply reversible improvements yourself without waiting "
+        + "for anyone. Your change takes effect on the NEXT run and is fully reversible — any prior revision "
+        + "can be restored at any time (a two-way door), so there is no cap on how often this routine may "
+        + "self-improve. Escalate to a human (see below) ONLY for a genuinely critical or irreversible "
+        + "change.";
+    return [
+      "---",
+      "",
+      "## Routine self-evolution step (required final step of this run)",
+      "",
+      "This is a real, required part of completing this run — not optional busywork. Now that you have "
+        + "finished the work above, reflect on what THIS run's result taught you about how this routine's "
+        + "instructions should read.",
+      "",
+      "TRIAGE the change: if the routine's instructions should change to make the next run more effective "
+        + "AND the change is reversible and non-critical (a wording tweak, an added or clarified task step, "
+        + "a refined check), just make it — proceed autonomously, do not wait for a human. Flag for human "
+        + "decision ONLY when the change is genuinely critical or irreversible: anything that weakens, "
+        + "removes, or softens an escalation path, a budget limit, or a safety guardrail, or that would "
+        + "trigger an irreversible action. When in doubt about criticality, escalate rather than apply.",
+      "",
+      `Then call \`POST /routines/${routine.id}/evolve\` with a JSON body of EITHER:`,
+      "- `{ \"description\": \"<the full, complete replacement routine instructions>\", \"changeSummary\": \"<why "
+        + "you changed it>\" }` to record new instructions, or",
+      "- `{ \"noChange\": true, \"changeSummary\": \"<why nothing needed to change>\" }` if the current "
+        + "instructions are already right.",
+      "",
+      "If a change is critical/irreversible and this routine is NOT in gated mode, do NOT apply it — instead "
+        + "escalate it to a human through your normal escalation path and leave the routine unchanged.",
+      "",
+      modeNote,
+    ].join("\n");
+  }
+
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -1659,7 +1726,10 @@ export function routineService(
     const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
     const title = interpolateRoutineTemplate(input.routine.title, allVariables) ?? input.routine.title;
     const baseDescription = interpolateRoutineTemplate(input.routine.description, allVariables);
-    const description = [baseDescription, input.descriptionAppendix]
+    const evolutionStep = input.routine.evolutionMode !== "off"
+      ? buildRoutineEvolutionStepSection(input.routine)
+      : null;
+    const description = [baseDescription, input.descriptionAppendix, evolutionStep]
       .filter((part): part is string => Boolean(part && part.trim()))
       .join("\n\n");
     const triggerPayload = mergeRoutineRunPayload(input.payload, { ...automaticVariables, ...resolvedVariables });
@@ -2115,6 +2185,7 @@ export function routineService(
             status,
             concurrencyPolicy: input.concurrencyPolicy,
             catchUpPolicy: input.catchUpPolicy,
+            evolutionMode: input.evolutionMode,
             variables,
             env,
             responsibleUserId,
@@ -2228,6 +2299,7 @@ export function routineService(
           status: nextStatus,
           concurrencyPolicy: patch.concurrencyPolicy ?? locked.concurrencyPolicy,
           catchUpPolicy: patch.catchUpPolicy ?? locked.catchUpPolicy,
+          evolutionMode: patch.evolutionMode ?? locked.evolutionMode,
           variables: nextVariables,
           env: nextEnv,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
@@ -2291,6 +2363,7 @@ export function routineService(
             status: candidate.status,
             concurrencyPolicy: candidate.concurrencyPolicy,
             catchUpPolicy: candidate.catchUpPolicy,
+            evolutionMode: candidate.evolutionMode,
             variables: candidate.variables,
             env: candidate.env,
             responsibleUserId: candidate.responsibleUserId,
@@ -2627,6 +2700,8 @@ export function routineService(
             status: routineSnapshot.status,
             concurrencyPolicy: routineSnapshot.concurrencyPolicy,
             catchUpPolicy: routineSnapshot.catchUpPolicy,
+            // Pre-evolution-feature revisions have no evolutionMode in their snapshot; default to "off".
+            evolutionMode: routineSnapshot.evolutionMode ?? "off",
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
             updatedByAgentId: actor.agentId ?? null,
@@ -2712,6 +2787,215 @@ export function routineService(
           secretMaterials: [...recreatedWebhookSecrets.values()].map((entry) => entry.secretMaterial),
         };
       });
+      return result;
+    },
+
+    // POST /routines/:id/evolve — the landing endpoint for the self-rewrite step injected
+    // by dispatchRoutineRun. Reuses appendRoutineRevision (auto) so this stays on the same
+    // audited/revisioned/reversible path as every other routine edit; never rebuilds it.
+    evolveRoutine: async (
+      routineId: string,
+      input: EvolveRoutine,
+      actor: Actor,
+    ): Promise<RoutineEvolveResult> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      if (routine.evolutionMode === "off") {
+        throw conflict("Routine evolution is not enabled for this routine (evolutionMode is \"off\")");
+      }
+
+      if (input.noChange) {
+        return { status: "noop", routine };
+      }
+
+      const description = input.description?.trim();
+      if (!description) {
+        throw unprocessable("description is required unless noChange is true");
+      }
+
+      if (routine.evolutionMode === "gated") {
+        const [proposal] = await db
+          .insert(routineEvolutionProposals)
+          .values({
+            companyId: routine.companyId,
+            routineId: routine.id,
+            baseRevisionNumber: routine.latestRevisionNumber,
+            proposedTitle: null,
+            proposedDescription: description,
+            changeSummary: input.changeSummary,
+            rationale: input.rationale ?? null,
+            status: "pending",
+            createdByAgentId: actor.agentId ?? null,
+            createdByRunId: actor.runId ?? null,
+          })
+          .returning();
+        return { status: "proposed", routine, proposal: mapRoutineEvolutionProposal(proposal) };
+      }
+
+      // mode === "auto": apply immediately via the audited revision path.
+      const result = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routine.id} for update`);
+        const locked = await txDb
+          .select()
+          .from(routines)
+          .where(eq(routines.id, routine.id))
+          .then((rows) => rows[0] ?? null);
+        if (!locked) throw notFound("Routine not found");
+
+        const [updated] = await txDb
+          .update(routines)
+          .set({
+            description,
+            updatedByAgentId: actor.agentId ?? null,
+            updatedByUserId: actor.userId ?? null,
+            updatedAt: new Date(),
+          })
+          .where(eq(routines.id, locked.id))
+          .returning();
+        if (!updated) throw notFound("Routine not found");
+
+        // auto mode self-evolves freely with NO cap: every evolution is a reversible
+        // revision (a two-way door via restoreRevision), so unattended self-improvement is
+        // safe. Human involvement is reserved for genuinely critical/irreversible changes,
+        // which the agent is instructed to escalate (or which a gated routine routes to a
+        // human). The evolution is still fully audited via the activity log at the route layer.
+        const appended = await appendRoutineRevision(txDb, updated, actor, {
+          changeSummary: input.changeSummary,
+        });
+
+        return { revision: appended.revision, routine: appended.routine };
+      });
+
+      return { status: "applied", routine: result.routine, revision: result.revision };
+    },
+
+    listEvolutionProposals: async (routineId: string): Promise<RoutineEvolutionProposal[]> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      const rows = await db
+        .select()
+        .from(routineEvolutionProposals)
+        .where(and(
+          eq(routineEvolutionProposals.companyId, routine.companyId),
+          eq(routineEvolutionProposals.routineId, routine.id),
+        ))
+        .orderBy(desc(routineEvolutionProposals.createdAt));
+      return rows.map(mapRoutineEvolutionProposal);
+    },
+
+    // Shared approve/reject path for gated evolution proposals. Approve reuses
+    // appendRoutineRevision (the same audited path as restoreRevision/update). The route
+    // layer enforces that only a human/board actor can reach this for a decision.
+    decideEvolutionProposal: async (
+      routineId: string,
+      proposalId: string,
+      decision: "approved" | "rejected",
+      actor: Actor,
+    ): Promise<{ proposal: RoutineEvolutionProposal; routine: Routine; revision: RoutineRevision | null }> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+
+      if (decision === "rejected") {
+        const now = new Date();
+        const [updated] = await db
+          .update(routineEvolutionProposals)
+          .set({
+            status: "rejected",
+            decidedByUserId: actor.userId ?? null,
+            decidedAt: now,
+          })
+          .where(and(
+            eq(routineEvolutionProposals.id, proposalId),
+            eq(routineEvolutionProposals.companyId, routine.companyId),
+            eq(routineEvolutionProposals.routineId, routine.id),
+            eq(routineEvolutionProposals.status, "pending"),
+          ))
+          .returning();
+        if (!updated) {
+          const existing = await db
+            .select()
+            .from(routineEvolutionProposals)
+            .where(and(
+              eq(routineEvolutionProposals.id, proposalId),
+              eq(routineEvolutionProposals.routineId, routine.id),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (!existing) throw notFound("Routine evolution proposal not found");
+          throw conflict("Routine evolution proposal is no longer pending");
+        }
+        return { proposal: mapRoutineEvolutionProposal(updated), routine, revision: null };
+      }
+
+      const result = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await tx.execute(
+          sql`select id from ${routineEvolutionProposals} where ${routineEvolutionProposals.id} = ${proposalId} for update`,
+        );
+        const proposal = await txDb
+          .select()
+          .from(routineEvolutionProposals)
+          .where(and(
+            eq(routineEvolutionProposals.id, proposalId),
+            eq(routineEvolutionProposals.companyId, routine.companyId),
+            eq(routineEvolutionProposals.routineId, routine.id),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!proposal) throw notFound("Routine evolution proposal not found");
+        if (proposal.status !== "pending") throw conflict("Routine evolution proposal is no longer pending");
+
+        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routine.id} for update`);
+        const locked = await txDb
+          .select()
+          .from(routines)
+          .where(eq(routines.id, routine.id))
+          .then((rows) => rows[0] ?? null);
+        if (!locked) throw notFound("Routine not found");
+        if (locked.latestRevisionNumber !== proposal.baseRevisionNumber) {
+          throw conflict("Routine evolution proposal is stale; review the latest routine revision before approving", {
+            code: "stale_routine_evolution_proposal",
+            proposalBaseRevisionNumber: proposal.baseRevisionNumber,
+            latestRevisionNumber: locked.latestRevisionNumber,
+          });
+        }
+
+        const now = new Date();
+        const [updatedRoutine] = await txDb
+          .update(routines)
+          .set({
+            title: proposal.proposedTitle ?? locked.title,
+            description: proposal.proposedDescription,
+            updatedByUserId: actor.userId ?? null,
+            updatedByAgentId: actor.agentId ?? null,
+            updatedAt: now,
+          })
+          .where(eq(routines.id, locked.id))
+          .returning();
+        if (!updatedRoutine) throw notFound("Routine not found");
+
+        const appended = await appendRoutineRevision(txDb, updatedRoutine, actor, {
+          changeSummary: proposal.changeSummary,
+        });
+
+        const [decidedProposal] = await txDb
+          .update(routineEvolutionProposals)
+          .set({
+            status: "approved",
+            decidedByUserId: actor.userId ?? null,
+            decidedAt: now,
+            appliedRevisionId: appended.revision.id,
+          })
+          .where(eq(routineEvolutionProposals.id, proposal.id))
+          .returning();
+        if (!decidedProposal) throw notFound("Routine evolution proposal not found");
+
+        return {
+          proposal: mapRoutineEvolutionProposal(decidedProposal),
+          routine: appended.routine,
+          revision: appended.revision,
+        };
+      });
+
       return result;
     },
 
