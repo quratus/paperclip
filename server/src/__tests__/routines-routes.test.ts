@@ -690,7 +690,7 @@ describe("routine routes", () => {
         costCents: null,
       },
     ]);
-    const app = createApp({
+    const app = await createApp({
       type: "board",
       userId: "board-user",
       source: "session",
