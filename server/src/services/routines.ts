@@ -66,7 +66,7 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { parseCron, validateCron } from "./cron.js";
-import { heartbeatService } from "./heartbeat.js";
+import { heartbeatService, projectUsage } from "./heartbeat.js";
 import {
   instanceSettingsService,
   isTruthyRuntimeEnvValue,
@@ -2904,42 +2904,95 @@ export function routineService(
         .orderBy(desc(routineRuns.createdAt))
         .limit(cappedLimit);
 
-      return rows.map((row) => ({
-        id: row.id,
-        companyId: row.companyId,
-        routineId: row.routineId,
-        triggerId: row.triggerId,
-        source: row.source as RoutineRunSummary["source"],
-        status: row.status as RoutineRunSummary["status"],
-        triggeredAt: row.triggeredAt,
-        idempotencyKey: row.idempotencyKey,
-        triggerPayload: row.triggerPayload as Record<string, unknown> | null,
-        dispatchFingerprint: row.dispatchFingerprint,
-        routineRevisionId: row.routineRevisionId,
-        linkedIssueId: row.linkedIssueId,
-        coalescedIntoRunId: row.coalescedIntoRunId,
-        failureReason: row.failureReason,
-        completedAt: row.completedAt,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
-        linkedIssue: row.linkedIssueId
-          ? {
-            id: row.linkedIssueId,
-            identifier: row.issueIdentifier,
-            title: row.issueTitle ?? "Routine execution",
-            status: row.issueStatus ?? "todo",
-            priority: row.issuePriority ?? "medium",
-            updatedAt: row.issueUpdatedAt ?? row.updatedAt,
+      // routine_runs has no FK to heartbeat_runs. Attribute usage by linked issue +
+      // time window (heartbeats whose contextSnapshot.issueId matches and started during
+      // the routine_run's lifespan). Window-overlap means one heartbeat can be counted by
+      // overlapping routine_runs against the same issue — accepted because routine_execution
+      // issues are created fresh per fire and rarely overlap in practice.
+      const issueIds = Array.from(new Set(rows.map((r) => r.linkedIssueId).filter((id): id is string => !!id)));
+      const hbRows = issueIds.length
+        ? await db
+            .select({
+              issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
+              startedAt: heartbeatRuns.startedAt,
+              usageJson: heartbeatRuns.usageJson,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`, issueIds),
+                isNotNull(heartbeatRuns.startedAt),
+                isNotNull(heartbeatRuns.usageJson),
+              ),
+            )
+        : [];
+
+      const hbByIssue = new Map<string, Array<{ startedAt: Date; usage: Record<string, unknown> }>>();
+      for (const r of hbRows) {
+        if (!r.issueId || !r.startedAt || !r.usageJson) continue;
+        if (!hbByIssue.has(r.issueId)) hbByIssue.set(r.issueId, []);
+        hbByIssue.get(r.issueId)!.push({ startedAt: r.startedAt, usage: r.usageJson });
+      }
+
+      return rows.map((row) => {
+        let usage: { tokensIn: number | null; tokensOut: number | null; cachedInputTokens: number | null; costCents: number | null } =
+          { tokensIn: null, tokensOut: null, cachedInputTokens: null, costCents: null };
+        if (row.linkedIssueId) {
+          const windowEnd = row.completedAt ?? new Date();
+          const hits = (hbByIssue.get(row.linkedIssueId) ?? []).filter(
+            (h) => h.startedAt >= row.triggeredAt && h.startedAt <= windowEnd,
+          );
+          if (hits.length) {
+            const sum = { tokensIn: 0, tokensOut: 0, cachedInputTokens: 0, costCents: 0 };
+            let any = false;
+            for (const h of hits) {
+              const p = projectUsage(h.usage);
+              if (p.tokensIn != null) { sum.tokensIn += p.tokensIn; any = true; }
+              if (p.tokensOut != null) { sum.tokensOut += p.tokensOut; any = true; }
+              if (p.cachedInputTokens != null) { sum.cachedInputTokens += p.cachedInputTokens; any = true; }
+              if (p.costCents != null) { sum.costCents += p.costCents; any = true; }
+            }
+            if (any) usage = sum;
           }
-          : null,
-        trigger: row.triggerId
-          ? {
-            id: row.triggerId,
-            kind: row.triggerKind as NonNullable<RoutineRunSummary["trigger"]>["kind"],
-            label: row.triggerLabel,
-          }
-          : null,
-      }));
+        }
+        return {
+          id: row.id,
+          companyId: row.companyId,
+          routineId: row.routineId,
+          triggerId: row.triggerId,
+          source: row.source as RoutineRunSummary["source"],
+          status: row.status as RoutineRunSummary["status"],
+          triggeredAt: row.triggeredAt,
+          idempotencyKey: row.idempotencyKey,
+          triggerPayload: row.triggerPayload as Record<string, unknown> | null,
+          dispatchFingerprint: row.dispatchFingerprint,
+          routineRevisionId: row.routineRevisionId,
+          linkedIssueId: row.linkedIssueId,
+          coalescedIntoRunId: row.coalescedIntoRunId,
+          failureReason: row.failureReason,
+          completedAt: row.completedAt,
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+          ...usage,
+          linkedIssue: row.linkedIssueId
+            ? {
+              id: row.linkedIssueId,
+              identifier: row.issueIdentifier,
+              title: row.issueTitle ?? "Routine execution",
+              status: row.issueStatus ?? "todo",
+              priority: row.issuePriority ?? "medium",
+              updatedAt: row.issueUpdatedAt ?? row.updatedAt,
+            }
+            : null,
+          trigger: row.triggerId
+            ? {
+              id: row.triggerId,
+              kind: row.triggerKind as NonNullable<RoutineRunSummary["trigger"]>["kind"],
+              label: row.triggerLabel,
+            }
+            : null,
+        };
+      });
     },
 
     tickScheduledTriggers: async (now: Date = new Date()) => {
