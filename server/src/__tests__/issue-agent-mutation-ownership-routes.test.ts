@@ -919,8 +919,12 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("allows manager-chain agents to repair product admission metadata for another agent's blocked issue", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+  it("allows manager-chain agents to repair a delegated blocked issue's missing admission contract", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "blocked",
+      assigneeAgentId: ownerAgentId,
+      description: "## Delegation Brief For Child Issue\n\nImplement the requested slice.",
+    }));
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "tasks:manage_active_checkouts",
       action: input.action,
@@ -934,17 +938,26 @@ describe("agent issue mutation checkout ownership", () => {
     const res = await request(await createApp(peerActor()))
       .patch(`/api/issues/${issueId}`)
       .send({
-        status: "in_review",
+        status: "todo",
         blockedByIssueIds: [],
         blockedByApprovalId: null,
         blockedByExternal: null,
+        description: [
+          "## Delegation Brief For Child Issue",
+          "",
+          "Implement the requested slice.",
+          "",
+          "## Product Truth Contract",
+          "",
+          "- User: founder",
+          "- Truth: the delegated slice preserves the parent contract.",
+        ].join("\n"),
         executionPolicy: {
           workClass: "product_ui",
           stages: [
             { type: "review", participants: [{ type: "agent", agentId: peerAgentId }] },
           ],
         },
-        reviewRequest: { instructions: "Review the existing PR; do not run implementation again." },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -955,7 +968,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       issueId,
       expect.objectContaining({
-        status: "in_review",
+        status: "todo",
         blockedByExternal: null,
         assigneeAgentId: peerAgentId,
         executionPolicy: expect.objectContaining({ workClass: "product_ui" }),

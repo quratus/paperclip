@@ -3315,6 +3315,45 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("inherits a parent Product Truth Contract when creating a delegated child", async () => {
+    const companyId = randomUUID();
+    const parentIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      title: "Routines redesign",
+      description: [
+        "## Product Truth Contract",
+        "",
+        "- User: a founder who needs to trust recurring work.",
+        "",
+        "## Definition of Done",
+        "",
+        "- The routine list is truthful.",
+      ].join("\n"),
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const { issue: child } = await svc.createChild(parentIssueId, {
+      title: "Implement routine list",
+      status: "todo",
+      description: "## Delegation Brief For Child Issue\n\nImplement the list.",
+    });
+
+    expect(child.description).toContain("## Delegation Brief For Child Issue");
+    expect(child.description).toContain("## Product Truth Contract");
+    expect(child.description).toContain("User: a founder who needs to trust recurring work.");
+    expect(child.description).not.toContain("## Definition of Done");
+  });
+
   it("clamps helper-created child requestDepth to the safe maximum", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
