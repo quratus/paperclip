@@ -1716,7 +1716,13 @@ describe.sequential("issue comment reopen routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("run-1");
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-1",
+      "Cancelled because its issue was cancelled",
+    );
+    expect(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]).toBeLessThan(
+      mockIssueService.update.mock.invocationCallOrder[0],
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({

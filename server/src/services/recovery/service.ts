@@ -3188,9 +3188,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // Recovery escalation is a real, machine-owned wait even when the source
+    // issue has no graph dependency. Persist it as a typed external blocker so
+    // the blocked-state contract does not turn recovery failures into another
+    // untyped, unwakeable blocked row.
+    const blockedByExternal = blockerIds.length === 0
+      ? {
+          type: "automatic_recovery",
+          owner: recoveryAction.ownerAgentId ? "assigned recovery owner" : "Paperclip recovery service",
+          recheckDate: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          note: `Recovery action ${recoveryAction.id} is responsible for restoring a runnable path.`,
+        }
+      : undefined;
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      ...(blockedByExternal ? { blockedByExternal } : {}),
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
     });
     if (!updated) return null;

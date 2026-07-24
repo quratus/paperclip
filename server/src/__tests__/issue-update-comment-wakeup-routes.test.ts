@@ -373,6 +373,61 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it("cancels the active run before persisting cancelled issue status", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+      checkoutRunId: "run-cancel-status",
+      executionRunId: "run-cancel-status",
+      status: "in_progress",
+    });
+    const updated = makeIssue({
+      ...existing,
+      checkoutRunId: null,
+      executionRunId: null,
+      status: "cancelled",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-cancel-status",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "running",
+      contextSnapshot: { issueId: existing.id },
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-cancel-status",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "cancelled",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "cancelled" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-cancel-status",
+      "Cancelled because its issue was cancelled",
+      { suppressImmediateRecovery: true },
+    );
+    const cancelCallIndex = mockHeartbeatService.cancelRun.mock.calls.findIndex(
+      ([runId, reason]) =>
+        runId === "run-cancel-status" &&
+        reason === "Cancelled because its issue was cancelled",
+    );
+    expect(cancelCallIndex).toBeGreaterThanOrEqual(0);
+    expect(mockHeartbeatService.cancelRun.mock.invocationCallOrder[cancelCallIndex]).toBeLessThan(
+      mockIssueService.update.mock.invocationCallOrder[0]!,
+    );
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      existing.id,
+      expect.objectContaining({ status: "cancelled" }),
+    );
+  }, 15_000);
+
   it("interrupts the active run without waking an agent when the handoff assigns a user", async () => {
     const existing = makeIssue({
       assigneeAgentId: PREVIOUS_AGENT_ID,

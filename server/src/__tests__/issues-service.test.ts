@@ -5,6 +5,7 @@ import { sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   createDb,
   documentRevisions,
@@ -16,6 +17,7 @@ import {
   instanceSettings,
   issueComments,
   issueInboxArchives,
+  issueApprovals,
   issueDocuments,
   issuePlanDecompositions,
   issueRelations,
@@ -300,7 +302,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -355,6 +357,49 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       permissions: {},
     };
   }
+
+  it("rejects normal comments from a cancelled run after its issue is cancelled", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "Cancelled Agent",
+    }));
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      contextSnapshot: { issueId, taskId: issueId },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cancelled output guard",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      cancelledAt: new Date(),
+    });
+
+    await expect(
+      svc.addComment(issueId, "late normal output", { agentId, runId }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: expect.objectContaining({
+        issueId,
+        issueStatus: "cancelled",
+        runId,
+        runStatus: "cancelled",
+      }),
+    });
+
+    const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(rows).toHaveLength(0);
+  });
 
   it("rejects checkout for pilot agents outside the company allowlist before mutating issue state", async () => {
     const allowedAgentId = randomUUID();
@@ -2399,9 +2444,11 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
   afterEach(async () => {
     await db.delete(issueComments);
     await db.delete(issueRelations);
+    await db.delete(issueApprovals);
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(approvals);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -3334,9 +3381,11 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
   afterEach(async () => {
     await db.delete(issueComments);
     await db.delete(issueRelations);
+    await db.delete(issueApprovals);
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(approvals);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -3348,6 +3397,115 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  async function seedCompany(prefixSeed = randomUUID()) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `B${prefixSeed.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  it("rejects service updates that leave an issue blocked without a typed blocker", async () => {
+    const companyId = await seedCompany();
+    const issue = await svc.create(companyId, {
+      title: "Needs a blocker",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await expect(svc.update(issue.id, { status: "blocked" }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: { code: "blocked_state_requires_typed_blocker" },
+      });
+  });
+
+  it("allows blocked service updates with typed external blocker metadata", async () => {
+    const companyId = await seedCompany();
+    const issue = await svc.create(companyId, {
+      title: "External wait",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const updated = await svc.update(issue.id, {
+      status: "blocked",
+      blockedByExternal: {
+        type: "vendor_response",
+        owner: "Vendor support",
+        recheckDate: "2026-07-24T00:00:00.000Z",
+      },
+    });
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.blockedByExternal).toMatchObject({
+      type: "vendor_response",
+      owner: "Vendor support",
+    });
+  });
+
+  it("links pending approval blockers and consumes decided approval blockers", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Wait for approval",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const blocked = await svc.update(issue.id, { status: "blocked", blockedByApprovalId: approvalId });
+    expect(blocked?.status).toBe("blocked");
+    await db.update(approvals).set({ status: "approved", decidedAt: new Date() }).where(eq(approvals.id, approvalId));
+
+    const consumed = await svc.consumeApprovalBlocker(approvalId, "approved");
+    const released = await svc.getById(issue.id);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+
+    expect(consumed).toEqual([expect.objectContaining({ id: issue.id, identifier: issue.identifier, status: "todo" })]);
+    expect(released?.status).toBe("todo");
+    expect(comments.some((comment) => comment.body.includes("Approval blocker consumed"))).toBe(true);
+  });
+
+  it("consumes rejected approval blockers with the decision note", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Wait for rejection",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await svc.update(issue.id, { status: "blocked", blockedByApprovalId: approvalId });
+    await db.update(approvals).set({ status: "rejected", decidedAt: new Date() }).where(eq(approvals.id, approvalId));
+
+    const consumed = await svc.consumeApprovalBlocker(approvalId, "rejected", "Not approved yet.");
+    const released = await svc.getById(issue.id);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+
+    expect(consumed).toEqual([expect.objectContaining({ id: issue.id, identifier: issue.identifier, status: "todo" })]);
+    expect(released?.status).toBe("todo");
+    expect(comments.some((comment) =>
+      comment.body.includes("Approval blocker consumed") && comment.body.includes("Decision note: Not approved yet."),
+    )).toBe(true);
   });
 
   async function seedSharedWorkspaceDependency() {

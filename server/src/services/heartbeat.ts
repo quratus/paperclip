@@ -16621,6 +16621,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resultJson?: Record<string, unknown>;
     eventMessage?: string;
     eventPayload?: Record<string, unknown>;
+    suppressImmediateRecovery?: boolean;
   };
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
@@ -16679,7 +16680,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: options.eventMessage ?? "run cancelled",
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
-      await releaseIssueExecutionAndPromote(cancelled);
+      await releaseIssueExecutionAndPromote(cancelled, {
+        suppressImmediateRecovery: options.suppressImmediateRecovery,
+      });
     }
 
     await finalizeAgentStatus(run.agentId, "cancelled");

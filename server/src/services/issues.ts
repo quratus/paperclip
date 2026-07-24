@@ -613,6 +613,7 @@ type DbReader = Pick<Db, "select">;
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
+  blockedByApprovalId?: string | null;
   inheritExecutionWorkspaceFromIssueId?: string | null;
   skipExecutionWorkspaceInheritance?: boolean;
   watchdog?: { agentId: string; instructions?: string | null } | null;
@@ -734,6 +735,12 @@ export type ChildIssueCompletionSummary = {
 function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   if (actorRunId) return checkoutRunId === actorRunId;
   return checkoutRunId == null;
+}
+
+function runContextTargetsIssue(contextSnapshot: unknown, issueId: string) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  return context.issueId === issueId || context.taskId === issueId;
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
@@ -2307,14 +2314,14 @@ async function listIssueBlockerAttentionMap(
       for (const row of interactionRows) explicitWaitingIssueIds.add(row.issueId);
 
       const approvalRows: Array<{ issueId: string }> = await dbOrTx
-        .select({ issueId: issueApprovals.issueId })
-        .from(issueApprovals)
-        .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+        .select({ issueId: issues.id })
+        .from(issues)
+        .innerJoin(approvals, eq(issues.blockedByApprovalId, approvals.id))
         .where(
           and(
-            eq(issueApprovals.companyId, companyId),
+            eq(issues.companyId, companyId),
             inArray(approvals.status, BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES),
-            inArray(issueApprovals.issueId, chunk),
+            inArray(issues.id, chunk),
           ),
         );
       for (const row of approvalRows) explicitWaitingIssueIds.add(row.issueId);
@@ -2565,6 +2572,7 @@ const issueListSelect = {
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
+  blockedByExternal: issues.blockedByExternal,
   sourceTrust: issues.sourceTrust,
   startedAt: issues.startedAt,
   completedAt: issues.completedAt,
@@ -3215,16 +3223,16 @@ async function listIssueBlockedInboxAttentionMap(
       : dbOrTx
           .select({
             approvalId: approvals.id,
-            issueId: issueApprovals.issueId,
+            issueId: issues.id,
             createdAt: approvals.createdAt,
           })
-          .from(issueApprovals)
-          .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+          .from(issues)
+          .innerJoin(approvals, eq(issues.blockedByApprovalId, approvals.id))
           .where(and(
-            eq(issueApprovals.companyId, companyId),
+            eq(issues.companyId, companyId),
             eq(approvals.companyId, companyId),
             inArray(approvals.status, [...BLOCKED_INBOX_PENDING_APPROVAL_STATUSES]),
-            inArray(issueApprovals.issueId, graphIssueIds),
+            inArray(issues.id, graphIssueIds),
           )),
     listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
   ]);
@@ -4490,6 +4498,92 @@ export function issueService(db: Db) {
         createdByUserId: actor.userId ?? null,
       })),
     );
+  }
+
+  function isTypedExternalBlocker(value: unknown) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const blocker = value as Record<string, unknown>;
+    return typeof blocker.type === "string" && blocker.type.trim().length > 0 &&
+      typeof blocker.owner === "string" && blocker.owner.trim().length > 0 &&
+      typeof blocker.recheckDate === "string" && !Number.isNaN(Date.parse(blocker.recheckDate));
+  }
+
+  async function assertApprovalCanBlock(companyId: string, approvalId: string, dbOrTx: DbReader = db) {
+    const approval = await dbOrTx
+      .select({ id: approvals.id, companyId: approvals.companyId, status: approvals.status })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId))
+      .then((rows) => rows[0] ?? null);
+    if (!approval || approval.companyId !== companyId) {
+      throw unprocessable("Blocked-by approval must belong to the same company");
+    }
+    if (approval.status !== "pending" && approval.status !== "revision_requested") {
+      throw unprocessable("Blocked-by approval must be pending or revision_requested");
+    }
+  }
+
+  async function issueHasExistingIssueBlockers(companyId: string, issueId: string, dbOrTx: DbReader = db) {
+    const row = await dbOrTx
+      .select({ id: issueRelations.id })
+      .from(issueRelations)
+      .where(and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.relatedIssueId, issueId),
+        eq(issueRelations.type, "blocks"),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
+  }
+
+  async function issueHasActiveApprovalBlocker(companyId: string, issueId: string, dbOrTx: DbReader = db, excludeApprovalId?: string | null) {
+    const conditions = [
+      eq(issues.companyId, companyId),
+      eq(issues.id, issueId),
+      inArray(approvals.status, ["pending", "revision_requested"]),
+    ];
+    if (excludeApprovalId) conditions.push(ne(issues.blockedByApprovalId, excludeApprovalId));
+    const row = await dbOrTx
+      .select({ id: issues.blockedByApprovalId })
+      .from(issues)
+      .innerJoin(approvals, eq(issues.blockedByApprovalId, approvals.id))
+      .where(and(...conditions))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
+  }
+
+  async function assertBlockedStateHasTypedBlocker(input: {
+    companyId: string;
+    issueId?: string | null;
+    nextStatus: string | null | undefined;
+    blockedByIssueIds?: string[];
+    blockedByApprovalId?: string | null;
+    blockedByExternal?: unknown;
+    existingBlockedByExternal?: unknown;
+    dbOrTx?: DbReader;
+  }) {
+    if (input.nextStatus !== "blocked") return;
+    const dbOrTx = input.dbOrTx ?? db;
+    const hasIssueBlocker = input.blockedByIssueIds !== undefined
+      ? input.blockedByIssueIds.length > 0
+      : input.issueId
+        ? await issueHasExistingIssueBlockers(input.companyId, input.issueId, dbOrTx)
+        : false;
+    const hasApprovalBlocker = input.blockedByApprovalId
+      ? (await assertApprovalCanBlock(input.companyId, input.blockedByApprovalId, dbOrTx), true)
+      : input.issueId
+        ? await issueHasActiveApprovalBlocker(input.companyId, input.issueId, dbOrTx)
+        : false;
+    const hasExternalBlocker = input.blockedByExternal !== undefined
+      ? isTypedExternalBlocker(input.blockedByExternal)
+      : isTypedExternalBlocker(input.existingBlockedByExternal);
+    if (!hasIssueBlocker && !hasApprovalBlocker && !hasExternalBlocker) {
+      throw unprocessable(
+        "blocked issues require blockedByIssueIds, blockedByApprovalId, or typed blockedByExternal {type, owner, recheckDate}",
+        { code: "blocked_state_requires_typed_blocker" },
+      );
+    }
   }
 
   async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
@@ -6182,6 +6276,7 @@ export function issueService(db: Db) {
       const {
         labelIds: inputLabelIds,
         blockedByIssueIds,
+        blockedByApprovalId,
         inheritExecutionWorkspaceFromIssueId,
         skipExecutionWorkspaceInheritance,
         watchdog,
@@ -6213,6 +6308,15 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      await assertBlockedStateHasTypedBlocker({
+        companyId,
+        nextStatus: data.status,
+        blockedByIssueIds,
+        blockedByApprovalId,
+        blockedByExternal: issueData.blockedByExternal,
+      });
+      if (blockedByApprovalId) await assertApprovalCanBlock(companyId, blockedByApprovalId);
+      issueData.blockedByApprovalId = blockedByApprovalId ?? null;
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -6600,6 +6704,7 @@ export function issueService(db: Db) {
       data: Partial<typeof issues.$inferInsert> & {
         labelIds?: string[];
         blockedByIssueIds?: string[];
+        blockedByApprovalId?: string | null;
         actorAgentId?: string | null;
         actorUserId?: string | null;
         expectedUpdatedAt?: Date;
@@ -6616,6 +6721,7 @@ export function issueService(db: Db) {
       const {
         labelIds: nextLabelIds,
         blockedByIssueIds,
+        blockedByApprovalId,
         actorAgentId,
         actorUserId,
         expectedUpdatedAt,
@@ -6653,6 +6759,18 @@ export function issueService(db: Db) {
       if (patch.status === "in_progress" && !nextAssigneeAgentId && !nextAssigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      await assertBlockedStateHasTypedBlocker({
+        companyId: existing.companyId,
+        issueId: existing.id,
+        nextStatus: patch.status ?? existing.status,
+        blockedByIssueIds,
+        blockedByApprovalId,
+        blockedByExternal: issueData.blockedByExternal,
+        existingBlockedByExternal: existing.blockedByExternal,
+        dbOrTx,
+      });
+      if (blockedByApprovalId) await assertApprovalCanBlock(existing.companyId, blockedByApprovalId, dbOrTx);
+      if (blockedByApprovalId !== undefined) issueData.blockedByApprovalId = blockedByApprovalId;
       if (patch.status === "in_progress") {
         const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
           ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
@@ -6866,6 +6984,83 @@ export function issueService(db: Db) {
       };
 
       return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+    },
+
+    consumeApprovalBlocker: async (
+      approvalId: string,
+      outcome: "approved" | "rejected",
+      decisionNote?: string | null,
+      actor: { userId?: string | null; agentId?: string | null; runId?: string | null } = {},
+    ) => {
+      const linkedIssues = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          blockedByExternal: issues.blockedByExternal,
+          blockedByApprovalId: issues.blockedByApprovalId,
+        })
+        .from(issues)
+        .where(eq(issues.blockedByApprovalId, approvalId));
+      const consumed: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }> = [];
+
+      for (const issue of linkedIssues) {
+        if (issue.status !== "blocked") continue;
+        const [hasIssueBlocker, hasOtherApprovalBlocker] = await Promise.all([
+          issueHasExistingIssueBlockers(issue.companyId, issue.id),
+          issueHasActiveApprovalBlocker(issue.companyId, issue.id, db, approvalId),
+        ]);
+        if (hasIssueBlocker || hasOtherApprovalBlocker || isTypedExternalBlocker(issue.blockedByExternal)) continue;
+
+        const [updated] = await db
+          .update(issues)
+          .set({
+            status: "todo",
+            blockedByApprovalId: null,
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, issue.id))
+          .returning();
+        if (!updated) continue;
+
+        const readableOutcome = outcome === "approved" ? "approved" : "rejected";
+        await db.insert(issueComments).values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          authorType: "system",
+          createdByRunId: actor.runId ?? null,
+          body: [
+            `Approval blocker consumed: approval ${approvalId} was ${readableOutcome}.`,
+            "",
+            outcome === "rejected" && decisionNote
+              ? `Decision note: ${decisionNote}`
+              : "The issue is back in todo for the assignee to continue.",
+          ].join("\n"),
+          metadata: {
+            version: 1,
+            sections: [{
+              title: "Approval blocker",
+              rows: [
+                { type: "key_value", label: "Outcome", value: readableOutcome },
+                { type: "key_value", label: "Approval", value: approvalId },
+              ],
+            }],
+          },
+        });
+        consumed.push({
+          id: updated.id,
+          identifier: updated.identifier,
+          status: updated.status,
+          assigneeAgentId: updated.assigneeAgentId,
+        });
+      }
+
+      return consumed;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
@@ -7609,12 +7804,41 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ) => {
       const issue = await dbOrTx
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, status: issues.status })
         .from(issues)
         .where(eq(issues.id, issueId))
-        .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
+        .then((rows: Array<{ companyId: string; status: string }>) => rows[0] ?? null);
 
       if (!issue) throw notFound("Issue not found");
+      if (actor.agentId && actor.runId && (issue.status === "done" || issue.status === "cancelled")) {
+        const run = await dbOrTx
+          .select({
+            status: heartbeatRuns.status,
+            contextSnapshot: heartbeatRuns.contextSnapshot,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, actor.runId),
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, actor.agentId),
+            ),
+          )
+          .then((rows: Array<{ status: string; contextSnapshot: unknown }>) => rows[0] ?? null);
+        if (
+          run &&
+          runContextTargetsIssue(run.contextSnapshot, issueId) &&
+          (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) || issue.status === "cancelled")
+        ) {
+          throw conflict("Run cannot mutate an issue that is already done or cancelled", {
+            issueId,
+            issueStatus: issue.status,
+            runId: actor.runId,
+            runStatus: run.status,
+            securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+          });
+        }
+      }
 
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
