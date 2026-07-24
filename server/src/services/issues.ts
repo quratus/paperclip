@@ -787,6 +787,18 @@ function appendAcceptanceCriteriaToDescription(description: string | null | unde
   return base ? `${base}\n\n${criteriaMarkdown}` : criteriaMarkdown;
 }
 
+function inheritProductTruthContract(parentDescription: string | null | undefined, childDescription: string | null | undefined) {
+  const child = childDescription?.trim() ?? "";
+  if (/^##[ \t]+Product Truth Contract[ \t]*$/im.test(child)) return child || null;
+
+  const contract = parentDescription?.match(
+    /(^##[ \t]+Product Truth Contract[ \t]*$[\s\S]*?)(?=^##[ \t]+|(?![\s\S]))/im,
+  )?.[1]?.trim();
+  if (!contract) return child || null;
+
+  return child ? `${child}\n\n${contract}` : contract;
+}
+
 function normalizeAcceptedPlanDecompositionFingerprintValue(value: unknown): unknown {
   if (value === undefined) return null;
   if (
@@ -5968,7 +5980,10 @@ export function issueService(db: Db) {
         requestDepth: clampIssueRequestDepth(
           Math.max(clampIssueRequestDepth(parent.requestDepth) + 1, issueData.requestDepth ?? 0),
         ),
-        description: appendAcceptanceCriteriaToDescription(issueData.description, acceptanceCriteria),
+        description: inheritProductTruthContract(
+          parent.description,
+          appendAcceptanceCriteriaToDescription(issueData.description, acceptanceCriteria),
+        ),
         ...(inheritedPreRealizationWorkspaceSettings
           ? { executionWorkspaceSettings: inheritedPreRealizationWorkspaceSettings }
           : {}),

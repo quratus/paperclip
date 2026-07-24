@@ -3336,6 +3336,18 @@ export function issueRoutes(
     return /^##[ \t]+Product Truth Contract[ \t]*$/im.test(description ?? "");
   }
 
+  function inheritProductTruthContract(parentDescription: string | null | undefined, childDescription: string | null | undefined) {
+    const child = childDescription?.trim() ?? "";
+    if (hasProductTruthContract(child)) return child || null;
+
+    const contract = parentDescription?.match(
+      /(^##[ \t]+Product Truth Contract[ \t]*$[\s\S]*?)(?=^##[ \t]+|(?![\s\S]))/im,
+    )?.[1]?.trim();
+    if (!contract) return child || null;
+
+    return child ? `${child}\n\n${contract}` : contract;
+  }
+
   function assertIssueAdmissionContract(input: {
     issue: {
       id: string;
@@ -3658,6 +3670,7 @@ export function issueRoutes(
       companyId: string;
       status: string;
       assigneeAgentId: string | null;
+      description?: string | null;
     },
     actorAgentId: string,
     body: Record<string, unknown>,
@@ -3672,15 +3685,21 @@ export function issueRoutes(
       "blockedByIssueIds",
       "blockedByApprovalId",
       "blockedByExternal",
+      "description",
     ]);
     if (Object.keys(body).some((key) => !allowedKeys.has(key))) return false;
     if (body.executionPolicy === undefined) return false;
-    if (body.status !== undefined && !(issue.status === "blocked" && body.status === "in_review")) return false;
+    if (
+      body.status !== undefined
+      && !(issue.status === "blocked" && (body.status === "todo" || body.status === "in_review"))
+    ) return false;
     if (body.blockedByExternal !== undefined && body.blockedByExternal !== null) return false;
     if (body.blockedByApprovalId !== undefined && body.blockedByApprovalId !== null) return false;
     if (body.blockedByIssueIds !== undefined) {
       if (!Array.isArray(body.blockedByIssueIds) || body.blockedByIssueIds.length > 0) return false;
     }
+    if (typeof body.description !== "string" || !hasProductTruthContract(body.description)) return false;
+    if (hasProductTruthContract(issue.description)) return false;
 
     let policy: NormalizedExecutionPolicy | null;
     try {
@@ -7237,13 +7256,13 @@ export function issueRoutes(
         return;
       }
     }
-    if (req.actor.type === "agent" && effectiveParentId) {
+    if (effectiveParentId) {
       createParent = await svc.getById(effectiveParentId);
       if (!createParent || createParent.companyId !== companyId) {
         res.status(404).json({ error: "Parent issue not found" });
         return;
       }
-      if (!isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, createParent))) return;
+      if (req.actor.type === "agent" && !isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, createParent))) return;
     }
     if (
       !watchdogProductBugFollowUp &&
@@ -7260,6 +7279,9 @@ export function issueRoutes(
     const createBody = {
       ...rawCreateBody,
       parentId: effectiveParentId,
+      ...(createParent
+        ? { description: inheritProductTruthContract(createParent.description, rawCreateBody.description) }
+        : {}),
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
       ...(runWorkspaceInheritanceSourceIssueId
         ? { inheritExecutionWorkspaceFromIssueId: runWorkspaceInheritanceSourceIssueId }
