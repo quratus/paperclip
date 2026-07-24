@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdapterEnvironmentTestResult } from "@paperclipai/shared";
 import { useLocation, useNavigate, useParams } from "@/lib/router";
@@ -51,7 +51,6 @@ import { Badge } from "@/components/ui/badge";
 import {
   Building2,
   Bot,
-  ListTodo,
   ArrowLeft,
   ArrowRight,
   Sparkles,
@@ -156,8 +155,6 @@ export function OnboardingWizard() {
   // Step 1
   const [companyName, setCompanyName] = useState((saved?.companyName as string) ?? "");
   const [companyGoal, setCompanyGoal] = useState((saved?.companyGoal as string) ?? "");
-  const [missionPath, setMissionPath] = useState<"direct" | "questionnaire" | null>((saved?.missionPath as "direct" | "questionnaire" | null) ?? null);
-  const [missionConfirmed, setMissionConfirmed] = useState((saved?.missionConfirmed as boolean) ?? false);
   // Questionnaire answers
   const [q1, setQ1] = useState((saved?.q1 as string) ?? ""); // What do you do?
   const [q2, setQ2] = useState((saved?.q2 as string) ?? ""); // Who do you serve?
@@ -198,6 +195,7 @@ export function OnboardingWizard() {
   const [createdIssueRef, setCreatedIssueRef] = useState<string | null>(
     (saved?.createdIssueRef as string) ?? null
   );
+  const confirmingMissionRef = useRef(false);
 
   // Reset the route-dismissed flag when navigating to a different path.
   useEffect(() => {
@@ -233,7 +231,7 @@ export function OnboardingWizard() {
   useEffect(() => {
     if (!effectiveOnboardingOpen) return;
     const state = {
-      step, companyName, companyGoal, missionPath, missionConfirmed,
+      step, companyName, companyGoal,
       q1, q2, q3, q4, agentName, adapterType, cwd, model, command, args, url,
       createdCompanyId, createdCompanyPrefix, createdAgentId,
       createdCompanyGoalId, createdProjectId, createdIssueRef,
@@ -241,7 +239,7 @@ export function OnboardingWizard() {
     };
     localStorage.setItem(ONBOARDING_STORAGE_KEY, JSON.stringify(state));
   }, [
-    effectiveOnboardingOpen, step, companyName, companyGoal, missionPath, missionConfirmed,
+    effectiveOnboardingOpen, step, companyName, companyGoal,
     q1, q2, q3, q4, agentName, adapterType, cwd, model, command, args, url,
     createdCompanyId, createdCompanyPrefix, createdAgentId,
     createdCompanyGoalId, createdProjectId, createdIssueRef,
@@ -371,8 +369,6 @@ export function OnboardingWizard() {
     setError(null);
     setCompanyName("");
     setCompanyGoal("");
-    setMissionPath(null);
-    setMissionConfirmed(false);
     setQ1("");
     setQ2("");
     setQ3("");
@@ -537,40 +533,52 @@ export function OnboardingWizard() {
   }
 
   // Step 2 → 3 ("Confirm mission"): create the company + its company-level
-  // goal, then advance to naming the team lead. Guarded so revisiting the
-  // mission step (e.g. via Back) doesn't create a duplicate company.
+  // goal, then advance to naming the team lead. A retry reuses a persisted
+  // company goal rather than creating a second one.
   async function handleConfirmMission() {
-    if (createdCompanyId) {
-      setStep(3);
-      return;
-    }
+    if (confirmingMissionRef.current) return;
+    confirmingMissionRef.current = true;
     setLoading(true);
     setError(null);
     try {
-      const company = await companiesApi.create({ name: companyName.trim() });
-      setCreatedCompanyId(company.id);
-      setCreatedCompanyPrefix(company.issuePrefix);
-      setSelectedCompanyId(company.id);
-      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      let companyId = createdCompanyId;
+      if (!companyId) {
+        const company = await companiesApi.create({ name: companyName.trim() });
+        companyId = company.id;
+        setCreatedCompanyId(company.id);
+        setCreatedCompanyPrefix(company.issuePrefix);
+        setSelectedCompanyId(company.id);
+        queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      }
 
-      const parsedGoal = parseOnboardingGoalInput(companyGoal);
-      const goal = await goalsApi.create(company.id, {
-        title: parsedGoal.title,
-        ...(parsedGoal.description
-          ? { description: parsedGoal.description }
-          : {}),
-        level: "company",
-        status: "active"
-      });
-      setCreatedCompanyGoalId(goal.id);
+      let goalId = createdCompanyGoalId;
+      if (!goalId) {
+        const existingGoalId = selectDefaultCompanyGoalId(await goalsApi.list(companyId));
+        if (existingGoalId) {
+          goalId = existingGoalId;
+        } else {
+          const parsedGoal = parseOnboardingGoalInput(companyGoal);
+          const goal = await goalsApi.create(companyId, {
+            title: parsedGoal.title,
+            ...(parsedGoal.description
+              ? { description: parsedGoal.description }
+              : {}),
+            level: "company",
+            status: "active"
+          });
+          goalId = goal.id;
+        }
+        setCreatedCompanyGoalId(goalId);
+      }
       queryClient.invalidateQueries({
-        queryKey: queryKeys.goals.list(company.id)
+        queryKey: queryKeys.goals.list(companyId)
       });
 
       setStep(3); // → Create your team lead
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create company");
     } finally {
+      confirmingMissionRef.current = false;
       setLoading(false);
     }
   }
@@ -998,7 +1006,6 @@ export function OnboardingWizard() {
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && companyName.trim()) {
                           e.preventDefault();
-                          if (onboardingPath !== "grow" && !missionPath) setMissionPath("direct");
                           setStep(2);
                         }
                       }}
@@ -1029,172 +1036,43 @@ export function OnboardingWizard() {
                     </div>
                   </div>
 
-                  {/* Mission path selector */}
                   <div className="space-y-3">
-                    <label className="text-xs text-foreground block">
-                      How would you like to define your mission?
-                    </label>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
+                    <div className="group">
+                      <label
                         className={cn(
-                          "flex flex-col items-center gap-1.5 rounded-md border p-3 text-xs transition-colors",
-                          missionPath === "direct"
-                            ? "border-foreground bg-accent/50"
-                            : "border-border hover:bg-accent/50"
+                          "text-xs mb-1 block transition-colors",
+                          companyGoal.trim()
+                            ? "text-foreground"
+                            : "text-muted-foreground group-focus-within:text-foreground"
                         )}
-                        onClick={() => setMissionPath("direct")}
                       >
-                        <Sparkles className="h-4 w-4" />
-                        <span className="font-medium">I know my mission</span>
-                        <span className="text-muted-foreground text-(length:--text-nano)">
-                          Type it directly
-                        </span>
-                      </button>
-                      <button
-                        className={cn(
-                          "flex flex-col items-center gap-1.5 rounded-md border p-3 text-xs transition-colors",
-                          missionPath === "questionnaire"
-                            ? "border-foreground bg-accent/50"
-                            : "border-border hover:bg-accent/50"
-                        )}
-                        onClick={() => setMissionPath("questionnaire")}
-                      >
-                        <ListTodo className="h-4 w-4" />
-                        <span className="font-medium">Help me figure it out</span>
-                        <span className="text-muted-foreground text-(length:--text-nano)">
-                          Answer a few questions
-                        </span>
-                      </button>
+                        Mission
+                      </label>
+                      <textarea
+                        className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50 resize-none min-h-(--sz-60px)"
+                        placeholder="What is your team trying to achieve?"
+                        value={companyGoal}
+                        onChange={(e) => setCompanyGoal(e.target.value)}
+                        autoFocus
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {MISSION_PROMPT_CHIPS.map((chip) => (
+                        <button
+                          key={chip}
+                          className={cn(
+                            "rounded-full border px-2.5 py-1 text-(length:--text-micro) transition-colors",
+                            companyGoal === chip
+                              ? "border-foreground bg-accent text-foreground"
+                              : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/50"
+                          )}
+                          onClick={() => setCompanyGoal(chip)}
+                        >
+                          {chip}
+                        </button>
+                      ))}
                     </div>
                   </div>
-
-                  {/* Direct mission input */}
-                  {missionPath === "direct" && (
-                    <div className="space-y-3 animate-in fade-in duration-200">
-                      <div className="group">
-                        <label
-                          className={cn(
-                            "text-xs mb-1 block transition-colors",
-                            companyGoal.trim()
-                              ? "text-foreground"
-                              : "text-muted-foreground group-focus-within:text-foreground"
-                          )}
-                        >
-                          Mission
-                        </label>
-                        <textarea
-                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50 resize-none min-h-(--sz-60px)"
-                          placeholder="What is your team trying to achieve?"
-                          value={companyGoal}
-                          onChange={(e) => setCompanyGoal(e.target.value)}
-                          autoFocus
-                        />
-                      </div>
-                      {/* Prompt chips for inspiration */}
-                      <div className="flex flex-wrap gap-1.5">
-                        {MISSION_PROMPT_CHIPS.map((chip) => (
-                          <button
-                            key={chip}
-                            className={cn(
-                              "rounded-full border px-2.5 py-1 text-(length:--text-micro) transition-colors",
-                              companyGoal === chip
-                                ? "border-foreground bg-accent text-foreground"
-                                : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/50"
-                            )}
-                            onClick={() => setCompanyGoal(chip)}
-                          >
-                            {chip}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Questionnaire path */}
-                  {missionPath === "questionnaire" && !missionConfirmed && (
-                    <div className="space-y-3 animate-in fade-in duration-200">
-                      <div className="group">
-                        <label className="text-xs text-muted-foreground mb-1 block">
-                          What does your team work on?
-                        </label>
-                        <input
-                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                          placeholder="e.g. We create educational YouTube content about AI"
-                          value={q1}
-                          onChange={(e) => setQ1(e.target.value)}
-                          autoFocus
-                        />
-                      </div>
-                      <div className="group">
-                        <label className="text-xs text-muted-foreground mb-1 block">
-                          Who do you serve?
-                        </label>
-                        <input
-                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                          placeholder="e.g. Non-technical professionals curious about AI tools"
-                          value={q2}
-                          onChange={(e) => setQ2(e.target.value)}
-                        />
-                      </div>
-                      <div className="group">
-                        <label className="text-xs text-muted-foreground mb-1 block">
-                          What's your biggest bottleneck right now?
-                        </label>
-                        <input
-                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                          placeholder="e.g. Can't produce content fast enough across multiple channels"
-                          value={q3}
-                          onChange={(e) => setQ3(e.target.value)}
-                        />
-                      </div>
-                      <div className="group">
-                        <label className="text-xs text-muted-foreground mb-1 block">
-                          What would success look like in 6 months?
-                        </label>
-                        <input
-                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                          placeholder="e.g. Publishing daily content across 4 platforms with a team of AI agents"
-                          value={q4}
-                          onChange={(e) => setQ4(e.target.value)}
-                        />
-                      </div>
-                      {q1.trim() && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => {
-                            setCompanyGoal(buildMissionFromQuestionnaire(q1, q2, q3, q4));
-                            setMissionConfirmed(true);
-                          }}
-                        >
-                          Generate my mission
-                        </Button>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Questionnaire result — editable mission */}
-                  {missionPath === "questionnaire" && missionConfirmed && (
-                    <div className="space-y-3 animate-in fade-in duration-200">
-                      <div className="group">
-                        <label className="text-xs text-foreground mb-1 block">
-                          Here's your draft mission — edit it however you like:
-                        </label>
-                        <textarea
-                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50 resize-none min-h-(--sz-80px)"
-                          value={companyGoal}
-                          onChange={(e) => setCompanyGoal(e.target.value)}
-                          autoFocus
-                        />
-                      </div>
-                      <button
-                        className="text-(length:--text-micro) text-muted-foreground hover:text-foreground transition-colors"
-                        onClick={() => { setMissionConfirmed(false); setCompanyGoal(""); }}
-                      >
-                        ← Back to questions
-                      </button>
-                    </div>
-                  )}
 
                   {/* Confirm mission note */}
                   {companyGoal.trim() && (
@@ -1652,7 +1530,6 @@ export function OnboardingWizard() {
                       size="sm"
                       disabled={!companyName.trim()}
                       onClick={() => {
-                        if (onboardingPath !== "grow" && !missionPath) setMissionPath("direct");
                         setStep(2);
                       }}
                     >
