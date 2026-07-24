@@ -919,6 +919,55 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("allows manager-chain agents to repair product admission metadata for another agent's blocked issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "tasks:manage_active_checkouts",
+      action: input.action,
+      reason: input.action === "tasks:manage_active_checkouts" ? "allow_manager_chain" : "deny_missing_grant",
+      explanation:
+        input.action === "tasks:manage_active_checkouts"
+          ? "Allowed because the actor manages the issue assignee in the reporting chain."
+          : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        blockedByIssueIds: [],
+        blockedByApprovalId: null,
+        blockedByExternal: null,
+        executionPolicy: {
+          workClass: "product_ui",
+          stages: [
+            { type: "review", participants: [{ type: "agent", agentId: peerAgentId }] },
+          ],
+        },
+        reviewRequest: { instructions: "Review the existing PR; do not run implementation again." },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "tasks:manage_active_checkouts",
+    }));
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        status: "in_review",
+        blockedByExternal: null,
+        assigneeAgentId: peerAgentId,
+        executionPolicy: expect.objectContaining({ workClass: "product_ui" }),
+        executionState: expect.objectContaining({
+          status: "pending",
+          currentStageType: "review",
+          currentParticipant: expect.objectContaining({ agentId: peerAgentId }),
+        }),
+      }),
+    );
+  }, 15_000);
+
   it("denies cross-company agents before comment authorization is evaluated", async () => {
     const res = await request(await createApp(peerActor({ companyId: "99999999-9999-4999-8999-999999999999" })))
       .post(`/api/issues/${issueId}/comments`)

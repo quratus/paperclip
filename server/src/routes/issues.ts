@@ -162,6 +162,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -3608,6 +3609,7 @@ export function issueRoutes(
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return false;
     }
+    if (!(await assertAgentRunCanWriteIssue(req, res, issue))) return false;
     return boundaryDecision;
   }
 
@@ -3648,6 +3650,47 @@ export function issueRoutes(
       resource: { type: "issue", companyId, assigneeAgentId },
     });
     return decision.allowed;
+  }
+
+  async function isAgentAdmissionMetadataRepairAllowed(
+    req: Request,
+    issue: {
+      companyId: string;
+      status: string;
+      assigneeAgentId: string | null;
+    },
+    actorAgentId: string,
+    body: Record<string, unknown>,
+  ) {
+    if (!issue.assigneeAgentId || issue.assigneeAgentId === actorAgentId) return false;
+
+    const allowedKeys = new Set([
+      "comment",
+      "reviewRequest",
+      "status",
+      "executionPolicy",
+      "blockedByIssueIds",
+      "blockedByApprovalId",
+      "blockedByExternal",
+    ]);
+    if (Object.keys(body).some((key) => !allowedKeys.has(key))) return false;
+    if (body.executionPolicy === undefined) return false;
+    if (body.status !== undefined && !(issue.status === "blocked" && body.status === "in_review")) return false;
+    if (body.blockedByExternal !== undefined && body.blockedByExternal !== null) return false;
+    if (body.blockedByApprovalId !== undefined && body.blockedByApprovalId !== null) return false;
+    if (body.blockedByIssueIds !== undefined) {
+      if (!Array.isArray(body.blockedByIssueIds) || body.blockedByIssueIds.length > 0) return false;
+    }
+
+    let policy: NormalizedExecutionPolicy | null;
+    try {
+      policy = normalizeIssueExecutionPolicy(body.executionPolicy);
+    } catch {
+      return false;
+    }
+    if (!policy || policy.workClass !== "product_ui" || policy.stages.length === 0) return false;
+
+    return hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId);
   }
 
   async function assertAgentIssueMutationAllowed(
@@ -3691,6 +3734,17 @@ export function issueRoutes(
         return false;
       }
       return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+    }
+    if (!(await assertAgentRunCanWriteIssue(req, res, issue))) return false;
+    if (
+      await isAgentAdmissionMetadataRepairAllowed(
+        req,
+        issue,
+        actorAgentId,
+        req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body as Record<string, unknown> : {},
+      )
+    ) {
+      return true;
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
@@ -4097,6 +4151,7 @@ export function issueRoutes(
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -4104,6 +4159,38 @@ export function issueRoutes(
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return null;
     return run;
+  }
+
+  function runContextTargetsIssue(contextSnapshot: unknown, issueId: string) {
+    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+    const context = contextSnapshot as Record<string, unknown>;
+    return context.issueId === issueId || context.taskId === issueId;
+  }
+
+  async function assertAgentRunCanWriteIssue(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string; status: string },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    if (!isClosedIssueStatus(issue.status)) return true;
+
+    const run = await loadActorRunContext(req, issue.companyId);
+    if (!run) return true;
+    if (!runContextTargetsIssue(run.contextSnapshot, issue.id)) return true;
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) && issue.status !== "cancelled") return true;
+
+    res.status(409).json({
+      error: "Run cannot mutate an issue that is already done or cancelled",
+      details: {
+        issueId: issue.id,
+        issueStatus: issue.status,
+        runId: run.id,
+        runStatus: run.status,
+        securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+      },
+    });
+    return false;
   }
 
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
@@ -8004,6 +8091,18 @@ export function issueRoutes(
     const runToCancelForCancelledStatus = shouldCancelActiveRunForCancelledStatus
       ? await resolveActiveIssueRun(existing)
       : null;
+    // A cancellation is a stop primitive, not merely a status label. Interrupt
+    // the claimed run before persisting the terminal issue state so it cannot
+    // continue to emit normal work after the board has cancelled the issue.
+    let cancelledStatusRunId: string | null = null;
+    if (runToCancelForCancelledStatus) {
+      const cancelled = await heartbeat.cancelRun(
+        runToCancelForCancelledStatus.id,
+        "Cancelled because its issue was cancelled",
+        { suppressImmediateRecovery: true },
+      );
+      if (cancelled) cancelledStatusRunId = cancelled.id;
+    }
 
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
@@ -8061,14 +8160,16 @@ export function issueRoutes(
       typeof normalizedAssigneeAgentId === "string" &&
       normalizedAssigneeAgentId !== existing.assigneeAgentId &&
       resultingStatus !== "backlog";
-    if (admissionStatusTransitionRequested || admissionAssignmentRequested) {
+    const isWatchdogScopedMutation =
+      req.actor.type === "agent" && (await resolveTaskWatchdogMutationScope(db, req.actor)).kind !== "none";
+    if (admissionStatusTransitionRequested) {
       assertIssueAdmissionContract({
         issue: existing,
         nextDescription: updateFields.description === undefined
           ? undefined
           : updateFields.description as string | null,
         nextExecutionPolicy: updateFields.executionPolicy,
-        source: admissionStatusTransitionRequested ? "status_transition" : "assignment",
+        source: "status_transition",
         actorType: req.actor.type,
       });
     }
@@ -8160,6 +8261,17 @@ export function issueRoutes(
         });
       }
     }
+    if (admissionAssignmentRequested && !isWatchdogScopedMutation) {
+      assertIssueAdmissionContract({
+        issue: existing,
+        nextDescription: updateFields.description === undefined
+          ? undefined
+          : updateFields.description as string | null,
+        nextExecutionPolicy: updateFields.executionPolicy,
+        source: "assignment",
+        actorType: req.actor.type,
+      });
+    }
 
     let issue;
     try {
@@ -8229,55 +8341,25 @@ export function issueRoutes(
       return;
     }
 
-    let cancelledStatusRunId: string | null = null;
-    if (runToCancelForCancelledStatus) {
-      try {
-        const cancelled = await heartbeat.cancelRun(runToCancelForCancelledStatus.id);
-        if (cancelled) {
-          cancelledStatusRunId = cancelled.id;
-          await runAfterCommittedIssueWrite(
-            issue,
-            "activity.heartbeat.cancelled",
-            () => logActivity(db, {
-              companyId: cancelled.companyId,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId,
-              runId: actor.runId,
-              agentApiKeyId: actor.agentApiKeyId,
-              action: "heartbeat.cancelled",
-              entityType: "heartbeat_run",
-              entityId: cancelled.id,
-              issueId: existing.id,
-              details: { agentId: cancelled.agentId, source: "issue_status_cancelled", issueId: existing.id },
-            }),
-            undefined,
-          );
-        }
-      } catch (err) {
-        logger.warn(
-          { err, issueId: existing.id, runId: runToCancelForCancelledStatus.id },
-          "failed to cancel run for cancelled issue",
-        );
-        await runAfterCommittedIssueWrite(
-          issue,
-          "activity.heartbeat.cancel_failed",
-          () => logActivity(db, {
-            companyId: existing.companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "heartbeat.cancel_failed",
-            entityType: "heartbeat_run",
-            entityId: runToCancelForCancelledStatus.id,
-            issueId: existing.id,
-            details: { source: "issue_status_cancelled", issueId: existing.id },
-          }),
-          undefined,
-        );
-      }
+    if (cancelledStatusRunId) {
+      await runAfterCommittedIssueWrite(
+        issue,
+        "activity.heartbeat.cancelled",
+        () => logActivity(db, {
+          companyId: existing.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "heartbeat.cancelled",
+          entityType: "heartbeat_run",
+          entityId: cancelledStatusRunId,
+          issueId: existing.id,
+          details: { source: "issue_status_cancelled", issueId: existing.id },
+        }),
+        undefined,
+      );
     }
 
     if (titleOrDescriptionChanged) {

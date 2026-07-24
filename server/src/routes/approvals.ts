@@ -22,6 +22,7 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
+import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
@@ -55,6 +56,22 @@ export function approvalRoutes(
   const issuesSvc = issueService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  function wakeConsumedBlockerAssignees(
+    consumedIssues: Array<{ id: string; assigneeAgentId: string | null; status: string }>,
+    outcome: "approved" | "rejected",
+  ) {
+    for (const issue of consumedIssues) {
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "approval_blocker_resolved",
+        mutation: `approval_${outcome}`,
+        contextSource: "approval.blocker_consumed",
+        requestedByActorType: "user",
+      });
+    }
+  }
 
   async function requireApprovalAccess(req: Request, id: string) {
     const approval = await svc.getById(id);
@@ -279,6 +296,25 @@ export function approvalRoutes(
           });
         }
       }
+
+      const consumedIssues = await issuesSvc.consumeApprovalBlocker(
+        approval.id,
+        "approved",
+        req.body.decisionNote,
+        { userId: req.actor.userId ?? "board" },
+      );
+      wakeConsumedBlockerAssignees(consumedIssues, "approved");
+      if (consumedIssues.length > 0) {
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "approval.blocked_issues_consumed",
+          entityType: "approval",
+          entityId: approval.id,
+          details: { outcome: "approved", issueIds: consumedIssues.map((issue) => issue.id) },
+        });
+      }
     }
 
     res.json(redactApprovalPayload(approval));
@@ -316,6 +352,13 @@ export function approvalRoutes(
           },
         },
       )));
+      const consumedIssues = await issuesSvc.consumeApprovalBlocker(
+        approval.id,
+        "rejected",
+        decisionNote,
+        { userId: req.actor.userId ?? "board" },
+      );
+      wakeConsumedBlockerAssignees(consumedIssues, "rejected");
 
       await logActivity(db, {
         companyId: approval.companyId,
@@ -324,7 +367,7 @@ export function approvalRoutes(
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
-        details: { type: approval.type, linkedIssueIds },
+        details: { type: approval.type, linkedIssueIds, consumedBlockedIssueIds: consumedIssues.map((issue) => issue.id) },
       });
     }
 

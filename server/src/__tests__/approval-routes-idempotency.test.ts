@@ -25,6 +25,7 @@ const mockIssueApprovalService = vi.hoisted(() => ({
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
+  consumeApprovalBlocker: vi.fn(),
 }));
 
 const mockSecretService = vi.hoisted(() => ({
@@ -136,6 +137,7 @@ describe("approval routes idempotent retries", () => {
     mockIssueApprovalService.listIssuesForApproval.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
     mockIssueService.addComment.mockReset();
+    mockIssueService.consumeApprovalBlocker.mockReset();
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
     mockLogActivity.mockReset();
     mockAccessService.decide.mockReset();
@@ -148,6 +150,7 @@ describe("approval routes idempotent retries", () => {
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
+    mockIssueService.consumeApprovalBlocker.mockResolvedValue([]);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -180,7 +183,55 @@ describe("approval routes idempotent retries", () => {
     expect(mockIssueApprovalService.listIssuesForApproval).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
-  });
+  }, 15_000);
+
+  it("consumes linked blocked issues when an approval is approved", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-blocker",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: null,
+    });
+    mockApprovalService.approve.mockResolvedValue({
+      approval: {
+        id: "approval-blocker",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "approved",
+        payload: {},
+        requestedByAgentId: null,
+      },
+      applied: true,
+    });
+    mockIssueService.consumeApprovalBlocker.mockResolvedValue([{
+      id: "issue-1",
+      identifier: "SQN-1",
+      status: "todo",
+      assigneeAgentId: "agent-2",
+    }]);
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-blocker/approve")
+      .send({ decisionNote: "Approved." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.consumeApprovalBlocker).toHaveBeenCalledWith(
+      "approval-blocker",
+      "approved",
+      "Approved.",
+      { userId: "user-1" },
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({
+        reason: "approval_blocker_resolved",
+        payload: { issueId: "issue-1", mutation: "approval_approved" },
+        contextSnapshot: { issueId: "issue-1", source: "approval.blocker_consumed" },
+      }),
+    );
+  }, 15_000);
 
   it("rejects approval rejections without a decision note", async () => {
     mockApprovalService.getById.mockResolvedValue({

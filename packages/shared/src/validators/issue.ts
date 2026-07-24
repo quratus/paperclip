@@ -384,6 +384,13 @@ const createIssueBaseSchema = z.object({
   goalId: z.string().uuid().optional().nullable(),
   parentId: z.string().uuid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().uuid()).optional(),
+  blockedByApprovalId: z.string().uuid().optional().nullable(),
+  blockedByExternal: z.object({
+    type: z.string().trim().min(1).max(120),
+    owner: z.string().trim().min(1).max(200),
+    recheckDate: z.string().datetime(),
+    note: multilineTextSchema.optional().nullable(),
+  }).strict().optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().uuid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),

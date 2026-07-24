@@ -17,6 +17,7 @@ import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { projectWorkspaces } from "./project_workspaces.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
+import { approvals } from "./approvals.js";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 
 export const issues = pgTable(
@@ -65,6 +66,11 @@ export const issues = pgTable(
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),
     executionWorkspaceSettings: jsonb("execution_workspace_settings").$type<Record<string, unknown>>(),
+    // This is deliberately distinct from issueApprovals. The latter records
+    // ordinary, many-to-many approval context; this column is the one active
+    // approval that semantically keeps an issue in `blocked`.
+    blockedByApprovalId: uuid("blocked_by_approval_id").references(() => approvals.id, { onDelete: "set null" }),
+    blockedByExternal: jsonb("blocked_by_external").$type<Record<string, unknown> | null>(),
     sourceTrust: jsonb("source_trust").$type<SourceTrustMetadata | null>(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
@@ -96,6 +102,7 @@ export const issues = pgTable(
     projectWorkspaceIdx: index("issues_company_project_workspace_idx").on(table.companyId, table.projectWorkspaceId),
     executionWorkspaceIdx: index("issues_company_execution_workspace_idx").on(table.companyId, table.executionWorkspaceId),
     dueMonitorIdx: index("issues_company_monitor_due_idx").on(table.companyId, table.monitorNextCheckAt),
+    blockedByApprovalIdx: index("issues_company_blocked_by_approval_idx").on(table.companyId, table.blockedByApprovalId),
     companyUpdatedIdx: index("issues_company_updated_idx").on(table.companyId, table.updatedAt),
     companyCreatedIdx: index("issues_company_created_idx").on(table.companyId, table.createdAt),
     openNormalizedTitleCreatedIdx: index("issues_open_normalized_title_created_idx")
