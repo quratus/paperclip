@@ -9,6 +9,7 @@ import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
 import {
   createAcpxEngineExecutor,
+  completedTurnStructuredError,
   decodeJwtExpSeconds,
   findAncestorBin,
   findAncestorBinWithRetry,
@@ -365,6 +366,37 @@ describe("shared ACPX engine runtime behavior", () => {
         tag: "agent_message_chunk",
       })}\n`,
     });
+  });
+
+  it("fails a completed ACP turn when its only output is a structured provider error", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({ backendSessionId: "backend-session", agentSessionId: "agent-session", runtimeSessionName: "runtime-session" }),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "text_delta", text: 'Warning: Model metadata missing.\\n\\n{"type":"error","status":400,"error":{"message":"Model needs a newer Codex version."}}', stream: "output", tag: "agent_message_chunk" };
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+    const result = await execute({
+      runId: "run-completed-provider-error", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir }, context: {}, onLog: async () => {}, onMeta: async () => {},
+    } as never);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toBe("Model needs a newer Codex version.");
+    expect(result.resultJson).toMatchObject({ status: "failed", protocolStatus: "completed" });
+  });
+
+  it("only classifies a standalone provider error payload, not a normal agent message mentioning one", () => {
+    expect(completedTurnStructuredError('{"type":"error","status":400,"error":{"message":"Denied"}}')).toBe("Denied");
+    expect(completedTurnStructuredError('I investigated {"type":"error","status":400,"error":{"message":"Denied"}}')).toBeNull();
   });
 
   it("captures per-run usage, cost deltas, and billing identity from the ACP runtime", async () => {

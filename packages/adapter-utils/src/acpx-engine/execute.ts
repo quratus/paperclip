@@ -1678,6 +1678,28 @@ function resultErrorMessage(result: AcpRuntimeTurnResult): string | null {
   return result.error.message;
 }
 
+/**
+ * Some ACP servers encode a rejected model request as an output text delta and
+ * still finish the protocol turn with `completed/end_turn`. Treat that exact
+ * terminal payload as a failed execution: otherwise Paperclip records a false
+ * success, drops the active run, and every client reports the agent as ready.
+ */
+export function completedTurnStructuredError(text: string): string | null {
+  const start = text.lastIndexOf('{"type":"error"');
+  if (start < 0) return null;
+  const prefix = text.slice(0, start).trim();
+  if (prefix && !prefix.split(/\r?\n/).every((line) => /^Warning: Model metadata/i.test(line.trim()))) return null;
+  try {
+    const value: unknown = JSON.parse(text.slice(start).trim());
+    if (!value || typeof value !== "object") return null;
+    const record = value as { type?: unknown; status?: unknown; error?: { message?: unknown } };
+    if (record.type !== "error" || typeof record.status !== "number" || record.status < 400) return null;
+    return typeof record.error?.message === "string" ? record.error.message : null;
+  } catch {
+    return null;
+  }
+}
+
 function usageBreakdownsEqual(
   left: AcpRuntimeUsageBreakdown,
   right: AcpRuntimeUsageBreakdown,
@@ -2330,20 +2352,25 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         eventBreakdown,
         eventCostUsd,
       });
-      if (terminal.status === "failed" || terminal.status === "cancelled" || timedOut) {
+      const streamedText = textParts.join("").trim();
+      const structuredOutputError = terminal.status === "completed"
+        ? completedTurnStructuredError(streamedText)
+        : null;
+      const terminalFailed = terminal.status === "failed" || terminal.status === "cancelled" || Boolean(structuredOutputError) || timedOut;
+      if (terminalFailed) {
         const existing = warmHandles.get(prepared.sessionKey);
         if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
           await closeWarmHandle({
             handles: warmHandles,
             key: prepared.sessionKey,
             entry: existing,
-            reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
+            reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${structuredOutputError ? "failed" : terminal.status}`,
             discardPersistentState: terminal.status === "cancelled" || timedOut,
           });
         } else {
           await runtime.close({
             handle: sessionHandle,
-            reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
+            reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${structuredOutputError ? "failed" : terminal.status}`,
             discardPersistentState: terminal.status === "cancelled" || timedOut,
           }).catch(() => {});
         }
@@ -2392,25 +2419,27 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
       const errorMessage = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
-        : resultErrorMessage(terminal);
-      const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
+        : structuredOutputError ?? resultErrorMessage(terminal);
+      const terminalStopReason = structuredOutputError ?? (terminal.status === "failed" ? terminal.error.message : terminal.stopReason);
       await emitAcpxLog(ctx, {
-        type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
-        summary: terminal.status,
+        type: terminalFailed ? "acpx.error" : "acpx.result",
+        summary: terminalFailed ? "failed" : terminal.status,
         stopReason: terminalStopReason,
         message: errorMessage,
       });
       await cleanupRemoteBridges(prepared);
       return {
-        exitCode: terminal.status === "completed" ? 0 : 1,
+        exitCode: terminalFailed ? 1 : 0,
         signal: timedOut ? "SIGTERM" : null,
         timedOut,
         errorMessage,
-        errorCode: terminalErrorCode({
-          status: terminal.status,
-          timedOut,
-          stopReason: terminalStopReason,
-        }),
+        errorCode: structuredOutputError
+          ? "acpx_provider_error"
+          : terminalErrorCode({
+            status: terminalFailed ? "failed" : terminal.status,
+            timedOut,
+            stopReason: terminalStopReason,
+          }),
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -2419,7 +2448,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
         costUsd: turnUsage.costUsd,
         resultJson: {
-          status: terminal.status,
+          status: terminalFailed ? "failed" : terminal.status,
+          ...(structuredOutputError ? { protocolStatus: terminal.status } : {}),
           stopReason: terminalStopReason,
           permissionMode: prepared.permissionMode,
           mode: prepared.mode,
@@ -2431,7 +2461,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? { cumulativeCostUsd: turnUsage.cumulativeCostUsd }
             : {}),
         },
-        summary: textParts.join("").trim() || terminalStopReason || terminal.status,
+        summary: structuredOutputError ?? (streamedText || terminalStopReason || terminal.status),
         clearSession,
       };
     } catch (err) {
