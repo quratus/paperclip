@@ -25,7 +25,7 @@ function isTemporaryCapacityOutput(stdout: string, stderr: string) {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, config, onLog, onMeta, authToken } = ctx;
+  const { runId, agent, config, context, onLog, onMeta, authToken } = ctx;
   const command = asString(config.command, "");
   if (!command) throw new Error("Process adapter missing command");
 
@@ -39,6 +39,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (typeof v === "string") env[k] = v;
   }
   env.PAPERCLIP_RUN_ID = runId;
+  const taskId =
+    (typeof context.taskId === "string" && context.taskId.trim()) ||
+    (typeof context.issueId === "string" && context.issueId.trim()) ||
+    "";
+  const wakeReason = typeof context.wakeReason === "string" ? context.wakeReason.trim() : "";
+  const wakeCommentId =
+    (typeof context.wakeCommentId === "string" && context.wakeCommentId.trim()) ||
+    (typeof context.commentId === "string" && context.commentId.trim()) ||
+    "";
+  if (taskId) env.PAPERCLIP_TASK_ID = taskId;
+  if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
+  if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
   if (authToken && !env.PAPERCLIP_API_KEY?.trim()) env.PAPERCLIP_API_KEY = authToken;
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
