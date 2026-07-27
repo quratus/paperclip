@@ -420,7 +420,12 @@ export function createPluginJobScheduler(
             .set({ companyCursor: batch.nextCursor })
             .where(eq(pluginJobs.id, jobId));
         }
-        await advanceSchedulePointer(job);
+        if (job.scope === "company" && batch.nextCursor) {
+          const now = new Date();
+          await jobStore.updateRunTimestamps(job.id, now, now);
+        } else {
+          await advanceSchedulePointer(job);
+        }
       } catch (err) {
         jobLog.error(
           { err: err instanceof Error ? err.message : String(err) },

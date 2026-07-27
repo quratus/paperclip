@@ -81,13 +81,20 @@ describe("company-scoped plugin job routing", () => {
       id: `run-${companyId}`,
     }));
     const call = vi.fn(async () => undefined);
+    const timestampUpdates: Array<{ lastRunAt: Date; nextRunAt: Date | null }> = [];
     const scheduler = createPluginJobScheduler({
       db: db as never,
       jobStore: {
         createRun,
         markRunning: vi.fn(async () => undefined),
         completeRun: vi.fn(async () => undefined),
-        updateRunTimestamps: vi.fn(async () => undefined),
+        updateRunTimestamps: vi.fn(async (
+          _jobId: string,
+          lastRunAt: Date,
+          nextRunAt: Date | null,
+        ) => {
+          timestampUpdates.push({ lastRunAt, nextRunAt });
+        }),
       } as never,
       workerManager: { isRunning: () => true, call } as never,
       maxCompaniesPerJobTick: 2,
@@ -97,11 +104,14 @@ describe("company-scoped plugin job routing", () => {
     expect(createRun.mock.calls.map(([input]) => input.companyId))
       .toEqual(["company-1", "company-2"]);
     expect(cursorUpdates).toEqual(["company-2"]);
+    expect(timestampUpdates[0]?.nextRunAt).toEqual(timestampUpdates[0]?.lastRunAt);
 
     await scheduler.tick();
     expect(createRun.mock.calls.map(([input]) => input.companyId))
       .toEqual(["company-1", "company-2", "company-3", "company-4"]);
     expect(cursorUpdates).toEqual(["company-2", null]);
     expect(call).toHaveBeenCalledTimes(4);
+    expect(timestampUpdates[1]?.nextRunAt?.getTime())
+      .toBeGreaterThan(timestampUpdates[1]!.lastRunAt.getTime());
   });
 });
