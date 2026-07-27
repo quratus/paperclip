@@ -126,7 +126,7 @@ export function resolveJobCompanyBatches(
     companyIds.add(row.companyId);
     companiesByPlugin.set(row.pluginId, companyIds);
   }
-  return new Map(jobs.map((job) => {
+  return new Map<string, JobCompanyBatch>(jobs.map((job): [string, JobCompanyBatch] => {
     if (job.scope === "instance") {
       return [job.id, { companyIds: [null], nextCursor: null }];
     }
@@ -134,7 +134,7 @@ export function resolveJobCompanyBatches(
     const afterCursor = job.companyCursor
       ? companyIds.filter((companyId) => companyId > job.companyCursor!)
       : companyIds;
-    const candidates = afterCursor.length > 0 ? afterCursor : companyIds;
+    const candidates = job.companyCursor ? afterCursor : companyIds;
     const batch = candidates.slice(0, maxCompaniesPerJobTick);
     return [job.id, {
       companyIds: batch,

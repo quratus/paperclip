@@ -48,6 +48,20 @@ describe("company-scoped plugin job routing", () => {
     });
   });
 
+  it("ends a cycle instead of replaying earlier companies after config removal", () => {
+    const result = resolveJobCompanyBatches([{
+      id: "job",
+      pluginId: "plugin-a",
+      scope: "company",
+      companyCursor: "company-2",
+    }], [
+      { pluginId: "plugin-a", companyId: "company-1" },
+      { pluginId: "plugin-a", companyId: "company-2" },
+    ], 2);
+
+    expect(result.get("job")).toEqual({ companyIds: [], nextCursor: null });
+  });
+
   it("dispatches only the bounded batch per tick and persists its cursor", async () => {
     const job = {
       id: "job",
