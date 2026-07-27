@@ -843,6 +843,8 @@ export interface PluginJobRecord {
   schedule: string;
   /** Invocation scope; existing jobs default to instance-wide execution. */
   scope: "instance" | "company";
+  /** Opaque cursor used to bound company-scoped fan-out across ticks. */
+  companyCursor: string | null;
   /** Current job status. */
   status: "active" | "paused" | "failed";
   /** Last time the job was executed. */

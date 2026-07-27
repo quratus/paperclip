@@ -179,6 +179,7 @@ export function pluginJobStore(db: Db) {
           }
           if (existing.scope !== scope) {
             updates.scope = scope;
+            if (scope === "instance") updates.companyCursor = null;
           }
           if (existing.status === "paused") {
             updates.status = "active";

@@ -75,6 +75,8 @@ export interface PluginJobSchedulerOptions {
   jobTimeoutMs?: number;
   /** Maximum number of concurrent job executions (default: 10). */
   maxConcurrentJobs?: number;
+  /** Maximum company runs dispatched for one job in a tick (default: 50). */
+  maxCompaniesPerJobTick?: number;
 }
 
 /**
@@ -103,20 +105,42 @@ export interface SchedulerDiagnostics {
   lastTickAt: string | null;
 }
 
-export function resolveJobCompanyIds(
-  jobs: Array<{ id: string; pluginId: string; scope: "instance" | "company" }>,
+export interface JobCompanyBatch {
+  companyIds: Array<string | null>;
+  nextCursor: string | null;
+}
+
+export function resolveJobCompanyBatches(
+  jobs: Array<{
+    id: string;
+    pluginId: string;
+    scope: "instance" | "company";
+    companyCursor: string | null;
+  }>,
   configRows: Array<{ pluginId: string; companyId: string }>,
-): Map<string, Array<string | null>> {
-  const companiesByPlugin = new Map<string, string[]>();
+  maxCompaniesPerJobTick: number,
+): Map<string, JobCompanyBatch> {
+  const companiesByPlugin = new Map<string, Set<string>>();
   for (const row of configRows) {
-    const companyIds = companiesByPlugin.get(row.pluginId) ?? [];
-    companyIds.push(row.companyId);
+    const companyIds = companiesByPlugin.get(row.pluginId) ?? new Set<string>();
+    companyIds.add(row.companyId);
     companiesByPlugin.set(row.pluginId, companyIds);
   }
-  return new Map(jobs.map((job) => [
-    job.id,
-    job.scope === "company" ? companiesByPlugin.get(job.pluginId) ?? [] : [null],
-  ]));
+  return new Map(jobs.map((job) => {
+    if (job.scope === "instance") {
+      return [job.id, { companyIds: [null], nextCursor: null }];
+    }
+    const companyIds = [...(companiesByPlugin.get(job.pluginId) ?? [])].sort();
+    const afterCursor = job.companyCursor
+      ? companyIds.filter((companyId) => companyId > job.companyCursor!)
+      : companyIds;
+    const candidates = afterCursor.length > 0 ? afterCursor : companyIds;
+    const batch = candidates.slice(0, maxCompaniesPerJobTick);
+    return [job.id, {
+      companyIds: batch,
+      nextCursor: candidates.length > batch.length ? batch.at(-1) ?? null : null,
+    }];
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +250,9 @@ export function createPluginJobScheduler(
     tickIntervalMs = DEFAULT_TICK_INTERVAL_MS,
     jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
     maxConcurrentJobs = DEFAULT_MAX_CONCURRENT_JOBS,
+    maxCompaniesPerJobTick = 50,
   } = options;
+  const companyBatchLimit = Math.max(1, Math.floor(maxCompaniesPerJobTick));
 
   const log = logger.child({ service: "plugin-job-scheduler" });
 
@@ -299,7 +325,11 @@ export function createPluginJobScheduler(
         .select({ pluginId: pluginConfig.pluginId, companyId: pluginConfig.companyId })
         .from(pluginConfig)
         .where(inArray(pluginConfig.pluginId, companyPluginIds));
-      const companyIdsByJob = resolveJobCompanyIds(dueJobs, companyRows);
+      const companyBatches = resolveJobCompanyBatches(
+        dueJobs,
+        companyRows,
+        companyBatchLimit,
+      );
 
       // Dispatch each due job (respecting concurrency limits)
       const dispatches: Promise<void>[] = [];
@@ -341,7 +371,10 @@ export function createPluginJobScheduler(
           continue;
         }
 
-        dispatches.push(dispatchJob(job, companyIdsByJob.get(job.id) ?? []));
+        dispatches.push(dispatchJob(
+          job,
+          companyBatches.get(job.id) ?? { companyIds: [], nextCursor: null },
+        ));
       }
 
       if (dispatches.length > 0) {
@@ -367,7 +400,7 @@ export function createPluginJobScheduler(
    */
   async function dispatchJob(
     job: typeof pluginJobs.$inferSelect,
-    companyIds: Array<string | null>,
+    batch: JobCompanyBatch,
   ): Promise<void> {
     const { id: jobId, pluginId, jobKey } = job;
     const jobLog = log.child({ jobId, pluginId, jobKey });
@@ -376,12 +409,17 @@ export function createPluginJobScheduler(
     activeJobs.add(jobId);
 
     try {
-      for (const companyId of companyIds) {
+      for (const companyId of batch.companyIds) {
         await executeJobRun(job, companyId);
       }
     } finally {
       activeJobs.delete(jobId);
       try {
+        if (job.scope === "company") {
+          await db.update(pluginJobs)
+            .set({ companyCursor: batch.nextCursor })
+            .where(eq(pluginJobs.id, jobId));
+        }
         await advanceSchedulePointer(job);
       } catch (err) {
         jobLog.error(

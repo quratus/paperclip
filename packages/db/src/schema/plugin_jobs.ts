@@ -42,6 +42,8 @@ export const pluginJobs = pgTable(
     schedule: text("schedule").notNull(),
     /** Invocation scope; company jobs fan out across configured companies. */
     scope: text("scope").$type<"instance" | "company">().notNull().default("instance"),
+    /** Last company dispatched by a bounded company-scoped scheduler batch. */
+    companyCursor: text("company_cursor"),
     /** Current scheduling state. */
     status: text("status").$type<PluginJobStatus>().notNull().default("active"),
     /** Timestamp of the most recent successful execution. */

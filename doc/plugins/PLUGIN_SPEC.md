@@ -976,6 +976,7 @@ Job rules:
 7. Job declarations default to `scope: "instance"`. A `scope: "company"` job runs once per configured plugin/company row and receives `companyId` in `PluginJobContext`.
 8. Company-scoped job runs persist `company_id`, and the host uses that company as the invocation scope for config, secret-ref, state, and other tenant-gated calls.
 9. Company-scoped scheduled runs are sequential per job and share the existing overlap guard; an unconfigured company produces no run.
+10. The scheduler bounds company runs per job/tick and persists a deterministic cursor so remaining companies resume on later ticks instead of creating an unbounded burst.
 
 ## 18. Webhooks
 
