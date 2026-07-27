@@ -66,7 +66,9 @@ describe("company-scoped plugin job routing", () => {
     const db = {
       select: vi.fn(() => ({
         from: vi.fn(() => ({
-          where: vi.fn(async () => selectCount++ % 2 === 0 ? [job] : rows),
+          where: vi.fn(async () => selectCount++ % 2 === 0
+            ? (job.nextRunAt.getTime() <= Date.now() ? [job] : [])
+            : rows),
         })),
       })),
       update: vi.fn(() => ({
@@ -93,6 +95,7 @@ describe("company-scoped plugin job routing", () => {
           lastRunAt: Date,
           nextRunAt: Date | null,
         ) => {
+          job.nextRunAt = nextRunAt ?? new Date(Number.MAX_SAFE_INTEGER);
           timestampUpdates.push({ lastRunAt, nextRunAt });
         }),
       } as never,
@@ -113,5 +116,8 @@ describe("company-scoped plugin job routing", () => {
     expect(call).toHaveBeenCalledTimes(4);
     expect(timestampUpdates[1]?.nextRunAt?.getTime())
       .toBeGreaterThan(timestampUpdates[1]!.lastRunAt.getTime());
+
+    await scheduler.tick();
+    expect(call).toHaveBeenCalledTimes(4);
   });
 });
