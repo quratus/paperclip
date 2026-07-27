@@ -43,11 +43,29 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
-const mockDb = vi.hoisted(() => ({
-  select: mockDbSelect,
-}));
+const mockDb = vi.hoisted(() => {
+  const db = {
+    select: mockDbSelect,
+    transaction: vi.fn(),
+  };
+  db.transaction.mockImplementation(async (callback) => callback(db));
+  return db;
+});
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockRedirectIssueAdmission = vi.hoisted(() => vi.fn(async (_db, input) => ({
+  kind: "redirected" as const,
+  disposition: input.disposition,
+  issue: {
+    id: input.issueId,
+    companyId: input.companyId,
+    status: "backlog",
+    assigneeAgentId: "44444444-4444-4444-8444-444444444444",
+  },
+  ownerAgentId: "44444444-4444-4444-8444-444444444444",
+  recoveryActionId: "55555555-5555-4555-8555-555555555555",
+  wakeIdempotencyKey: "issue_admission_redirect:test",
+})));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
@@ -57,6 +75,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/issue-admission-redirect.js", () => ({
+    handBackCompletedAdmissionRedirectInTransaction: vi.fn(async () => null),
+    redirectIssueAdmission: mockRedirectIssueAdmission,
+  }));
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
@@ -262,7 +284,7 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("rejects backlog to todo admission without a Product Truth Contract", async () => {
+  it("redirects backlog to todo admission without a Product Truth Contract", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -290,14 +312,66 @@ describe("issue execution policy routes", () => {
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "todo" });
 
-    expect(res.status).toBe(422);
-    expect(res.body.error).toContain("Issue Refinery");
-    expect(res.body.details).toMatchObject({
+    expect(res.status).toBe(202);
+    expect(res.body.disposition).toMatchObject({
       code: "missing_product_truth_contract",
       source: "status_transition",
-      refinery: "Issue Refinery",
     });
-    expect(res.body.details.missing).toContain("## Product Truth Contract");
+    expect(res.body.disposition.missing).toContain("## Product Truth Contract");
+    expect(mockRedirectIssueAdmission).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        issueId: issue.id,
+        deniedAgentId: "33333333-3333-4333-8333-333333333333",
+        returnOwnerAgentId: "33333333-3333-4333-8333-333333333333",
+        expectedStatuses: ["backlog"],
+      }),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("redirects responsibility when an agent assigns unrefined product work", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1109",
+      title: "Unrefined reassignment",
+      description: "Build the product surface.",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ assigneeAgentId: "66666666-6666-4666-8666-666666666666" });
+
+    expect(res.status).toBe(202);
+    expect(res.body.disposition).toMatchObject({
+      code: "missing_product_truth_contract",
+      source: "assignment",
+    });
+    expect(mockRedirectIssueAdmission).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        issueId: issue.id,
+        deniedAgentId: "66666666-6666-4666-8666-666666666666",
+        returnOwnerAgentId: "66666666-6666-4666-8666-666666666666",
+        expectedStatuses: ["todo"],
+      }),
+    );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -367,7 +441,7 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  it("rejects checkout without taxonomy, contract, and review chain", async () => {
+  it("redirects checkout without taxonomy, contract, and review chain", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -397,17 +471,29 @@ describe("issue execution policy routes", () => {
         expectedStatuses: ["todo"],
       });
 
-    expect(res.status).toBe(422);
-    expect(res.body.error).toContain("Issue Refinery");
-    expect(res.body.details).toMatchObject({
-      code: "missing_product_truth_contract",
-      source: "checkout",
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({
+      kind: "redirected",
+      ownerAgentId: "44444444-4444-4444-8444-444444444444",
+      disposition: {
+        code: "missing_product_truth_contract",
+        source: "checkout",
+        requiredResponsibility: "issue_refinement",
+        routingPolicy: "manager_chain_v1",
+      },
     });
-    expect(res.body.details.missing).toEqual([
+    expect(res.body.disposition.missing).toEqual([
       "executionPolicy.workClass",
       "## Product Truth Contract",
       "executionPolicy.stages",
     ]);
+    expect(mockRedirectIssueAdmission).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        issueId: issue.id,
+        deniedAgentId: issue.assigneeAgentId,
+      }),
+    );
     expect(mockIssueService.checkout).not.toHaveBeenCalled();
   });
 
@@ -604,6 +690,7 @@ describe("issue execution policy routes", () => {
           }),
         }),
       }),
+      mockDb,
     );
   });
 
@@ -657,6 +744,7 @@ describe("issue execution policy routes", () => {
         status: "in_review",
         monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
       }),
+      mockDb,
     );
   });
 
@@ -730,6 +818,7 @@ describe("issue execution policy routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockDb,
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.status).toBeUndefined();

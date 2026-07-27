@@ -195,6 +195,14 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import {
+  evaluateIssueAdmission,
+  hasProductTruthContract,
+} from "../services/issue-admission.js";
+import {
+  handBackCompletedAdmissionRedirectInTransaction,
+  redirectIssueAdmission,
+} from "../services/issue-admission-redirect.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -3332,10 +3340,6 @@ export function issueRoutes(
     });
   }
 
-  function hasProductTruthContract(description: string | null | undefined) {
-    return /^##[ \t]+Product Truth Contract[ \t]*$/im.test(description ?? "");
-  }
-
   function inheritProductTruthContract(parentDescription: string | null | undefined, childDescription: string | null | undefined) {
     const child = childDescription?.trim() ?? "";
     if (hasProductTruthContract(child)) return child || null;
@@ -3346,55 +3350,6 @@ export function issueRoutes(
     if (!contract) return child || null;
 
     return child ? `${child}\n\n${contract}` : contract;
-  }
-
-  function assertIssueAdmissionContract(input: {
-    issue: {
-      id: string;
-      description?: string | null;
-      executionPolicy?: unknown;
-    };
-    nextDescription?: string | null;
-    nextExecutionPolicy?: unknown;
-    source: "status_transition" | "checkout" | "assignment";
-    actorType?: string;
-  }) {
-    // Board/founder-authenticated requests are the one-way-door override for the
-    // Issue Refinery admission contract (Julius directive, 2026-07-22): the gate
-    // exists to keep agent-authored product work disciplined, not to lock the
-    // board out of its own backlog. Agents (including Charles running as an
-    // agent) still need either the still-backlog refinement path above or a
-    // real contract to reach todo. Matches the board exemption pattern used
-    // elsewhere in this file (see assertCanManageIssueMonitor above).
-    if (input.actorType === "board") return;
-
-    const policy = normalizeIssueExecutionPolicy(
-      input.nextExecutionPolicy === undefined ? input.issue.executionPolicy ?? null : input.nextExecutionPolicy,
-    );
-    const workClass = policy?.workClass ?? null;
-    if (workClass === "docs_ops") return;
-
-    const hasContract = hasProductTruthContract(
-      input.nextDescription === undefined ? input.issue.description ?? null : input.nextDescription,
-    );
-    const hasReviewChain = Boolean(policy?.stages?.length);
-    if (hasContract && hasReviewChain) return;
-
-    throw unprocessable(
-      "Product admission rejected: run this issue through the Issue Refinery before build. Product-class issues need a ## Product Truth Contract section and an executionPolicy review chain; docs_ops is the only exempt workClass.",
-      {
-        code: "missing_product_truth_contract",
-        source: input.source,
-        issueId: input.issue.id,
-        refinery: "Issue Refinery",
-        missing: [
-          ...(!workClass ? ["executionPolicy.workClass"] : []),
-          ...(!hasContract ? ["## Product Truth Contract"] : []),
-          ...(!hasReviewChain ? ["executionPolicy.stages"] : []),
-        ],
-        validWorkClasses: ["product_ui", "backend", "security", "docs_ops"],
-      },
-    );
   }
 
   async function logExpiredRequestConfirmations(input: {
@@ -8182,10 +8137,14 @@ export function issueRoutes(
       typeof normalizedAssigneeAgentId === "string" &&
       normalizedAssigneeAgentId !== existing.assigneeAgentId &&
       resultingStatus !== "backlog";
+    let admissionRedirectDisposition: Extract<
+      ReturnType<typeof evaluateIssueAdmission>,
+      { kind: "redirect" }
+    > | null = null;
     const isWatchdogScopedMutation =
       req.actor.type === "agent" && (await resolveTaskWatchdogMutationScope(db, req.actor)).kind !== "none";
     if (admissionStatusTransitionRequested) {
-      assertIssueAdmissionContract({
+      const disposition = evaluateIssueAdmission({
         issue: existing,
         nextDescription: updateFields.description === undefined
           ? undefined
@@ -8194,6 +8153,7 @@ export function issueRoutes(
         source: "status_transition",
         actorType: req.actor.type,
       });
+      if (disposition.kind === "redirect") admissionRedirectDisposition = disposition;
     }
 
     const transition = applyIssueExecutionPolicyTransition({
@@ -8284,7 +8244,7 @@ export function issueRoutes(
       }
     }
     if (admissionAssignmentRequested && !isWatchdogScopedMutation) {
-      assertIssueAdmissionContract({
+      const disposition = evaluateIssueAdmission({
         issue: existing,
         nextDescription: updateFields.description === undefined
           ? undefined
@@ -8293,8 +8253,81 @@ export function issueRoutes(
         source: "assignment",
         actorType: req.actor.type,
       });
+      if (disposition.kind === "redirect") admissionRedirectDisposition = disposition;
     }
 
+    if (admissionRedirectDisposition) {
+      const deniedAgentId =
+        admissionAssignmentRequested && typeof normalizedAssigneeAgentId === "string"
+          ? normalizedAssigneeAgentId
+          : actor.agentId ?? existing.assigneeAgentId;
+      const redirect = await redirectIssueAdmission(db, {
+        companyId: existing.companyId,
+        issueId: existing.id,
+        deniedAgentId,
+        returnOwnerAgentId: deniedAgentId ?? null,
+        disposition: admissionRedirectDisposition,
+        nextDescription: updateFields.description === undefined
+          ? undefined
+          : updateFields.description as string | null,
+        nextExecutionPolicy: updateFields.executionPolicy,
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+        checkoutRunId: actor.runId,
+        expectedStatuses: [existing.status],
+      });
+      if (redirect.kind === "retry") {
+        res.status(409).json(redirect);
+        return;
+      }
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.admission_redirected",
+        entityType: "issue",
+        entityId: existing.id,
+        details: redirect,
+      });
+      const wakeRun = redirect.kind === "redirected"
+        ? await heartbeat.wakeup(redirect.ownerAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_admission_redirect",
+            payload: {
+              issueId: existing.id,
+              recoveryActionId: redirect.recoveryActionId,
+              disposition: redirect.disposition,
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            idempotencyKey: redirect.wakeIdempotencyKey,
+            contextSnapshot: {
+              issueId: existing.id,
+              taskId: existing.id,
+              source: "issue_admission_redirect",
+              recoveryActionId: redirect.recoveryActionId,
+            },
+          })
+        : null;
+      res.status(202).json({
+        ...redirect,
+        wake: {
+          state: wakeRun ? "queued_or_running" : "deferred_or_suppressed",
+          runId: wakeRun?.id ?? null,
+        },
+      });
+      return;
+    }
+
+    const shouldAttemptAdmissionHandoff =
+      req.body.description !== undefined || req.body.executionPolicy !== undefined;
+    let admissionHandoff: Awaited<ReturnType<
+      typeof handBackCompletedAdmissionRedirectInTransaction
+    >> | undefined;
     let issue;
     try {
       if (transition.decision && decisionId) {
@@ -8325,15 +8358,46 @@ export function issueRoutes(
             createdByRunId: actor.runId ?? null,
           });
 
-          return updated;
+          if (shouldAttemptAdmissionHandoff) {
+            admissionHandoff = await handBackCompletedAdmissionRedirectInTransaction(tx, {
+              companyId: updated.companyId,
+              issueId: updated.id,
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              requestedByAgentId: actor.agentId,
+              actorRunId: actor.runId,
+            });
+          }
+          return admissionHandoff?.issue ?? updated;
         });
       } else {
-        issue = await svc.update(id, {
-          ...updateFields,
-          actorAgentId: actor.agentId ?? null,
-          actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          expectedUpdatedAt: expectedUpdatedAtRaw ? new Date(expectedUpdatedAtRaw) : undefined,
-        });
+        if (shouldAttemptAdmissionHandoff) {
+          issue = await db.transaction(async (tx) => {
+            const updated = await svc.update(id, {
+              ...updateFields,
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              expectedUpdatedAt: expectedUpdatedAtRaw ? new Date(expectedUpdatedAtRaw) : undefined,
+            }, tx);
+            if (!updated) return null;
+            admissionHandoff = await handBackCompletedAdmissionRedirectInTransaction(tx, {
+              companyId: updated.companyId,
+              issueId: updated.id,
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              requestedByAgentId: actor.agentId,
+              actorRunId: actor.runId,
+            });
+            return admissionHandoff?.issue ?? updated;
+          });
+        } else {
+          issue = await svc.update(id, {
+            ...updateFields,
+            actorAgentId: actor.agentId ?? null,
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            expectedUpdatedAt: expectedUpdatedAtRaw ? new Date(expectedUpdatedAtRaw) : undefined,
+          });
+        }
       }
     } catch (err) {
       if (err instanceof HttpError && err.status === 422) {
@@ -8361,6 +8425,39 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    if (admissionHandoff) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.admission_handed_back",
+        entityType: "issue",
+        entityId: issue.id,
+        details: admissionHandoff,
+      });
+      await heartbeat.wakeup(admissionHandoff.returnOwnerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_admission_completed",
+        payload: {
+          issueId: issue.id,
+          recoveryActionId: admissionHandoff.recoveryActionId,
+        },
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+        idempotencyKey: admissionHandoff.wakeIdempotencyKey,
+        contextSnapshot: {
+          issueId: issue.id,
+          taskId: issue.id,
+          source: "issue_admission_completed",
+          recoveryActionId: admissionHandoff.recoveryActionId,
+        },
+      });
     }
 
     if (cancelledStatusRunId) {
@@ -9418,14 +9515,6 @@ export function issueRoutes(
       });
     }
 
-    // Checking out a still-backlog issue is the refinement pickup itself (e.g. Charles
-    // checking it out to add the Product Truth Contract) — don't demand the contract
-    // already exist to start that work. The real admission gate is the backlog->todo
-    // status transition and cross-status reassignment, both enforced in PATCH above.
-    if (issue.status !== "backlog") {
-      assertIssueAdmissionContract({ issue, source: "checkout", actorType: req.actor.type });
-    }
-
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
@@ -9434,6 +9523,77 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
+
+    // Checking out a still-backlog issue is the refinement pickup itself (e.g. Charles
+    // checking it out to add the Product Truth Contract) — don't demand the contract
+    // already exist to start that work. The real admission gate is the backlog->todo
+    // status transition and cross-status reassignment, both enforced in PATCH above.
+    if (issue.status !== "backlog") {
+      const disposition = evaluateIssueAdmission({
+        issue,
+        source: "checkout",
+        actorType: req.actor.type,
+      });
+      if (disposition.kind === "redirect") {
+        const actor = getActorInfo(req);
+        const redirect = await redirectIssueAdmission(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          deniedAgentId: req.body.agentId,
+          disposition,
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          checkoutRunId,
+          expectedStatuses: req.body.expectedStatuses,
+        });
+        if (redirect.kind === "retry") {
+          res.status(409).json(redirect);
+          return;
+        }
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.admission_redirected",
+          entityType: "issue",
+          entityId: issue.id,
+          details: redirect,
+        });
+        const wakeRun = redirect.kind === "redirected"
+          ? await heartbeat.wakeup(redirect.ownerAgentId, {
+              source: "assignment",
+              triggerDetail: "system",
+              reason: "issue_admission_redirect",
+              payload: {
+                issueId: issue.id,
+                recoveryActionId: redirect.recoveryActionId,
+                disposition: redirect.disposition,
+              },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              idempotencyKey: redirect.wakeIdempotencyKey,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                source: "issue_admission_redirect",
+                recoveryActionId: redirect.recoveryActionId,
+              },
+            })
+          : null;
+        res.status(202).json({
+          ...redirect,
+          wake: {
+            state: wakeRun ? "queued_or_running" : "deferred_or_suppressed",
+            runId: wakeRun?.id ?? null,
+          },
+        });
+        return;
+      }
+    }
+
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     const actor = getActorInfo(req);
     if (updated?.harnessKind === "skill_test") {
