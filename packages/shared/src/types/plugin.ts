@@ -82,6 +82,8 @@ export interface PluginJobDeclaration {
   description?: string;
   /** Cron expression for the schedule (e.g. "star/15 star star star star" or "0 * * * *"). */
   schedule?: string;
+  /** Invocation scope. Company jobs run once per configured company. */
+  scope?: "instance" | "company";
 }
 
 /**
@@ -839,6 +841,8 @@ export interface PluginJobRecord {
   jobKey: string;
   /** Cron expression for the schedule. */
   schedule: string;
+  /** Invocation scope; existing jobs default to instance-wide execution. */
+  scope: "instance" | "company";
   /** Current job status. */
   status: "active" | "paused" | "failed";
   /** Last time the job was executed. */
@@ -865,6 +869,8 @@ export interface PluginJobRunRecord {
   jobId: string;
   /** FK to `plugins.id`. */
   pluginId: string;
+  /** Company invocation scope; null for instance-wide runs. */
+  companyId: string | null;
   /** What triggered this run. */
   trigger: "schedule" | "manual" | "retry";
   /** Current run status. */

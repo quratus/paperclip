@@ -528,6 +528,11 @@ export function createPluginWorkerHandle(
       return companyId ? { companyId } : null;
     }
 
+    if (method === "runJob" && isRecord(params.job)) {
+      const companyId = readNonEmptyString(params.job.companyId);
+      return companyId ? { companyId } : null;
+    }
+
     return null;
   }
 

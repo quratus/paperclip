@@ -9,7 +9,9 @@ function send(message) {
 
 function sendNestedHostRequest(originalRequest, invocationId) {
   const nestedId = `nested-${nextRequestId++}`;
-  const params = originalRequest.params?.params ?? {};
+  const params = originalRequest.method === "runJob"
+    ? originalRequest.params?.job ?? {}
+    : originalRequest.params?.params ?? {};
   const mode = params.mode;
   const requestedCompanyId = params.requestedCompanyId;
   const hostMethod = params.hostMethod || "companies.get";
@@ -79,13 +81,13 @@ rl.on("line", (line) => {
       id: message.id,
       result: {
         ok: true,
-        supportedMethods: ["getData", "performAction"],
+        supportedMethods: ["getData", "performAction", "runJob"],
       },
     });
     return;
   }
 
-  if (method === "getData" || method === "performAction") {
+  if (method === "getData" || method === "performAction" || method === "runJob") {
     sendNestedHostRequest(message, message.paperclipInvocation?.id);
     return;
   }

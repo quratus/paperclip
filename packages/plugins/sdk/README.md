@@ -141,7 +141,7 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 Plugins can declare **scheduled jobs** that the host runs on a cron schedule. Use this for recurring tasks like syncs, digest reports, or cleanup.
 
 1. **Capability:** Add `jobs.schedule` to `manifest.capabilities`.
-2. **Declare jobs** in `manifest.jobs`: each entry has `jobKey`, `displayName`, optional `description`, and `schedule` (a 5-field cron expression).
+2. **Declare jobs** in `manifest.jobs`: each entry has `jobKey`, `displayName`, optional `description`, `schedule` (a 5-field cron expression), and optional `scope` (`instance` by default or `company`).
 3. **Register a handler** in `setup()` with `ctx.jobs.register(jobKey, async (job) => { ... })`.
 
 **Cron format** (5 fields: minute, hour, day-of-month, month, day-of-week):
@@ -164,8 +164,9 @@ Examples: `"0 * * * *"` = every hour at minute 0; `"*/5 * * * *"` = every 5 minu
 | `runId`     | string   | UUID for this run. |
 | `trigger`   | `"schedule" \| "manual" \| "retry"` | What caused this run. |
 | `scheduledAt` | string | ISO 8601 time when the run was scheduled. |
+| `companyId` | string? | Present only for a `scope: "company"` run. |
 
-Runs can be triggered by the **schedule**, **manually** from the UI/API, or as a **retry** (when an operator re-runs a job after a failure). Re-throw from the handler to mark the run as failed; the host records the failure. The host does not automatically retry—operators can trigger another run manually from the UI or API.
+An instance job runs once per tick. A company job runs once for each company that has a config row for the plugin, and the host enforces that company as the worker invocation scope. Manual/retry triggers currently apply to instance jobs. Re-throw from the handler to mark the run as failed; the host records the failure.
 
 Example:
 

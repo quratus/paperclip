@@ -34,9 +34,9 @@
  * @see ./cron.ts — Cron parsing utilities
  */
 
-import { and, eq, lte, or } from "drizzle-orm";
+import { and, eq, inArray, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import { pluginConfig, pluginJobs, pluginJobRuns } from "@paperclipai/db";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
@@ -101,6 +101,22 @@ export interface SchedulerDiagnostics {
   tickCount: number;
   /** Timestamp of the last tick (ISO 8601). */
   lastTickAt: string | null;
+}
+
+export function resolveJobCompanyIds(
+  jobs: Array<{ id: string; pluginId: string; scope: "instance" | "company" }>,
+  configRows: Array<{ pluginId: string; companyId: string }>,
+): Map<string, Array<string | null>> {
+  const companiesByPlugin = new Map<string, string[]>();
+  for (const row of configRows) {
+    const companyIds = companiesByPlugin.get(row.pluginId) ?? [];
+    companyIds.push(row.companyId);
+    companiesByPlugin.set(row.pluginId, companyIds);
+  }
+  return new Map(jobs.map((job) => [
+    job.id,
+    job.scope === "company" ? companiesByPlugin.get(job.pluginId) ?? [] : [null],
+  ]));
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +292,15 @@ export function createPluginJobScheduler(
 
       log.debug({ count: dueJobs.length }, "found due jobs");
 
+      const companyPluginIds = [...new Set(
+        dueJobs.filter((job) => job.scope === "company").map((job) => job.pluginId),
+      )];
+      const companyRows = companyPluginIds.length === 0 ? [] : await db
+        .select({ pluginId: pluginConfig.pluginId, companyId: pluginConfig.companyId })
+        .from(pluginConfig)
+        .where(inArray(pluginConfig.pluginId, companyPluginIds));
+      const companyIdsByJob = resolveJobCompanyIds(dueJobs, companyRows);
+
       // Dispatch each due job (respecting concurrency limits)
       const dispatches: Promise<void>[] = [];
 
@@ -316,7 +341,7 @@ export function createPluginJobScheduler(
           continue;
         }
 
-        dispatches.push(dispatchJob(job));
+        dispatches.push(dispatchJob(job, companyIdsByJob.get(job.id) ?? []));
       }
 
       if (dispatches.length > 0) {
@@ -342,21 +367,45 @@ export function createPluginJobScheduler(
    */
   async function dispatchJob(
     job: typeof pluginJobs.$inferSelect,
+    companyIds: Array<string | null>,
   ): Promise<void> {
-    const { id: jobId, pluginId, jobKey, schedule } = job;
+    const { id: jobId, pluginId, jobKey } = job;
     const jobLog = log.child({ jobId, pluginId, jobKey });
 
     // Mark as active (overlap prevention)
     activeJobs.add(jobId);
 
+    try {
+      for (const companyId of companyIds) {
+        await executeJobRun(job, companyId);
+      }
+    } finally {
+      activeJobs.delete(jobId);
+      try {
+        await advanceSchedulePointer(job);
+      } catch (err) {
+        jobLog.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          "failed to advance schedule pointer",
+        );
+      }
+    }
+  }
+
+  async function executeJobRun(
+    job: typeof pluginJobs.$inferSelect,
+    companyId: string | null,
+  ): Promise<void> {
+    const { id: jobId, pluginId, jobKey } = job;
+    const jobLog = log.child({ jobId, pluginId, jobKey, companyId });
     let runId: string | undefined;
     const startedAt = Date.now();
-
     try {
       // 1. Create run record
       const run = await jobStore.createRun({
         jobId,
         pluginId,
+        companyId,
         trigger: "schedule",
       });
       runId = run.id;
@@ -376,6 +425,7 @@ export function createPluginJobScheduler(
             runId,
             trigger: "schedule" as const,
             scheduledAt: (job.nextRunAt ?? new Date()).toISOString(),
+            ...(companyId ? { companyId } : {}),
           },
         },
         jobTimeoutMs,
@@ -416,19 +466,6 @@ export function createPluginJobScheduler(
           );
         }
       }
-    } finally {
-      // Remove from active set
-      activeJobs.delete(jobId);
-
-      // 5. Always advance the schedule pointer (even on failure)
-      try {
-        await advanceSchedulePointer(job);
-      } catch (err) {
-        jobLog.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          "failed to advance schedule pointer",
-        );
-      }
     }
   }
 
@@ -449,6 +486,9 @@ export function createPluginJobScheduler(
       throw new Error(
         `Job "${job.jobKey}" is not active (status: ${job.status})`,
       );
+    }
+    if (job.scope === "company") {
+      throw new Error(`Company-scoped job "${job.jobKey}" must run on its schedule`);
     }
 
     // Overlap prevention

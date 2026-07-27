@@ -1254,6 +1254,27 @@
       "when": 1784970000000,
       "tag": "0180_issue_blocked_by_approval",
       "breakpoints": true
+    },
+    {
+      "idx": 182,
+      "version": "7",
+      "when": 1784241829832,
+      "tag": "0182_external_issue_source_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 183,
+      "version": "7",
+      "when": 1784386000000,
+      "tag": "0183_routine_evolution",
+      "breakpoints": true
+    },
+    {
+      "idx": 184,
+      "version": "7",
+      "when": 1785112200000,
+      "tag": "0184_plugin_jobs_company_scope",
+      "breakpoints": true
     }
   ]
 }
