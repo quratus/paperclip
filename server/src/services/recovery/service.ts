@@ -74,6 +74,8 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { evaluateIssueAdmission } from "../issue-admission.js";
+import { handBackCompletedAdmissionRedirect } from "../issue-admission-redirect.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -87,6 +89,17 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const ADMISSION_WAKE_RETRY_COOLDOWN_MS = 60_000;
+const ADMISSION_WAKE_LIVE_STATUSES = new Set([
+  "queued",
+  "deferred_issue_execution",
+  "claimed",
+]);
+const ADMISSION_WAKE_IMPLEMENTATION_ACCEPTED_STATUSES = new Set([
+  ...ADMISSION_WAKE_LIVE_STATUSES,
+  "coalesced",
+  "completed",
+]);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -1081,6 +1094,224 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       projectId: issue.projectId,
     });
     return Boolean(budgetBlock);
+  }
+
+  async function reconcileAdmissionRedirectWakes(opts?: { now?: Date }) {
+    const now = opts?.now ?? new Date();
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.kind, "admission_redirect"),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+    const result = {
+      checked: actions.length,
+      delivered: 0,
+      retried: 0,
+      pendingCooldown: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+
+    for (const action of actions) {
+      const policy = parseObject(action.wakePolicy);
+      const phase = readNonEmptyString(policy.phase);
+      const agentId = readNonEmptyString(policy.agentId);
+      const idempotencyKey = readNonEmptyString(policy.idempotencyKey);
+      if (
+        policy.mode !== "canonical" ||
+        (phase !== "refinement" && phase !== "implementation") ||
+        !agentId ||
+        !idempotencyKey
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const wake = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, action.companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ))
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      let refinementWakeIsLive =
+        Boolean(wake && ADMISSION_WAKE_LIVE_STATUSES.has(wake.status));
+      if (phase === "refinement" && wake?.status === "coalesced" && wake.runId) {
+        refinementWakeIsLive = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, wake.runId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          ))
+          .limit(1)
+          .then((rows) => rows.length > 0);
+      }
+      const wakeIsAccepted = phase === "refinement"
+        ? refinementWakeIsLive
+        : Boolean(wake && ADMISSION_WAKE_IMPLEMENTATION_ACCEPTED_STATUSES.has(wake.status));
+      if (wakeIsAccepted) {
+        result.delivered += 1;
+        result.issueIds.push(action.sourceIssueId);
+        if (phase === "implementation" && action.status !== "resolved") {
+          await db
+            .update(issueRecoveryActions)
+            .set({
+              status: "resolved",
+              outcome: "handed_back",
+              resolutionNote: "Admission contract completed; implementation ownership restored and canonical wake recorded.",
+              resolvedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(issueRecoveryActions.id, action.id));
+        }
+        continue;
+      }
+
+      if (
+        phase === "refinement" &&
+        wake &&
+        ["completed", "coalesced"].includes(wake.status)
+      ) {
+        const issue = await db
+          .select()
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, action.companyId),
+            eq(issues.id, action.sourceIssueId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (
+          issue &&
+          evaluateIssueAdmission({
+            issue,
+            source: "assignment",
+            actorType: "agent",
+          }).kind === "allow"
+        ) {
+          const handoff = await handBackCompletedAdmissionRedirect(db, {
+            companyId: action.companyId,
+            issueId: action.sourceIssueId,
+            requestedByActorType: "system",
+            requestedByActorId: "recovery.admission_redirect_wake",
+            requestedByAgentId: action.ownerAgentId,
+            actorRunId: wake.runId,
+          });
+          if (handoff) {
+            await deps.enqueueWakeup(handoff.returnOwnerAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_admission_completed",
+              payload: {
+                issueId: action.sourceIssueId,
+                recoveryActionId: action.id,
+              },
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              idempotencyKey: handoff.wakeIdempotencyKey,
+              contextSnapshot: {
+                issueId: action.sourceIssueId,
+                taskId: action.sourceIssueId,
+                source: "recovery.admission_redirect_handoff",
+                recoveryActionId: action.id,
+              },
+            });
+            result.delivered += 1;
+            result.issueIds.push(action.sourceIssueId);
+            continue;
+          }
+        }
+      }
+
+      const lastAttemptAt = action.lastAttemptAt?.getTime() ?? 0;
+      if (now.getTime() - lastAttemptAt < ADMISSION_WAKE_RETRY_COOLDOWN_MS) {
+        result.pendingCooldown += 1;
+        continue;
+      }
+
+      const maxAttempts = Math.max(1, Math.floor(asNumber(policy.maxAttempts, 3)));
+      if (action.attemptCount >= maxAttempts) {
+        if (action.status !== "escalated") {
+          await db
+            .update(issueRecoveryActions)
+            .set({
+              status: "escalated",
+              ownerType: "board",
+              ownerAgentId: null,
+              nextAction: `Restore canonical wake delivery for the ${phase} owner; ${action.attemptCount} attempts produced no runnable path.`,
+              resolutionNote: wake
+                ? `Latest canonical wake ended with status ${wake.status}.`
+                : "No canonical wake request was durably recorded.",
+              updatedAt: now,
+            })
+            .where(eq(issueRecoveryActions.id, action.id));
+        }
+        result.escalated += 1;
+        result.issueIds.push(action.sourceIssueId);
+        continue;
+      }
+
+      const nextAttempt = action.attemptCount + 1;
+      const retryIdempotencyKey = `${idempotencyKey}:retry:${nextAttempt}`;
+      const claimedRetry = await db
+        .update(issueRecoveryActions)
+        .set({
+          status: "active",
+          wakePolicy: {
+            ...policy,
+            idempotencyKey: retryIdempotencyKey,
+          },
+          attemptCount: nextAttempt,
+          lastAttemptAt: now,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueRecoveryActions.id, action.id),
+          eq(issueRecoveryActions.status, action.status),
+          eq(issueRecoveryActions.attemptCount, action.attemptCount),
+          sql`${issueRecoveryActions.wakePolicy} ->> 'idempotencyKey' = ${idempotencyKey}`,
+        ))
+        .returning({ id: issueRecoveryActions.id })
+        .then((rows) => rows[0] ?? null);
+      if (!claimedRetry) {
+        result.skipped += 1;
+        continue;
+      }
+      await deps.enqueueWakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: phase === "refinement"
+          ? "issue_admission_redirect"
+          : "issue_admission_completed",
+        payload: {
+          issueId: action.sourceIssueId,
+          recoveryActionId: action.id,
+          recoveryAttempt: nextAttempt,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        idempotencyKey: retryIdempotencyKey,
+        contextSnapshot: {
+          issueId: action.sourceIssueId,
+          taskId: action.sourceIssueId,
+          source: "recovery.admission_redirect_wake",
+          recoveryActionId: action.id,
+          recoveryAttempt: nextAttempt,
+        },
+      });
+      result.retried += 1;
+      result.issueIds.push(action.sourceIssueId);
+    }
+
+    result.issueIds = [...new Set(result.issueIds)];
+    return result;
   }
 
   async function reconcileUnassignedBlockingIssues() {
@@ -3167,6 +3398,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
+    // A typed admission redirect is already the runnable recovery path. The
+    // denied run may finish successfully after receiving HTTP 202, but that
+    // must not be reclassified as a missing disposition, reassigned to the
+    // denied implementer, or converted into a generic blocked issue.
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (activeRecoveryAction?.kind === "admission_redirect") {
+      return input.issue;
+    }
+
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -3484,6 +3727,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const admissionRedirectWakes = await reconcileAdmissionRedirectWakes();
     const candidates = await db
       .select()
       .from(issues)
@@ -3514,6 +3758,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
+      admissionRedirectWakes,
     };
 
     for (const issue of candidates) {
@@ -5427,6 +5672,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reconcileAdmissionRedirectWakes,
     sweepStaleIssueLocks,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
