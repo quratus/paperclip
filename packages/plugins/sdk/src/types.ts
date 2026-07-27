@@ -236,6 +236,8 @@ export interface PluginJobContext {
   trigger: "schedule" | "manual" | "retry";
   /** ISO 8601 timestamp when the run was scheduled to start. */
   scheduledAt: string;
+  /** Company for a company-scoped job; absent for instance jobs. */
+  companyId?: string;
 }
 
 // ---------------------------------------------------------------------------

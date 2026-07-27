@@ -421,6 +421,42 @@ describe("plugin-worker-manager stderr failure context", () => {
 
 
 describe("plugin host company context guards", () => {
+  it("propagates company scope from a scheduled job into host calls", async () => {
+    const configGet = vi.fn(async ({ companyId }: { companyId?: string }) => ({ companyId }));
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: [],
+      services: { config: { get: configGet } } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "company-sync",
+          runId: "run-1",
+          trigger: "schedule",
+          scheduledAt: new Date().toISOString(),
+          companyId: "company-a",
+          mode: "echo",
+          hostMethod: "config.get",
+          requestedCompanyId: "company-a",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({ companyId: "company-a" });
+      expect(configGet).toHaveBeenCalledOnce();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects config and secret calls without host-issued company context before host services run", async () => {
     const configGet = vi.fn(async () => ({ apiKey: "unreachable" }));
     const secretsResolve = vi.fn(async () => "unreachable");

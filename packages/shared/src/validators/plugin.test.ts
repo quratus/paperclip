@@ -9,6 +9,30 @@ describe("plugin capability constants", () => {
 });
 
 describe("plugin manifest validators", () => {
+  it("accepts explicit company job scope and rejects unknown scopes", () => {
+    const job = {
+      jobKey: "telegram-poll",
+      displayName: "Telegram poll",
+      schedule: "* * * * *",
+    };
+    const base = {
+      id: "paperclip.company-job",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Company job",
+      description: "Company-scoped connector job.",
+      author: "Paperclip",
+      categories: ["connector"],
+      capabilities: ["jobs.schedule"],
+      entrypoints: { worker: "./dist/worker.js" },
+    };
+
+    expect(pluginManifestV1Schema.parse({ ...base, jobs: [{ ...job, scope: "company" }] }).jobs?.[0]?.scope)
+      .toBe("company");
+    expect(pluginManifestV1Schema.safeParse({ ...base, jobs: [{ ...job, scope: "tenant" }] }).success)
+      .toBe(false);
+  });
+
   it("accepts existing-style plugins that do not request access or authorization capabilities", () => {
     const parsed = pluginManifestV1Schema.parse({
       id: "paperclip.compat-dashboard",
