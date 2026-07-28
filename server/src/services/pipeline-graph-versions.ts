@@ -11,7 +11,7 @@ import {
   compilePipelineGraph,
   type PipelineGraphCycleContractInput,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 
 type PipelineGraphDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -209,6 +209,100 @@ export function pipelineGraphVersionService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!version) throw notFound("Pipeline graph version not found");
       return version;
+    },
+
+    async activate(input: {
+      companyId: string;
+      pipelineId: string;
+      versionId: string;
+      expectedActiveVersionId: string | null;
+      actor: PipelineGraphVersionActor;
+    }) {
+      return db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
+        );
+        await assertPipeline(tx, input.companyId, input.pipelineId);
+        const selected = await tx
+          .select()
+          .from(pipelineGraphVersions)
+          .where(and(
+            eq(pipelineGraphVersions.id, input.versionId),
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!selected) throw notFound("Pipeline graph version not found");
+        if (selected.status === "active") return { changed: false as const, version: selected };
+        if (selected.status !== "draft") {
+          throw unprocessable("Retired graph versions cannot be reactivated", {
+            code: "pipeline_graph_version_retired",
+          });
+        }
+        const currentActive = await tx
+          .select({ id: pipelineGraphVersions.id })
+          .from(pipelineGraphVersions)
+          .where(and(
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+            eq(pipelineGraphVersions.status, "active"),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if ((currentActive?.id ?? null) !== input.expectedActiveVersionId) {
+          throw conflict("Active graph version changed", {
+            code: "pipeline_graph_activation_conflict",
+            expectedActiveVersionId: input.expectedActiveVersionId,
+            currentActiveVersionId: currentActive?.id ?? null,
+          });
+        }
+
+        const now = new Date();
+        await tx
+          .update(pipelineGraphVersions)
+          .set({ status: "retired", retiredAt: now, updatedAt: now })
+          .where(and(
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+            eq(pipelineGraphVersions.status, "active"),
+          ));
+        const actorId = input.actor.type === "user" ? input.actor.userId : input.actor.agentId;
+        const [activated] = await tx
+          .update(pipelineGraphVersions)
+          .set({
+            status: "active",
+            activatedByType: input.actor.type,
+            activatedById: actorId,
+            activatedAt: now,
+            retiredAt: null,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(pipelineGraphVersions.id, input.versionId),
+            eq(pipelineGraphVersions.status, "draft"),
+          ))
+          .returning();
+        if (!activated) {
+          throw unprocessable("Graph version is no longer activatable", {
+            code: "pipeline_graph_version_not_draft",
+          });
+        }
+        await logActivity(tx as unknown as Db, {
+          companyId: input.companyId,
+          actorType: input.actor.type,
+          actorId,
+          agentId: input.actor.type === "agent" ? input.actor.agentId : null,
+          runId: input.actor.type === "agent" ? input.actor.runId : null,
+          action: "pipeline.graph_version_activated",
+          entityType: "pipeline",
+          entityId: input.pipelineId,
+          details: {
+            graphVersionId: activated.id,
+            version: activated.version,
+            definitionHash: activated.definitionHash,
+          },
+        });
+        return { changed: true as const, version: activated };
+      });
     },
   };
 }

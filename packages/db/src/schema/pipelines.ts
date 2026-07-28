@@ -44,6 +44,7 @@ export const pipelineStages = pgTable(
   },
   (table) => ({
     pipelineKeyUq: uniqueIndex("pipeline_stages_pipeline_key_uq").on(table.pipelineId, table.key),
+    pipelineIdUq: uniqueIndex("pipeline_stages_pipeline_id_uq").on(table.pipelineId, table.id),
     pipelinePositionIdx: index("pipeline_stages_pipeline_position_idx").on(table.pipelineId, table.position),
     kindCheck: check("pipeline_stages_kind_check", sql`${table.kind} in ('working', 'review', 'done', 'cancelled')`),
   }),
@@ -84,6 +85,10 @@ export const pipelineGraphVersions = pgTable(
     status: text("status").notNull().default("draft"),
     createdByType: text("created_by_type").notNull(),
     createdById: text("created_by_id").notNull(),
+    activatedByType: text("activated_by_type"),
+    activatedById: text("activated_by_id"),
+    activatedAt: timestamp("activated_at", { withTimezone: true }),
+    retiredAt: timestamp("retired_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -92,6 +97,13 @@ export const pipelineGraphVersions = pgTable(
       .on(table.pipelineId, table.version),
     pipelineHashUq: uniqueIndex("pipeline_graph_versions_pipeline_hash_uq")
       .on(table.pipelineId, table.definitionHash),
+    pipelineIdUq: uniqueIndex("pipeline_graph_versions_pipeline_id_uq")
+      .on(table.pipelineId, table.id),
+    companyPipelineIdUq: uniqueIndex("pipeline_graph_versions_company_pipeline_id_uq")
+      .on(table.companyId, table.pipelineId, table.id),
+    pipelineActiveUq: uniqueIndex("pipeline_graph_versions_pipeline_active_uq")
+      .on(table.pipelineId)
+      .where(sql`${table.status} = 'active'`),
     companyPipelineVersionIdx: index("pipeline_graph_versions_company_pipeline_version_idx")
       .on(table.companyId, table.pipelineId, table.version),
     companyPipelineFk: foreignKey({
@@ -110,11 +122,27 @@ export const pipelineGraphVersions = pgTable(
     ),
     statusCheck: check(
       "pipeline_graph_versions_status_check",
-      sql`${table.status} in ('draft', 'retired')`,
+      sql`${table.status} in ('draft', 'active', 'retired')`,
     ),
     createdByTypeCheck: check(
       "pipeline_graph_versions_created_by_type_check",
       sql`${table.createdByType} in ('user', 'agent')`,
+    ),
+    activatedByTypeCheck: check(
+      "pipeline_graph_versions_activated_by_type_check",
+      sql`${table.activatedByType} is null or ${table.activatedByType} in ('user', 'agent')`,
+    ),
+    activationActorCheck: check(
+      "pipeline_graph_versions_activation_actor_check",
+      sql`(${table.activatedByType} is null) = (${table.activatedById} is null)`,
+    ),
+    lifecycleCheck: check(
+      "pipeline_graph_versions_lifecycle_check",
+      sql`(
+        (${table.status} = 'draft' and ${table.activatedAt} is null and ${table.retiredAt} is null)
+        or (${table.status} = 'active' and ${table.activatedAt} is not null and ${table.retiredAt} is null)
+        or (${table.status} = 'retired' and ${table.activatedAt} is not null and ${table.retiredAt} is not null)
+      )`,
     ),
   }),
 );

@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -15,7 +16,7 @@ import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { documents } from "./documents.js";
 import { issues } from "./issues.js";
-import { pipelineStages, pipelines } from "./pipelines.js";
+import { pipelineGraphVersions, pipelineStages, pipelines } from "./pipelines.js";
 import { routines } from "./routines.js";
 
 export type PipelineCasePendingSuggestion = {
@@ -38,8 +39,9 @@ export const pipelineCases = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
-    pipelineId: uuid("pipeline_id").notNull().references(() => pipelines.id, { onDelete: "cascade" }),
-    stageId: uuid("stage_id").notNull().references(() => pipelineStages.id),
+    pipelineId: uuid("pipeline_id").notNull(),
+    graphVersionId: uuid("graph_version_id"),
+    stageId: uuid("stage_id").notNull(),
     caseKey: text("case_key").notNull(),
     title: text("title").notNull(),
     summary: text("summary"),
@@ -72,6 +74,26 @@ export const pipelineCases = pgTable(
   },
   (table) => ({
     pipelineCaseKeyUq: uniqueIndex("pipeline_cases_pipeline_case_key_uq").on(table.pipelineId, table.caseKey),
+    pipelineCompanyFk: foreignKey({
+      columns: [table.companyId, table.pipelineId],
+      foreignColumns: [pipelines.companyId, pipelines.id],
+      name: "pipeline_cases_company_pipeline_fk",
+    }).onDelete("cascade"),
+    pipelineGraphVersionFk: foreignKey({
+      columns: [table.companyId, table.pipelineId, table.graphVersionId],
+      foreignColumns: [
+        pipelineGraphVersions.companyId,
+        pipelineGraphVersions.pipelineId,
+        pipelineGraphVersions.id,
+      ],
+      name: "pipeline_cases_pipeline_graph_version_fk",
+    }).onDelete("restrict"),
+    pipelineStageFk: foreignKey({
+      columns: [table.pipelineId, table.stageId],
+      foreignColumns: [pipelineStages.pipelineId, pipelineStages.id],
+      name: "pipeline_cases_pipeline_stage_fk",
+    }),
+    graphVersionIdx: index("pipeline_cases_graph_version_idx").on(table.graphVersionId),
     parentRequestKeyUq: uniqueIndex("pipeline_cases_parent_request_key_uq")
       .on(table.parentCaseId, table.requestKey)
       .where(sql`${table.requestKey} is not null and ${table.retiredAt} is null`),

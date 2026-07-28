@@ -17,6 +17,7 @@ import {
   pipelineCaseEvents,
   pipelineCaseIssueLinks,
   pipelineCases,
+  pipelineGraphVersions,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -24,6 +25,7 @@ import {
   routines,
 } from "@paperclipai/db";
 import {
+  compilePipelineGraph,
   extractRoutineVariableNames,
   isBuiltinRoutineVariable,
   syncRoutineVariablesWithTemplate,
@@ -68,6 +70,32 @@ export const PIPELINE_CASE_EVENTS_DEFAULT_LIMIT = 50;
 export const PIPELINE_CASE_EVENTS_MAX_LIMIT = 100;
 export const PIPELINE_CONTEXT_PACK_EVENT_LIMIT = 20;
 export { PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE };
+
+export async function assertPipelineGraphTopologyMutable(
+  dbOrTx: PipelineDb,
+  pipelineId: string,
+) {
+  await dbOrTx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + pipelineId}, 0))`,
+  );
+  const pinnedCase = await dbOrTx
+    .select({ id: pipelineCases.id, graphVersionId: pipelineCases.graphVersionId })
+    .from(pipelineCases)
+    .where(and(
+      eq(pipelineCases.pipelineId, pipelineId),
+      isNotNull(pipelineCases.graphVersionId),
+      isNull(pipelineCases.terminalKind),
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (pinnedCase) {
+    throw conflict("Pipeline topology is pinned by active cases", {
+      code: "pipeline_graph_topology_pinned",
+      caseId: pinnedCase.id,
+      graphVersionId: pinnedCase.graphVersionId,
+    });
+  }
+}
 
 function legacyPipelineAutomationTitle(stageName: string) {
   return `${stageName} automation`;
@@ -3234,6 +3262,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
     assertStageEnabled(toStage, "transition");
+    await assertPinnedGraphTransitionAllowed(tx, {
+      companyId: input.companyId,
+      caseRow: current,
+      fromStage,
+      toStage,
+    });
     if (fromStage.id !== toStage.id) {
       assertActorCanApproveStageExit(fromStage, input.actor);
       await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
@@ -3354,6 +3388,47 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       });
     }
     return { case: updated, event, automationLedger: ledger };
+  }
+
+  async function assertPinnedGraphTransitionAllowed(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      caseRow: typeof pipelineCases.$inferSelect;
+      fromStage: typeof pipelineStages.$inferSelect;
+      toStage: typeof pipelineStages.$inferSelect;
+    },
+  ) {
+    if (!input.caseRow.graphVersionId || input.fromStage.id === input.toStage.id) return;
+    const pinnedVersion = await tx
+      .select({ definition: pipelineGraphVersions.definition })
+      .from(pipelineGraphVersions)
+      .where(and(
+        eq(pipelineGraphVersions.id, input.caseRow.graphVersionId),
+        eq(pipelineGraphVersions.companyId, input.companyId),
+        eq(pipelineGraphVersions.pipelineId, input.caseRow.pipelineId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!pinnedVersion) {
+      throw conflict("Pinned pipeline graph version is unavailable", {
+        code: "pipeline_graph_version_missing",
+        graphVersionId: input.caseRow.graphVersionId,
+      });
+    }
+    const nodeKeys = new Set(pinnedVersion.definition.nodes.map((node) => node.key));
+    const allowed = nodeKeys.has(input.fromStage.key)
+      && nodeKeys.has(input.toStage.key)
+      && pinnedVersion.definition.edges.some(
+        (edge) => edge.fromNodeKey === input.fromStage.key && edge.toNodeKey === input.toStage.key,
+      );
+    if (!allowed) {
+      throw conflict("Transition is not allowed by the pinned graph version", {
+        code: "pinned_graph_transition_not_allowed",
+        graphVersionId: input.caseRow.graphVersionId,
+        fromStageKey: input.fromStage.key,
+        toStageKey: input.toStage.key,
+      });
+    }
   }
 
   // A case can enter an auto-advance stage after its children are already
@@ -3576,6 +3651,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await validateStageTargets(input.companyId, input.pipelineId, input.kind, config);
       await validateStageAutomationConfig(input.companyId, config);
       return db.transaction(async (tx) => {
+        await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
         const [nextStage] = await tx
           .select({ key: pipelineStages.key })
           .from(pipelineStages)
@@ -3650,6 +3726,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await validateStageTargets(input.companyId, input.pipelineId, kind, config);
       await validateStageAutomationConfig(input.companyId, config);
       return db.transaction(async (tx) => {
+        await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
         const nextConfig = automationRequest
           ? await syncPipelineStageAutomation(tx, {
               companyId: input.companyId,
@@ -3802,6 +3879,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     }) {
       return db.transaction(async (tx) => {
         await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+        await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
         const stage = await getStageOrThrow(tx, input.pipelineId, input.stageId);
         const targetStage = input.moveCasesToStageId
           ? await getStageOrThrow(tx, input.pipelineId, input.moveCasesToStageId)
@@ -3873,19 +3951,22 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     },
 
     async createTransition(input: { companyId: string; pipelineId: string; fromStageId: string; toStageId: string; label?: string | null }) {
-      await getPipelineOrThrow(db, input.companyId, input.pipelineId);
-      await getStageOrThrow(db, input.pipelineId, input.fromStageId);
-      await getStageOrThrow(db, input.pipelineId, input.toStageId);
-      const [transition] = await db
-        .insert(pipelineTransitions)
-        .values({
-          pipelineId: input.pipelineId,
-          fromStageId: input.fromStageId,
-          toStageId: input.toStageId,
-          label: input.label ?? null,
-        })
-        .returning();
-      return transition!;
+      return db.transaction(async (tx) => {
+        await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
+        await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+        await getStageOrThrow(tx, input.pipelineId, input.fromStageId);
+        await getStageOrThrow(tx, input.pipelineId, input.toStageId);
+        const [transition] = await tx
+          .insert(pipelineTransitions)
+          .values({
+            pipelineId: input.pipelineId,
+            fromStageId: input.fromStageId,
+            toStageId: input.toStageId,
+            label: input.label ?? null,
+          })
+          .returning();
+        return transition!;
+      });
     },
 
     async ingestCase(input: {
@@ -3915,6 +3996,58 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       const result = await db.transaction(async (tx) => {
         const pipeline = await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
         if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
+        );
+        const activeGraphVersion = await tx
+          .select({
+            id: pipelineGraphVersions.id,
+            definition: pipelineGraphVersions.definition,
+          })
+          .from(pipelineGraphVersions)
+          .where(and(
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+            eq(pipelineGraphVersions.status, "active"),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (activeGraphVersion) {
+          const [liveStages, liveTransitions] = await Promise.all([
+            tx.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, input.pipelineId)),
+            tx.select().from(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, input.pipelineId)),
+          ]);
+          const stageKeyById = new Map(liveStages.map((stage) => [stage.id, stage.key]));
+          const compiled = compilePipelineGraph({
+            entryNodeKey: activeGraphVersion.definition.entryNodeKey,
+            nodes: liveStages.map((stage) => ({
+              key: stage.key,
+              name: stage.name,
+              kind: stage.kind as "working" | "review" | "done" | "cancelled",
+              position: stage.position,
+              config: stage.config,
+            })),
+            edges: liveTransitions.map((transition) => ({
+              fromNodeKey: stageKeyById.get(transition.fromStageId) ?? transition.fromStageId,
+              toNodeKey: stageKeyById.get(transition.toStageId) ?? transition.toStageId,
+              outcome: transition.label,
+            })),
+            cycleContracts: activeGraphVersion.definition.cycleContracts,
+          });
+          if (!compiled.ok || !isDeepStrictEqual(compiled.definition, activeGraphVersion.definition)) {
+            throw conflict("Live pipeline topology differs from the active graph version", {
+              code: "pipeline_graph_activation_stale",
+              graphVersionId: activeGraphVersion.id,
+            });
+          }
+          if (input.stageKey && input.stageKey !== activeGraphVersion.definition.entryNodeKey) {
+            throw conflict("Versioned cases must start at the pinned graph entry node", {
+              code: "pipeline_graph_entry_mismatch",
+              graphVersionId: activeGraphVersion.id,
+              entryNodeKey: activeGraphVersion.definition.entryNodeKey,
+            });
+          }
+        }
         const requestKey = input.requestKey?.trim() || null;
         const parentCase = await assertValidParentCase(tx, { companyId: input.companyId, parentCaseId: input.parentCaseId ?? null });
         if (requestKey && !input.parentCaseId) {
@@ -3950,8 +4083,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             ...Array.from(blockedByCaseKeyMap.values()),
           ],
         });
-        const stage = input.stageKey
-          ? await getStageByKeyOrThrow(tx, input.pipelineId, input.stageKey)
+        const stageKey = activeGraphVersion?.definition.entryNodeKey ?? input.stageKey;
+        const stage = stageKey
+          ? await getStageByKeyOrThrow(tx, input.pipelineId, stageKey)
           : await tx
             .select()
             .from(pipelineStages)
@@ -3968,6 +4102,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           .values({
             companyId: input.companyId,
             pipelineId: input.pipelineId,
+            graphVersionId: activeGraphVersion?.id ?? null,
             stageId: stage.id,
             caseKey,
             title: input.title,
@@ -4522,6 +4657,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             blockers: plan.blockers,
           });
         }
+        await assertPinnedGraphTransitionAllowed(tx, {
+          companyId: input.companyId,
+          caseRow: detail.case,
+          fromStage: detail.stage,
+          toStage: plan.targetStageRow,
+        });
         const requestedEvent = await writeCaseEvent(tx, {
           companyId: input.companyId,
           caseId: input.caseId,
