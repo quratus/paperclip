@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  pipelineCases,
   pipelineGraphVersions,
   pipelineStages,
   pipelineTransitions,
@@ -20,6 +21,7 @@ import {
   decodePipelineGraphVersionCursor,
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
+import { pipelineService } from "../services/pipelines.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -40,6 +42,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(pipelineCases);
     await db.delete(pipelineGraphVersions);
     await db.delete(pipelineTransitions);
     await db.delete(pipelineStages);
@@ -268,6 +271,92 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
   });
 
+  it("activates one version at a time and pins new cases to their starting version", async () => {
+    const fixture = await seedLinearPipeline();
+    const versions = pipelineGraphVersionService(db);
+    const cases = pipelineService(db);
+    const actor = { type: "user" as const, userId: "board-user" };
+    const firstDraft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor,
+    });
+    const firstActivation = await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: firstDraft.version.id,
+      actor,
+    });
+    expect(firstActivation.changed).toBe(true);
+    expect(firstActivation.version.status).toBe("active");
+    expect(firstActivation.version.activatedAt).toBeInstanceOf(Date);
+
+    const firstCase = await cases.ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "first-case",
+      title: "First case",
+      actor,
+    });
+    expect(firstCase.case.graphVersionId).toBe(firstDraft.version.id);
+
+    await db.update(pipelineStages)
+      .set({ name: "Implementation" })
+      .where(eq(pipelineStages.id, fixture.stages[0]!.id));
+    const secondDraft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor,
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: secondDraft.version.id,
+      actor,
+    });
+
+    const [firstPersisted, secondPersisted] = await Promise.all([
+      versions.get({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        versionId: firstDraft.version.id,
+      }),
+      versions.get({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        versionId: secondDraft.version.id,
+      }),
+    ]);
+    expect(firstPersisted.status).toBe("retired");
+    expect(firstPersisted.retiredAt).toBeInstanceOf(Date);
+    expect(secondPersisted.status).toBe("active");
+    await expect(versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: firstDraft.version.id,
+      actor,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "pipeline_graph_version_retired" },
+    });
+
+    const secondCase = await cases.ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "second-case",
+      title: "Second case",
+      actor,
+    });
+    expect(secondCase.case.graphVersionId).toBe(secondDraft.version.id);
+    expect(firstCase.case.graphVersionId).toBe(firstDraft.version.id);
+
+    await expect(
+      db.delete(pipelines).where(eq(pipelines.id, fixture.pipeline.id)),
+    ).resolves.toBeDefined();
+  });
+
   it("exposes preview, idempotent persist, bounded list, and immutable get routes", async () => {
     const fixture = await seedLinearPipeline();
     const app = express();
@@ -303,6 +392,20 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(replay.status).toBe(200);
     expect(replay.body.version.id).toBe(first.body.version.id);
 
+    const activated = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}/activate`)
+      .send({});
+    expect(activated.status).toBe(200);
+    expect(activated.body).toMatchObject({
+      changed: true,
+      version: { id: first.body.version.id, status: "active" },
+    });
+    const activationReplay = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}/activate`)
+      .send({});
+    expect(activationReplay.status).toBe(200);
+    expect(activationReplay.body.changed).toBe(false);
+
     const listed = await http
       .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions?limit=1`);
     expect(listed.status).toBe(200);
@@ -328,6 +431,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .send({ entryNodeKey: "work" });
     expect(invalidPipeline.status).toBe(400);
     expect(invalidPipeline.body.details).toMatchObject({ code: "validation" });
+
+    const invalidActivation = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/versions/not-a-uuid/activate`)
+      .send({});
+    expect(invalidActivation.status).toBe(400);
+    expect(invalidActivation.body.details).toMatchObject({ code: "validation" });
 
     const fetched = await http
       .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}`);

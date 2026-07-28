@@ -1119,6 +1119,24 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     }));
   });
 
+  router.post("/pipelines/:pipelineId/graph/versions/:versionId/activate", async (req, res) => {
+    const pipelineId = parseGraphPipelineId(req.params.pipelineId);
+    const parsedVersionId = z.string().uuid().safeParse(req.params.versionId);
+    if (!parsedVersionId.success) {
+      throw badRequest("Invalid graph version id", { code: "validation" });
+    }
+    const companyId = await assertPipelineAccess(db, req, pipelineId);
+    await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    const actor = actorForMutation(req);
+    if (actor.type === "system") throw forbidden("A user or agent actor is required");
+    res.json(await graphVersions.activate({
+      companyId,
+      pipelineId,
+      versionId: parsedVersionId.data,
+      actor,
+    }));
+  });
+
   // Setup-health warnings: surface any configuration that won't actually run
   // (paused teammate, missing instructions, no approver, broken hand-off links,
   // unset required details) in plain prosumer language. Assembles the cross-

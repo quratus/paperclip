@@ -17,6 +17,7 @@ import {
   pipelineCaseEvents,
   pipelineCaseIssueLinks,
   pipelineCases,
+  pipelineGraphVersions,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -3915,6 +3916,19 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       const result = await db.transaction(async (tx) => {
         const pipeline = await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
         if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
+        );
+        const activeGraphVersion = await tx
+          .select({ id: pipelineGraphVersions.id })
+          .from(pipelineGraphVersions)
+          .where(and(
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+            eq(pipelineGraphVersions.status, "active"),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
         const requestKey = input.requestKey?.trim() || null;
         const parentCase = await assertValidParentCase(tx, { companyId: input.companyId, parentCaseId: input.parentCaseId ?? null });
         if (requestKey && !input.parentCaseId) {
@@ -3968,6 +3982,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           .values({
             companyId: input.companyId,
             pipelineId: input.pipelineId,
+            graphVersionId: activeGraphVersion?.id ?? null,
             stageId: stage.id,
             caseKey,
             title: input.title,
