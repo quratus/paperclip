@@ -675,6 +675,10 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     const replay = await runs.checkpoint(checkpointInput);
     expect(replay.changed).toBe(false);
     expect(replay.event.id).toBe(saved.event.id);
+    expect(replay.committed).toEqual({
+      revision: 2,
+      checkpoint: { attempt: 1, proof: "reviewed" },
+    });
 
     await expect(runs.checkpoint({
       ...checkpointInput,
@@ -693,9 +697,9 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect((await runs.listEvents({
       companyId: fixture.companyId,
       runId: left.run.id,
-    })).map((event) => [event.sequence, event.type])).toEqual([
-      [1, "run_started"],
-      [2, "checkpoint_saved"],
+    })).map((event) => [event.sequence, event.type, event.payload.checkpoint])).toEqual([
+      [1, "run_started", undefined],
+      [2, "checkpoint_saved", { attempt: 1, proof: "reviewed" }],
     ]);
   });
 
@@ -726,6 +730,36 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       title: "Tenant case",
       actor: { type: "user", userId: "board-user" },
     });
+    const secondCase = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "tenant-case-two",
+      title: "Tenant case two",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const sameKeyResults = await Promise.allSettled([
+      pipelineGraphRunService(db).start({
+        companyId: fixture.companyId,
+        caseId: ingested.case.id,
+        idempotencyKey: "company-wide-key",
+        actor: { type: "user", userId: "board-user" },
+      }),
+      pipelineGraphRunService(db).start({
+        companyId: fixture.companyId,
+        caseId: secondCase.case.id,
+        idempotencyKey: "company-wide-key",
+        actor: { type: "user", userId: "board-user" },
+      }),
+    ]);
+    expect(sameKeyResults.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = sameKeyResults.find((result) => result.status === "rejected");
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      reason: {
+        status: 409,
+        details: { code: "graph_run_idempotency_conflict" },
+      },
+    });
     await expect(db.insert(pipelineGraphRuns).values({
       companyId: otherCompany!.id,
       pipelineId: fixture.pipeline.id,
@@ -754,5 +788,10 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .get("/api/graph-runs/not-a-uuid");
     expect(response.status).toBe(400);
     expect(response.body.details).toMatchObject({ code: "validation" });
+    const invalidCase = await request(app)
+      .post("/api/cases/not-a-uuid/graph-runs")
+      .send({ idempotencyKey: "invalid-case" });
+    expect(invalidCase.status).toBe(400);
+    expect(invalidCase.body.details).toMatchObject({ code: "validation" });
   });
 });

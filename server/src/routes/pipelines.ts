@@ -1625,7 +1625,9 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   });
 
   router.post("/cases/:caseId/graph-runs", validate(startGraphRunSchema), async (req, res) => {
-    const caseId = req.params.caseId as string;
+    const parsedCaseId = z.string().uuid().safeParse(req.params.caseId);
+    if (!parsedCaseId.success) throw badRequest("Invalid pipeline case id", { code: "validation" });
+    const caseId = parsedCaseId.data;
     const companyId = await assertCaseAccess(db, req, caseId);
     const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });

@@ -43,6 +43,11 @@ export function pipelineGraphRunService(db: Db) {
       });
       return db.transaction(async (tx) => {
         await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${
+            "pipeline-graph-run:start-key:" + input.companyId + ":" + input.idempotencyKey
+          }, 0))`,
+        );
+        await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:case:" + input.caseId}, 0))`,
         );
         const replay = await tx
@@ -199,7 +204,15 @@ export function pipelineGraphRunService(db: Db) {
             ))
             .then((rows) => rows[0] ?? null);
           if (!run) throw notFound("Graph run not found");
-          return { changed: false as const, run, event: replay };
+          return {
+            changed: false as const,
+            run,
+            event: replay,
+            committed: {
+              revision: replay.payload.revision as number,
+              checkpoint: replay.payload.checkpoint as Record<string, unknown>,
+            },
+          };
         }
 
         const run = await tx
@@ -254,10 +267,21 @@ export function pipelineGraphRunService(db: Db) {
             nodeKey: run.currentNodeKey,
             idempotencyKey: input.idempotencyKey,
             requestHash: hash,
-            payload: { revision: updated!.revision },
+            payload: {
+              revision: updated!.revision,
+              checkpoint: input.checkpoint,
+            },
           })
           .returning();
-        return { changed: true as const, run: updated!, event: event! };
+        return {
+          changed: true as const,
+          run: updated!,
+          event: event!,
+          committed: {
+            revision: updated!.revision,
+            checkpoint: input.checkpoint,
+          },
+        };
       });
     },
 
