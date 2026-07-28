@@ -61,6 +61,9 @@ jobs:
       - name: Test release verify workflow wiring
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
 
+      - name: Test PR workspace bootstrap wiring
+        run: node --test ./scripts/__tests__/pr-workflow-bootstrap.test.mjs
+
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
 
@@ -129,6 +132,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build server workspace dependencies
+        run: pnpm ci:build-server-deps
+
       - name: Typecheck workspaces whose build scripts skip TypeScript
         run: pnpm run typecheck:build-gaps
 
@@ -188,6 +194,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Build server workspace dependencies
+        run: pnpm ci:build-server-deps
 
       - name: Run grouped general test suites
         run: |
@@ -298,6 +307,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build server workspace dependencies
+        run: pnpm ci:build-server-deps
+
       - name: Run serialized server test shard
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
@@ -385,6 +397,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Build server workspace dependencies
+        run: pnpm ci:build-server-deps
 
       - name: Verify runner Chrome
         # GitHub's Ubuntu runner image already ships Google Chrome, so use that
