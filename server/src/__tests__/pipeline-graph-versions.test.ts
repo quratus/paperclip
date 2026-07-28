@@ -1074,23 +1074,59 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
 
     const dispatcher = pipelineGraphOutboxService(db);
-    const firstClaim = await dispatcher.claim({ workerId: "worker-a", limit: 1, leaseMs: 1_000 });
+    await expect(dispatcher.claim({
+      companyId: randomUUID(),
+      workerId: "wrong-company-worker",
+      limit: 1,
+    })).resolves.toEqual([]);
+    await expect(dispatcher.dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "disabled-worker",
+      enabled: false,
+      wakeup: async () => {
+        throw new Error("disabled dispatcher should not call heartbeat");
+      },
+    })).resolves.toEqual({ claimed: 0, dispatched: 0, retried: 0 });
+    await expect(dispatcher.dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "default-off-worker",
+      enabled: true,
+      wakeup: async () => {
+        throw new Error("default-off outbox rows should not call heartbeat");
+      },
+    })).resolves.toEqual({ claimed: 0, dispatched: 0, retried: 0 });
+
+    const firstClaim = await dispatcher.claim({
+      companyId: fixture.companyId,
+      workerId: "worker-a",
+      limit: 1,
+      leaseMs: 1_000,
+    });
     expect(firstClaim).toHaveLength(1);
     expect(firstClaim[0]).toMatchObject({ status: "claimed", attemptCount: 1 });
     const receipt = { heartbeatRunId: randomUUID(), accepted: true };
+    await expect(dispatcher.acknowledge({
+      companyId: randomUUID(),
+      outboxId: firstClaim[0]!.id,
+      claimToken: firstClaim[0]!.claimToken!,
+      receipt,
+    })).rejects.toMatchObject({ status: 404 });
     const acknowledged = await dispatcher.acknowledge({
+      companyId: fixture.companyId,
       outboxId: firstClaim[0]!.id,
       claimToken: firstClaim[0]!.claimToken!,
       receipt,
     });
     expect(acknowledged).toMatchObject({ status: "dispatched", dispatchReceipt: receipt });
     const replay = await dispatcher.acknowledge({
+      companyId: fixture.companyId,
       outboxId: firstClaim[0]!.id,
       claimToken: firstClaim[0]!.claimToken!,
       receipt,
     });
     expect(replay.dispatchReceipt).toEqual(receipt);
     await expect(dispatcher.acknowledge({
+      companyId: fixture.companyId,
       outboxId: firstClaim[0]!.id,
       claimToken: randomUUID(),
       receipt: { accepted: false },
@@ -1101,12 +1137,14 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
 
     const expiredAt = new Date(Date.now() + 1_000);
     const expiring = await dispatcher.claim({
+      companyId: fixture.companyId,
       workerId: "worker-a",
       limit: 1,
       leaseMs: 1_000,
       now: expiredAt,
     });
     const reclaimed = await dispatcher.claim({
+      companyId: fixture.companyId,
       workerId: "worker-b",
       limit: 1,
       leaseMs: 1_000,
@@ -1115,6 +1153,16 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(reclaimed[0]!.id).toBe(expiring[0]!.id);
     expect(reclaimed[0]!.claimToken).not.toBe(expiring[0]!.claimToken);
     await expect(dispatcher.release({
+      companyId: randomUUID(),
+      outboxId: reclaimed[0]!.id,
+      claimToken: reclaimed[0]!.claimToken!,
+      error: "wrong company",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "graph_wake_claim_stale" },
+    });
+    await expect(dispatcher.release({
+      companyId: fixture.companyId,
       outboxId: expiring[0]!.id,
       claimToken: expiring[0]!.claimToken!,
       error: "stale worker",
@@ -1122,5 +1170,101 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       status: 422,
       details: { code: "graph_wake_claim_stale" },
     });
+
+    await dispatcher.release({
+      companyId: fixture.companyId,
+      outboxId: reclaimed[0]!.id,
+      claimToken: reclaimed[0]!.claimToken!,
+      error: "test releases reclaimed crash-replay lease",
+    });
+    const targetAgentId = randomUUID();
+    const [dispatchable] = await db
+      .select()
+      .from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
+      .limit(1);
+    await db.update(pipelineGraphWakeOutbox)
+      .set({
+        payload: {
+          ...dispatchable!.payload,
+          dispatchEnabled: true,
+          targetAgentId,
+        },
+      })
+      .where(eq(pipelineGraphWakeOutbox.id, dispatchable!.id));
+    const heartbeatRunId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const wakeCalls: Array<{ agentId: string; opts: Record<string, unknown> }> = [];
+    const delivered = await dispatcher.dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "dispatcher-a",
+      enabled: true,
+      limit: 1,
+      wakeup: async (agentId, opts) => {
+        wakeCalls.push({ agentId, opts });
+        return { id: heartbeatRunId, wakeupRequestId };
+      },
+    });
+    expect(delivered).toEqual({ claimed: 1, dispatched: 1, retried: 0 });
+    expect(wakeCalls).toMatchObject([{
+      agentId: targetAgentId,
+      opts: {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "pipeline_graph_wake",
+        idempotencyKey: dispatchable!.idempotencyKey,
+        contextSnapshot: {
+          pipelineGraphWake: true,
+          graphRunId: dispatchable!.runId,
+          graphEventId: dispatchable!.eventId,
+          pipelineCaseId: dispatchable!.caseId,
+          targetNodeKey: dispatchable!.targetNodeKey,
+        },
+      },
+    }]);
+    const [dispatchedRow] = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.id, dispatchable!.id));
+    expect(dispatchedRow).toMatchObject({
+      status: "dispatched",
+      dispatchReceipt: {
+        accepted: true,
+        heartbeatRunId,
+        wakeupRequestId,
+      },
+    });
+
+    const [retryable] = await db
+      .select()
+      .from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
+      .limit(1);
+    await db.update(pipelineGraphWakeOutbox)
+      .set({
+        payload: {
+          ...retryable!.payload,
+          dispatchEnabled: true,
+          targetAgentId,
+        },
+      })
+      .where(eq(pipelineGraphWakeOutbox.id, retryable!.id));
+    const retryNow = new Date(Date.now() + 10_000);
+    await expect(dispatcher.dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "dispatcher-b",
+      enabled: true,
+      limit: 1,
+      now: retryNow,
+      retryDelayMs: 60_000,
+      wakeup: async () => {
+        throw new Error("temporary heartbeat outage");
+      },
+    })).resolves.toEqual({ claimed: 1, dispatched: 0, retried: 1 });
+    const [retriedRow] = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.id, retryable!.id));
+    expect(retriedRow).toMatchObject({
+      status: "pending",
+      lastError: "temporary heartbeat outage",
+    });
+    expect(retriedRow!.availableAt.getTime()).toBe(retryNow.getTime() + 60_000);
   });
 });
