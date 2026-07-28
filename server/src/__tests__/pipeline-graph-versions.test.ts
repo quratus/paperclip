@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -1177,7 +1177,56 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       claimToken: reclaimed[0]!.claimToken!,
       error: "test releases reclaimed crash-replay lease",
     });
+
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Wrong Target Co",
+      issuePrefix: `W${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const [otherCompanyAgent] = await db.insert(agents).values({
+      companyId: otherCompany!.id,
+      name: "Wrong-company agent",
+      role: "engineer",
+    }).returning();
+    const [crossCompanyTarget] = await db
+      .select()
+      .from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
+      .limit(1);
+    await db.update(pipelineGraphWakeOutbox)
+      .set({
+        payload: {
+          ...crossCompanyTarget!.payload,
+          dispatchEnabled: true,
+          targetAgentId: otherCompanyAgent!.id,
+        },
+      })
+      .where(eq(pipelineGraphWakeOutbox.id, crossCompanyTarget!.id));
+    const crossCompanyWakeup = vi.fn();
+    await expect(dispatcher.dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "cross-company-dispatcher",
+      enabled: true,
+      limit: 1,
+      wakeup: crossCompanyWakeup,
+    })).resolves.toEqual({ claimed: 1, dispatched: 0, retried: 0 });
+    expect(crossCompanyWakeup).not.toHaveBeenCalled();
+    const [rejectedCrossCompanyTarget] = await db
+      .select()
+      .from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.id, crossCompanyTarget!.id));
+    expect(rejectedCrossCompanyTarget).toMatchObject({
+      status: "failed",
+      dispatchReceipt: null,
+      lastError: "Graph wake target agent does not belong to the outbox company",
+    });
+
     const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId: fixture.companyId,
+      name: "Graph target agent",
+      role: "engineer",
+    });
     const [dispatchable] = await db
       .select()
       .from(pipelineGraphWakeOutbox)
