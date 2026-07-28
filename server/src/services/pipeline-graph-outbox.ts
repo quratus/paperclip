@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pipelineGraphWakeOutbox } from "@paperclipai/db";
+import { agents, pipelineGraphWakeOutbox } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
 function stableStringify(value: unknown): string {
@@ -65,7 +65,10 @@ export function pipelineGraphOutboxService(db: Db) {
             lastError: null,
             updatedAt: now,
           })
-          .where(inArray(pipelineGraphWakeOutbox.id, rows.map((row) => row.id)))
+          .where(and(
+            eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+            inArray(pipelineGraphWakeOutbox.id, rows.map((row) => row.id)),
+          ))
           .returning();
       });
     },
@@ -152,6 +155,25 @@ export function pipelineGraphOutboxService(db: Db) {
             outboxId: row.id,
             claimToken: row.claimToken!,
             error: "Graph wake dispatch requires dispatchEnabled=true and payload.targetAgentId",
+            terminal: true,
+            now: input.now,
+          });
+          continue;
+        }
+        const [targetAgent] = await db
+          .select({ id: agents.id })
+          .from(agents)
+          .where(and(
+            eq(agents.companyId, input.companyId),
+            eq(agents.id, targetAgentId),
+          ))
+          .limit(1);
+        if (!targetAgent) {
+          await this.release({
+            companyId: input.companyId,
+            outboxId: row.id,
+            claimToken: row.claimToken!,
+            error: "Graph wake target agent does not belong to the outbox company",
             terminal: true,
             now: input.now,
           });
