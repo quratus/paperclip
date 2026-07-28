@@ -69,12 +69,22 @@ CREATE TABLE IF NOT EXISTS "pipeline_graph_run_events" (
   "type" text NOT NULL,
   "node_key" text NOT NULL,
   "outcome" text,
+  "actor_type" text NOT NULL,
+  "actor_id" text,
+  "actor_run_id" uuid,
   "idempotency_key" text NOT NULL,
   "request_hash" text NOT NULL,
   "payload" jsonb DEFAULT '{}'::jsonb NOT NULL,
   "created_at" timestamp with time zone DEFAULT now() NOT NULL,
   CONSTRAINT "pipeline_graph_run_events_sequence_check" CHECK ("sequence" > 0),
   CONSTRAINT "pipeline_graph_run_events_request_hash_check" CHECK ("request_hash" ~ '^[0-9a-f]{64}$'),
+  CONSTRAINT "pipeline_graph_run_events_actor_type_check"
+    CHECK ("actor_type" in ('user', 'agent', 'system')),
+  CONSTRAINT "pipeline_graph_run_events_actor_identity_check" CHECK (
+    ("actor_type" = 'system' and "actor_id" is null and "actor_run_id" is null)
+    or ("actor_type" = 'user' and "actor_id" is not null and "actor_run_id" is null)
+    or ("actor_type" = 'agent' and "actor_id" is not null and "actor_run_id" is not null)
+  ),
   CONSTRAINT "pipeline_graph_run_events_type_check" CHECK (
     "type" in (
       'run_started', 'checkpoint_saved', 'transition_committed', 'run_paused',

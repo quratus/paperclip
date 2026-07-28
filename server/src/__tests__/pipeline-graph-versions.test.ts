@@ -651,6 +651,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(left.run.graphVersionId).toBe(draft.version.id);
     expect(left.run.currentNodeKey).toBe("work");
     expect(left.run.revision).toBe(1);
+    expect(left.committed).toEqual({ revision: 1, checkpoint: { attempt: 0 } });
 
     await expect(runs.start({ ...startInput, idempotencyKey: "start:other" })).rejects.toMatchObject({
       status: 409,
@@ -667,6 +668,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       expectedRevision: 1,
       idempotencyKey: "checkpoint:1",
       checkpoint: { attempt: 1, proof: "reviewed" },
+      actor: { type: "user" as const, userId: "board-user" },
     };
     const saved = await runs.checkpoint(checkpointInput);
     expect(saved.changed).toBe(true);
@@ -698,7 +700,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       companyId: fixture.companyId,
       runId: left.run.id,
     })).map((event) => [event.sequence, event.type, event.payload.checkpoint])).toEqual([
-      [1, "run_started", undefined],
+      [1, "run_started", { attempt: 0 }],
       [2, "checkpoint_saved", { attempt: 1, proof: "reviewed" }],
     ]);
   });

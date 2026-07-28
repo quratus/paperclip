@@ -101,6 +101,9 @@ export const pipelineGraphRunEvents = pgTable(
     type: text("type").notNull(),
     nodeKey: text("node_key").notNull(),
     outcome: text("outcome"),
+    actorType: text("actor_type").notNull(),
+    actorId: text("actor_id"),
+    actorRunId: uuid("actor_run_id"),
     idempotencyKey: text("idempotency_key").notNull(),
     requestHash: text("request_hash").notNull(),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
@@ -137,6 +140,18 @@ export const pipelineGraphRunEvents = pgTable(
         'run_failed',
         'run_cancelled',
         'wake_requested'
+      )`,
+    ),
+    actorTypeCheck: check(
+      "pipeline_graph_run_events_actor_type_check",
+      sql`${table.actorType} in ('user', 'agent', 'system')`,
+    ),
+    actorIdentityCheck: check(
+      "pipeline_graph_run_events_actor_identity_check",
+      sql`(
+        (${table.actorType} = 'system' and ${table.actorId} is null and ${table.actorRunId} is null)
+        or (${table.actorType} = 'user' and ${table.actorId} is not null and ${table.actorRunId} is null)
+        or (${table.actorType} = 'agent' and ${table.actorId} is not null and ${table.actorRunId} is not null)
       )`,
     ),
   }),

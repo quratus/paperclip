@@ -27,6 +27,14 @@ function actorId(actor: PipelineGraphVersionActor) {
   return actor.type === "user" ? actor.userId : actor.agentId;
 }
 
+function actorEnvelope(actor: PipelineGraphVersionActor) {
+  return {
+    actorType: actor.type,
+    actorId: actorId(actor),
+    actorRunId: actor.type === "agent" ? actor.runId : null,
+  };
+}
+
 export function pipelineGraphRunService(db: Db) {
   return {
     async start(input: {
@@ -40,6 +48,7 @@ export function pipelineGraphRunService(db: Db) {
         operation: "start",
         caseId: input.caseId,
         checkpoint: input.checkpoint ?? {},
+        actor: actorEnvelope(input.actor),
       });
       return db.transaction(async (tx) => {
         await tx.execute(
@@ -72,7 +81,15 @@ export function pipelineGraphRunService(db: Db) {
               code: "graph_run_idempotency_conflict",
             });
           }
-          return { created: false as const, run: replay, event };
+          return {
+            created: false as const,
+            run: replay,
+            event,
+            committed: {
+              revision: event.payload.revision as number,
+              checkpoint: event.payload.checkpoint as Record<string, unknown>,
+            },
+          };
         }
 
         const row = await tx
@@ -150,16 +167,27 @@ export function pipelineGraphRunService(db: Db) {
             sequence: 1,
             type: "run_started",
             nodeKey: row.stageKey,
+            ...actorEnvelope(input.actor),
             idempotencyKey: input.idempotencyKey,
             requestHash: hash,
             payload: {
+              revision: run!.revision,
+              checkpoint: input.checkpoint ?? {},
               graphVersionId: row.graphVersion.id,
               graphVersion: row.graphVersion.version,
               caseVersion: row.case.version,
             },
           })
           .returning();
-        return { created: true as const, run: run!, event: event! };
+        return {
+          created: true as const,
+          run: run!,
+          event: event!,
+          committed: {
+            revision: run!.revision,
+            checkpoint: input.checkpoint ?? {},
+          },
+        };
       });
     },
 
@@ -169,12 +197,14 @@ export function pipelineGraphRunService(db: Db) {
       expectedRevision: number;
       idempotencyKey: string;
       checkpoint: Record<string, unknown>;
+      actor: PipelineGraphVersionActor;
     }) {
       const hash = requestHash({
         operation: "checkpoint",
         runId: input.runId,
         expectedRevision: input.expectedRevision,
         checkpoint: input.checkpoint,
+        actor: actorEnvelope(input.actor),
       });
       return db.transaction(async (tx) => {
         await tx.execute(
@@ -265,6 +295,7 @@ export function pipelineGraphRunService(db: Db) {
             sequence: run.nextEventSequence,
             type: "checkpoint_saved",
             nodeKey: run.currentNodeKey,
+            ...actorEnvelope(input.actor),
             idempotencyKey: input.idempotencyKey,
             requestHash: hash,
             payload: {

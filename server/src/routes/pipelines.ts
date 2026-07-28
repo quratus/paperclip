@@ -1680,12 +1680,15 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         companyId: scope.companyId,
         pipelineId: scope.pipelineId,
       });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user or agent actor is required");
       res.json(await graphRuns.checkpoint({
         companyId: scope.companyId,
         runId: runId.data,
         expectedRevision: req.body.expectedRevision,
         idempotencyKey: req.body.idempotencyKey,
         checkpoint: req.body.checkpoint,
+        actor,
       }));
     },
   );
