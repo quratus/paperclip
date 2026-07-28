@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pipelineGraphWakeOutbox } from "@paperclipai/db";
+import { agentWakeupRequests, pipelineGraphWakeOutbox } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
 function stableStringify(value: unknown): string {
@@ -158,6 +158,35 @@ export function pipelineGraphOutboxService(db: Db) {
           continue;
         }
         try {
+          const acceptedWake = await db
+            .select({
+              id: agentWakeupRequests.id,
+              runId: agentWakeupRequests.runId,
+            })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, input.companyId),
+              eq(agentWakeupRequests.idempotencyKey, row.idempotencyKey),
+            ))
+            .orderBy(asc(agentWakeupRequests.requestedAt))
+            .then((existing) => existing.find((wakeup) => wakeup.runId) ?? null);
+          if (acceptedWake?.runId) {
+            await this.acknowledge({
+              companyId: input.companyId,
+              outboxId: row.id,
+              claimToken: row.claimToken!,
+              receipt: {
+                accepted: true,
+                heartbeatRunId: acceptedWake.runId,
+                wakeupRequestId: acceptedWake.id,
+                replayed: true,
+              },
+              now: input.now,
+            });
+            dispatched += 1;
+            continue;
+          }
+
           const run = await input.wakeup(targetAgentId, {
             source: "automation",
             triggerDetail: "system",

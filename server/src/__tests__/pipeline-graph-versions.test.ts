@@ -5,6 +5,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -48,6 +49,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(pipelineGraphWakeOutbox);
     await db.delete(pipelineGraphRunEvents);
     await db.delete(pipelineGraphRuns);
@@ -1177,7 +1179,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       claimToken: reclaimed[0]!.claimToken!,
       error: "test releases reclaimed crash-replay lease",
     });
-    const targetAgentId = randomUUID();
+    const [targetAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Graph worker",
+      role: "worker",
+    }).returning();
+    const targetAgentId = targetAgent!.id;
     const [dispatchable] = await db
       .select()
       .from(pipelineGraphWakeOutbox)
@@ -1266,5 +1273,53 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       lastError: "temporary heartbeat outage",
     });
     expect(retriedRow!.availableAt.getTime()).toBe(retryNow.getTime() + 60_000);
+
+    const [crashReplay] = await db
+      .select()
+      .from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
+      .limit(1);
+    await db.update(pipelineGraphWakeOutbox)
+      .set({
+        payload: {
+          ...crashReplay!.payload,
+          dispatchEnabled: true,
+          targetAgentId,
+        },
+      })
+      .where(eq(pipelineGraphWakeOutbox.id, crashReplay!.id));
+    const replayedHeartbeatRunId = randomUUID();
+    const [acceptedWake] = await db.insert(agentWakeupRequests).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "pipeline_graph_wake",
+      payload: { graphRunId: crashReplay!.runId },
+      status: "queued",
+      idempotencyKey: crashReplay!.idempotencyKey,
+      runId: replayedHeartbeatRunId,
+    }).returning();
+    const replayed = await dispatcher.dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "dispatcher-c",
+      enabled: true,
+      limit: 1,
+      wakeup: async () => {
+        throw new Error("crash replay should reuse the accepted wake");
+      },
+    });
+    expect(replayed).toEqual({ claimed: 1, dispatched: 1, retried: 0 });
+    const [crashReplayRow] = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.id, crashReplay!.id));
+    expect(crashReplayRow).toMatchObject({
+      status: "dispatched",
+      dispatchReceipt: {
+        accepted: true,
+        heartbeatRunId: replayedHeartbeatRunId,
+        wakeupRequestId: acceptedWake!.id,
+        replayed: true,
+      },
+    });
   });
 });
