@@ -5,11 +5,13 @@ import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
   environmentLeases,
   environments,
+  heartbeatRuns,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -58,6 +60,23 @@ async function waitForRunLeasesToRelease(
     .select()
     .from(environmentLeases)
     .where(eq(environmentLeases.heartbeatRunId, runId));
+}
+
+async function waitForAgentToBecomeIdle(
+  db: ReturnType<typeof createDb>,
+  agentId: string,
+  timeoutMs = 5_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const agent = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    if (agent?.status === "idle") return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
@@ -154,6 +173,71 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       driver: "local",
       leaseId: leases[0]?.id,
     });
+  });
+
+  it("replays an accepted wake idempotently after the original run finishes", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const idempotencyKey = `graph-wake:${randomUUID()}`;
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IdempotentWakeAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const wakeOptions = {
+      source: "automation" as const,
+      triggerDetail: "system" as const,
+      reason: "pipeline_graph_wake",
+      idempotencyKey,
+      requestedByActorType: "system" as const,
+      requestedByActorId: "pipeline_graph_outbox",
+      contextSnapshot: { pipelineGraphWake: true },
+    };
+    const accepted = await heartbeat.wakeup(agentId, wakeOptions);
+    expect(accepted).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, accepted!.id))?.status).toBe("succeeded");
+    await waitForRunLeasesToRelease(db, accepted!.id);
+    await waitForAgentToBecomeIdle(db, agentId);
+
+    const replayed = await heartbeat.wakeup(agentId, wakeOptions);
+    expect(replayed?.id).toBe(accepted!.id);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+    expect(runs).toHaveLength(1);
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      ));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toMatchObject({ runId: accepted!.id });
   });
 
   it("injects run-scoped Paperclip env into process agents", async () => {

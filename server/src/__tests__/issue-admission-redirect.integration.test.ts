@@ -106,32 +106,38 @@ describeEmbeddedPostgres("issue admission redirect", () => {
       attemptCount: 1,
     });
 
-    const issue = await db
-      .select()
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0]!);
-    const disposition = evaluateIssueAdmission({
-      issue,
-      source: "checkout",
-      actorType: "agent",
+    const historicalWake = vi.fn(async (agentId: string, options?: {
+      idempotencyKey?: string | null;
+      payload?: Record<string, unknown> | null;
+    }) => {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_admission_redirect",
+        payload: options?.payload ?? {},
+        status: "deferred_issue_execution",
+        requestedByActorType: "system",
+        idempotencyKey: options?.idempotencyKey ?? null,
+      });
+      return null;
     });
-    expect(disposition.kind).toBe("redirect");
-    if (disposition.kind !== "redirect") throw new Error("Expected redirect");
-
-    const redirect = await redirectIssueAdmission(db, {
-      companyId,
-      issueId,
-      deniedAgentId: implementerId,
-      disposition,
-      checkoutRunId: null,
-      expectedStatuses: ["blocked"],
-      requestedByActorType: "agent",
-      requestedByActorId: implementerId,
+    const historicalReplay = await recoveryService(db, { enqueueWakeup: historicalWake })
+      .reconcileStrandedAssignedIssues();
+    expect(historicalReplay.missingDispositionAdmissionRedirects).toMatchObject({
+      checked: 1,
+      redirected: 1,
+      externalIntervention: 0,
+      issueIds: [issueId],
     });
-    expect(redirect.kind).toBe("redirected");
-    if (redirect.kind !== "redirected") throw new Error("Expected persisted redirect");
-    expect(redirect.ownerAgentId).toBe(managerId);
+    expect(historicalWake).toHaveBeenCalledWith(
+      managerId,
+      expect.objectContaining({
+        reason: "issue_admission_redirect",
+        payload: expect.objectContaining({ issueId }),
+      }),
+    );
 
     const redirectedIssue = await db
       .select()
@@ -153,8 +159,13 @@ describeEmbeddedPostgres("issue admission redirect", () => {
     const admissionAction = await db
       .select()
       .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.id, redirect.recoveryActionId))
-      .then((rows) => rows[0]!);
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows.find((row) => row.kind === "admission_redirect")!);
+    const redirect = {
+      recoveryActionId: admissionAction.id,
+      wakeIdempotencyKey:
+        (admissionAction.wakePolicy as { idempotencyKey: string }).idempotencyKey,
+    };
     expect(admissionAction.wakePolicy).toMatchObject({
       mode: "canonical",
       phase: "refinement",
