@@ -394,6 +394,16 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       actor,
     });
     expect(firstCase.case.graphVersionId).toBe(firstDraft.version.id);
+    await expect(cases.updateStage({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      stageId: fixture.stages[0]!.id,
+      patch: { position: 125 },
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_topology_pinned" },
+    });
     await expect(cases.createStage({
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,

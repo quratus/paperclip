@@ -3726,13 +3726,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await validateStageTargets(input.companyId, input.pipelineId, kind, config);
       await validateStageAutomationConfig(input.companyId, config);
       return db.transaction(async (tx) => {
-        if (
-          input.patch.key !== undefined
-          || input.patch.kind !== undefined
-          || input.patch.config !== undefined
-        ) {
-          await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
-        }
+        await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
         const nextConfig = automationRequest
           ? await syncPipelineStageAutomation(tx, {
               companyId: input.companyId,
