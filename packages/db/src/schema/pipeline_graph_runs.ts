@@ -172,7 +172,11 @@ export const pipelineGraphWakeOutbox = pgTable(
     attemptCount: integer("attempt_count").notNull().default(0),
     availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    claimToken: uuid("claim_token"),
+    claimedBy: text("claimed_by"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
     dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+    dispatchReceipt: jsonb("dispatch_receipt").$type<Record<string, unknown>>(),
     lastError: text("last_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -182,6 +186,8 @@ export const pipelineGraphWakeOutbox = pgTable(
       .on(table.companyId, table.idempotencyKey),
     pendingIdx: index("pipeline_graph_wake_outbox_pending_idx")
       .on(table.status, table.availableAt, table.createdAt),
+    claimIdx: index("pipeline_graph_wake_outbox_claim_idx")
+      .on(table.status, table.claimExpiresAt, table.availableAt),
     companyRunIdx: index("pipeline_graph_wake_outbox_company_run_idx")
       .on(table.companyId, table.runId),
     runFk: foreignKey({
@@ -210,6 +216,25 @@ export const pipelineGraphWakeOutbox = pgTable(
     attemptCountCheck: check(
       "pipeline_graph_wake_outbox_attempt_count_check",
       sql`${table.attemptCount} >= 0`,
+    ),
+    claimLifecycleCheck: check(
+      "pipeline_graph_wake_outbox_claim_lifecycle_check",
+      sql`(
+        (
+          ${table.status} = 'claimed'
+          and ${table.claimToken} is not null
+          and ${table.claimedBy} is not null
+          and ${table.claimedAt} is not null
+          and ${table.claimExpiresAt} is not null
+          and ${table.dispatchedAt} is null
+        )
+        or (
+          ${table.status} <> 'claimed'
+          and ${table.claimToken} is null
+          and ${table.claimedBy} is null
+          and ${table.claimExpiresAt} is null
+        )
+      )`,
     ),
   }),
 );

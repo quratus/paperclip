@@ -10,8 +10,10 @@ import {
   createDb,
   heartbeatRuns,
   pipelineCases,
+  pipelineCaseEvents,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
+  pipelineGraphWakeOutbox,
   pipelineGraphVersions,
   pipelineStages,
   pipelineTransitions,
@@ -24,6 +26,7 @@ import {
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
 import { pipelineGraphRunService } from "../services/pipeline-graph-runs.js";
+import { pipelineGraphOutboxService } from "../services/pipeline-graph-outbox.js";
 import { pipelineService } from "../services/pipelines.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -45,6 +48,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(pipelineGraphWakeOutbox);
     await db.delete(pipelineGraphRunEvents);
     await db.delete(pipelineGraphRuns);
     await db.delete(pipelineCases);
@@ -107,7 +111,6 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       entryNodeKey: "work",
       actor: { type: "user" as const, userId: "board-user" },
     };
-
     const [left, right] = await Promise.all([
       service.createDraft(input),
       service.createDraft(input),
@@ -795,5 +798,329 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .send({ idempotencyKey: "invalid-case" });
     expect(invalidCase.status).toBe(400);
     expect(invalidCase.body.details).toMatchObject({ code: "validation" });
+  });
+
+  it("commits pinned terminal transitions once and advances the case atomically", async () => {
+    const fixture = await seedLinearPipeline();
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "terminal-transition",
+      title: "Terminal transition",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const started = await runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start:terminal",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const outcome = draft.version.definition.edges[0]!.outcome;
+    const input = {
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "transition:done",
+      outcome,
+      checkpoint: { proof: "reviewed" },
+      actor: { type: "user" as const, userId: "board-user" },
+    };
+    await expect(pipelineService(db).transitionCase({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      toStageKey: "done",
+      expectedVersion: 1,
+      actor: { type: "user", userId: "board-user" },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "case_graph_run_active", graphRunId: started.run.id },
+    });
+    await expect(runs.transition({
+      ...input,
+      idempotencyKey: "transition:invalid",
+      outcome: "not-an-edge",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "graph_transition_not_allowed" },
+    });
+    expect((await runs.get({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+    })).revision).toBe(1);
+    expect(await db.select().from(pipelineGraphWakeOutbox)).toHaveLength(0);
+    const committed = await runs.transition(input);
+    expect(committed).toMatchObject({
+      changed: true,
+      redirected: false,
+      run: { status: "succeeded", currentNodeKey: "done", revision: 2 },
+    });
+    const replay = await runs.transition(input);
+    expect(replay.changed).toBe(false);
+    expect(replay.committed).toEqual(committed.committed);
+    await expect(runs.transition({ ...input, checkpoint: { proof: "different" } })).rejects
+      .toMatchObject({ status: 409, details: { code: "graph_event_idempotency_conflict" } });
+    const [pipelineCase] = await db.select().from(pipelineCases)
+      .where(eq(pipelineCases.id, ingested.case.id));
+    expect(pipelineCase).toMatchObject({ terminalKind: "done", version: 2 });
+    expect((await runs.listEvents({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+    })).map((event) => event.type)).toEqual([
+      "run_started",
+      "transition_committed",
+      "run_succeeded",
+    ]);
+    expect((await db.select().from(pipelineCaseEvents)
+      .where(eq(pipelineCaseEvents.caseId, ingested.case.id)))
+      .map((event) => event.type)).toContain("transitioned");
+    expect(await db.select().from(pipelineGraphWakeOutbox)).toHaveLength(0);
+  });
+
+  it("serializes graph start against the legacy case transition authority", async () => {
+    const fixture = await seedLinearPipeline();
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "start-transition-race",
+      title: "Start transition race",
+      actor: { type: "user", userId: "board-user" },
+    });
+    let startPromise: Promise<unknown> = Promise.resolve();
+    let legacyPromise: Promise<unknown> = Promise.resolve();
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${
+        "pipeline-graph-run:case:" + ingested.case.id
+      }, 0))`);
+      startPromise = pipelineGraphRunService(db).start({
+        companyId: fixture.companyId,
+        caseId: ingested.case.id,
+        idempotencyKey: "start:race",
+        actor: { type: "user", userId: "board-user" },
+      });
+      legacyPromise = pipelineService(db).transitionCase({
+        companyId: fixture.companyId,
+        caseId: ingested.case.id,
+        toStageKey: "done",
+        expectedVersion: 1,
+        actor: { type: "user", userId: "board-user" },
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    });
+    const results = await Promise.allSettled([startPromise, legacyPromise]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+
+    const [pipelineCase] = await db.select().from(pipelineCases)
+      .where(eq(pipelineCases.id, ingested.case.id));
+    const graphRuns = await db.select().from(pipelineGraphRuns)
+      .where(eq(pipelineGraphRuns.caseId, ingested.case.id));
+    if (graphRuns.length === 1) {
+      expect(pipelineCase).toMatchObject({ terminalKind: null, version: 1 });
+      expect(graphRuns[0]).toMatchObject({ currentNodeKey: "work", status: "running" });
+    } else {
+      expect(pipelineCase).toMatchObject({ terminalKind: "done", version: 2 });
+    }
+  });
+
+  it("redirects cycle exhaustion and fences wake delivery receipts", async () => {
+    const fixture = await seedLinearPipeline();
+    const [reviewStage] = await db.insert(pipelineStages).values({
+      pipelineId: fixture.pipeline.id,
+      key: "review",
+      name: "Review",
+      kind: "review",
+      position: 150,
+      config: {
+        approveToStageKey: "done",
+        rejectToStageKey: "work",
+        requireApproval: false,
+      },
+    }).returning();
+    const workStage = fixture.stages.find((stage) => stage.key === "work")!;
+    await db.insert(pipelineTransitions).values([
+      {
+        pipelineId: fixture.pipeline.id,
+        fromStageId: workStage.id,
+        toStageId: reviewStage!.id,
+        label: "review",
+      },
+      {
+        pipelineId: fixture.pipeline.id,
+        fromStageId: reviewStage!.id,
+        toStageId: workStage.id,
+        label: "revise",
+      },
+    ]);
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      cycleContracts: [{
+        key: "implementation-review",
+        nodeKeys: ["work", "review"],
+        maxIterations: 3,
+        noProgressLimit: 1,
+        progressField: null,
+        exitNodeKeys: ["done"],
+      }],
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "cycle-redirect",
+      title: "Cycle redirect",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const started = await runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start:cycle",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const move = async (
+      expectedRevision: number,
+      outcome: string,
+      key: string,
+      actor = { type: "user" as const, userId: "board-user" },
+      leaseToken?: string,
+    ) =>
+      runs.transition({
+        companyId: fixture.companyId,
+        runId: started.run.id,
+        expectedRevision,
+        idempotencyKey: key,
+        outcome,
+        checkpoint: { score: 10 },
+        leaseToken,
+        actor,
+      });
+    await move(1, "review", "cycle:review:1");
+    await move(2, "revise", "cycle:revise:1");
+    await move(3, "review", "cycle:review:2");
+    const claimed = await pipelineService(db).claimCase({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      actor: { type: "user", userId: "lease-owner" },
+    });
+    await expect(move(4, "revise", "cycle:revise:wrong-owner")).rejects.toMatchObject({
+      status: 409,
+      details: { code: "lease_held" },
+    });
+    expect((await runs.get({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+    })).revision).toBe(4);
+    const redirected = await move(
+      4,
+      "revise",
+      "cycle:revise:2",
+      { type: "user", userId: "lease-owner" },
+      claimed.leaseToken!,
+    );
+    expect(redirected).toMatchObject({
+      changed: true,
+      redirected: true,
+      run: { status: "paused", currentNodeKey: "review", revision: 5 },
+      committed: {
+        interruption: { code: "cycle_no_progress" },
+        responsibilityOwner: "graph_owner",
+      },
+    });
+    const outbox = await db.select().from(pipelineGraphWakeOutbox);
+    expect(outbox).toHaveLength(4);
+    expect(outbox.at(-1)).toMatchObject({
+      status: "pending",
+      targetNodeKey: "review",
+      payload: { responsibilityOwner: "graph_owner", dispatchEnabled: false },
+    });
+
+    const dispatcher = pipelineGraphOutboxService(db);
+    const firstClaim = await dispatcher.claim({ workerId: "worker-a", limit: 1, leaseMs: 1_000 });
+    expect(firstClaim).toHaveLength(1);
+    expect(firstClaim[0]).toMatchObject({ status: "claimed", attemptCount: 1 });
+    const receipt = { heartbeatRunId: randomUUID(), accepted: true };
+    const acknowledged = await dispatcher.acknowledge({
+      outboxId: firstClaim[0]!.id,
+      claimToken: firstClaim[0]!.claimToken!,
+      receipt,
+    });
+    expect(acknowledged).toMatchObject({ status: "dispatched", dispatchReceipt: receipt });
+    const replay = await dispatcher.acknowledge({
+      outboxId: firstClaim[0]!.id,
+      claimToken: firstClaim[0]!.claimToken!,
+      receipt,
+    });
+    expect(replay.dispatchReceipt).toEqual(receipt);
+    await expect(dispatcher.acknowledge({
+      outboxId: firstClaim[0]!.id,
+      claimToken: randomUUID(),
+      receipt: { accepted: false },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_wake_receipt_conflict" },
+    });
+
+    const expiredAt = new Date(Date.now() + 1_000);
+    const expiring = await dispatcher.claim({
+      workerId: "worker-a",
+      limit: 1,
+      leaseMs: 1_000,
+      now: expiredAt,
+    });
+    const reclaimed = await dispatcher.claim({
+      workerId: "worker-b",
+      limit: 1,
+      leaseMs: 1_000,
+      now: new Date(expiredAt.getTime() + 2_000),
+    });
+    expect(reclaimed[0]!.id).toBe(expiring[0]!.id);
+    expect(reclaimed[0]!.claimToken).not.toBe(expiring[0]!.claimToken);
+    await expect(dispatcher.release({
+      outboxId: expiring[0]!.id,
+      claimToken: expiring[0]!.claimToken!,
+      error: "stale worker",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "graph_wake_claim_stale" },
+    });
   });
 });
