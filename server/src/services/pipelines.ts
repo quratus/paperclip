@@ -18,6 +18,7 @@ import {
   pipelineCaseIssueLinks,
   pipelineCases,
   pipelineGraphVersions,
+  pipelineGraphRuns,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -3229,6 +3230,59 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     return { case: updated, event };
   }
 
+  async function lockCaseTransitionControl(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      caseId: string;
+      expectedVersion: number;
+      leaseToken?: string | null;
+      actor: PipelineActor;
+      graphRunId?: string;
+    },
+  ) {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:case:" + input.caseId}, 0))`,
+    );
+    const { case: existing, stage: fromStage, pipeline } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
+    if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
+    const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
+    const activeGraphRun = await tx
+      .select({ id: pipelineGraphRuns.id, currentNodeKey: pipelineGraphRuns.currentNodeKey })
+      .from(pipelineGraphRuns)
+      .where(and(
+        eq(pipelineGraphRuns.companyId, input.companyId),
+        eq(pipelineGraphRuns.caseId, input.caseId),
+        sql`${pipelineGraphRuns.status} in ('running', 'paused')`,
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (activeGraphRun && activeGraphRun.id !== input.graphRunId) {
+      throw conflict("Pipeline case is controlled by an active graph run", {
+        code: "case_graph_run_active",
+        graphRunId: activeGraphRun.id,
+      });
+    }
+    if (input.graphRunId && (!activeGraphRun || activeGraphRun.id !== input.graphRunId)) {
+      throw conflict("Graph run no longer controls the pipeline case", {
+        code: "case_graph_run_not_active",
+        graphRunId: input.graphRunId,
+      });
+    }
+    if (activeGraphRun && activeGraphRun.currentNodeKey !== fromStage.key) {
+      throw conflict("Pipeline case and graph run nodes diverged", {
+        code: "graph_run_case_node_conflict",
+        graphRunId: activeGraphRun.id,
+        runNodeKey: activeGraphRun.currentNodeKey,
+        caseNodeKey: fromStage.key,
+      });
+    }
+    if (current.version !== input.expectedVersion) {
+      throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, fromStage));
+    }
+    return { current, fromStage, pipeline };
+  }
+
   async function transitionCaseInTransaction(
     tx: PipelineDb,
     input: {
@@ -3246,17 +3300,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       autoAdvanceVisitedStageIds?: Set<string>;
       skipChildrenTerminalGate?: boolean;
+      graphRunId?: string;
     },
   ) {
     if (input.transitionClass === "auto" && input.actor.type !== "system") {
       throw unprocessable("Pipeline auto autonomy is not enabled", { code: "autonomy_not_enabled" });
     }
-    const { case: existing, stage: fromStage, pipeline } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
-    if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
-    const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
-    if (current.version !== input.expectedVersion) {
-      throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, fromStage));
-    }
+    const { current, fromStage, pipeline } = await lockCaseTransitionControl(tx, input);
 
     const toStage = input.toStageId
       ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
@@ -4593,6 +4643,48 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         };
       }
       return { ...result, automationExecution: { status: "none" } satisfies PipelineAutomationExecutionResult };
+    },
+
+    async transitionCaseWithinTransaction(
+      tx: PipelineDb,
+      input: {
+        companyId: string;
+        caseId: string;
+        toStageId?: string;
+        toStageKey?: string;
+        expectedVersion: number;
+        leaseToken?: string | null;
+        actor: PipelineActor;
+        transitionClass?: "manual" | "suggested" | "auto";
+        suggestionId?: string;
+        reason?: string | null;
+        force?: boolean;
+        skipChildrenTerminalGate?: boolean;
+        graphRunId?: string;
+        automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect>;
+      },
+    ) {
+      return transitionCaseInTransaction(tx, input);
+    },
+
+    async assertGraphCaseControlWithinTransaction(
+      tx: PipelineDb,
+      input: {
+        companyId: string;
+        caseId: string;
+        expectedVersion: number;
+        leaseToken?: string | null;
+        actor: PipelineActor;
+        graphRunId: string;
+      },
+    ) {
+      return lockCaseTransitionControl(tx, input);
+    },
+
+    async executeTransitionAutomationLedgers(
+      ledgers: Array<typeof pipelineAutomationExecutions.$inferSelect>,
+    ) {
+      return executeAutomationLedgers(ledgers, { type: "system" });
     },
 
     async retryAutomation(input: {

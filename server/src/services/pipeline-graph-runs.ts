@@ -3,13 +3,17 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   pipelineCases,
+  pipelineAutomationExecutions,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
   pipelineGraphVersions,
+  pipelineGraphWakeOutbox,
   pipelineStages,
 } from "@paperclipai/db";
+import type { PipelineGraphDefinitionV1 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { PipelineGraphVersionActor } from "./pipeline-graph-versions.js";
+import { pipelineService } from "./pipelines.js";
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -33,6 +37,96 @@ function actorEnvelope(actor: PipelineGraphVersionActor) {
     actorId: actorId(actor),
     actorRunId: actor.type === "agent" ? actor.runId : null,
   };
+}
+
+type CycleRuntimeState = Record<string, {
+  iteration: number;
+  noProgressCount: number;
+  lastProgressHash: string | null;
+}>;
+
+function readProgress(checkpoint: Record<string, unknown>, field: string | null): unknown {
+  if (!field) return undefined;
+  return field.split(".").reduce<unknown>((value, key) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    return (value as Record<string, unknown>)[key];
+  }, checkpoint);
+}
+
+function evolveCycleState(input: {
+  definition: PipelineGraphDefinitionV1;
+  currentNodeKey: string;
+  targetNodeKey: string;
+  checkpoint: Record<string, unknown>;
+  previous: Record<string, unknown>;
+}) {
+  const state = structuredClone(input.previous) as CycleRuntimeState;
+  let interruption: {
+    code: "cycle_iteration_exhausted" | "cycle_no_progress";
+    contractKey: string;
+    iteration: number;
+    noProgressCount: number;
+  } | null = null;
+
+  for (const contract of input.definition.cycleContracts) {
+    const sourceInside = contract.nodeKeys.includes(input.currentNodeKey);
+    const targetInside = contract.nodeKeys.includes(input.targetNodeKey);
+    if (!targetInside) continue;
+    const externalEntryNodes = contract.nodeKeys.filter((nodeKey) =>
+      input.definition.edges.some((edge) =>
+        edge.toNodeKey === nodeKey && !contract.nodeKeys.includes(edge.fromNodeKey)));
+    const anchor = contract.nodeKeys.includes(input.definition.entryNodeKey)
+      ? input.definition.entryNodeKey
+      : externalEntryNodes.length === 1
+        ? externalEntryNodes[0]!
+        : contract.nodeKeys[0]!;
+    const entering = !sourceInside;
+    const returningToAnchor = sourceInside && input.targetNodeKey === anchor;
+    if (!entering && !returningToAnchor) continue;
+
+    const prior = state[contract.key] ?? {
+      iteration: 0,
+      noProgressCount: 0,
+      lastProgressHash: null,
+    };
+    const progress = readProgress(input.checkpoint, contract.progressField);
+    const progressHash = contract.noProgressLimit === null
+      ? null
+      : contract.progressField === null
+        ? requestHash(input.checkpoint)
+        : requestHash({ missing: progress === undefined, value: progress ?? null });
+    const noProgressCount = prior.iteration > 0
+      && progressHash !== null
+      && progressHash === prior.lastProgressHash
+      ? prior.noProgressCount + 1
+      : 0;
+    const next = {
+      iteration: prior.iteration + 1,
+      noProgressCount,
+      lastProgressHash: progressHash,
+    };
+    state[contract.key] = next;
+
+    if (next.iteration > contract.maxIterations) {
+      interruption = {
+        code: "cycle_iteration_exhausted",
+        contractKey: contract.key,
+        iteration: next.iteration,
+        noProgressCount,
+      };
+    } else if (
+      contract.noProgressLimit !== null
+      && noProgressCount >= contract.noProgressLimit
+    ) {
+      interruption = {
+        code: "cycle_no_progress",
+        contractKey: contract.key,
+        iteration: next.iteration,
+        noProgressCount,
+      };
+    }
+  }
+  return { state, interruption };
 }
 
 export function pipelineGraphRunService(db: Db) {
@@ -313,6 +407,507 @@ export function pipelineGraphRunService(db: Db) {
             checkpoint: input.checkpoint,
           },
         };
+      });
+    },
+
+    async transition(input: {
+      companyId: string;
+      runId: string;
+      expectedRevision: number;
+      idempotencyKey: string;
+      outcome: string;
+      checkpoint: Record<string, unknown>;
+      leaseToken?: string | null;
+      reason?: string | null;
+      actor: PipelineGraphVersionActor;
+    }) {
+      const hash = requestHash({
+        operation: "transition",
+        runId: input.runId,
+        expectedRevision: input.expectedRevision,
+        outcome: input.outcome,
+        checkpoint: input.checkpoint,
+        leaseToken: input.leaseToken ?? null,
+        reason: input.reason ?? null,
+        actor: actorEnvelope(input.actor),
+      });
+      const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
+      const result = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + input.runId}, 0))`,
+        );
+        const replay = await tx
+          .select()
+          .from(pipelineGraphRunEvents)
+          .where(and(
+            eq(pipelineGraphRunEvents.companyId, input.companyId),
+            eq(pipelineGraphRunEvents.runId, input.runId),
+            eq(pipelineGraphRunEvents.idempotencyKey, input.idempotencyKey),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (replay) {
+          if (replay.requestHash !== hash) {
+            throw conflict("Graph event idempotency key was reused with a different request", {
+              code: "graph_event_idempotency_conflict",
+            });
+          }
+          const run = await tx
+            .select()
+            .from(pipelineGraphRuns)
+            .where(and(
+              eq(pipelineGraphRuns.companyId, input.companyId),
+              eq(pipelineGraphRuns.id, input.runId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (!run) throw notFound("Graph run not found");
+          return {
+            changed: false as const,
+            redirected: replay.type === "run_paused",
+            run,
+            event: replay,
+            committed: replay.payload,
+          };
+        }
+
+        const row = await tx
+          .select({
+            run: pipelineGraphRuns,
+            graphVersion: pipelineGraphVersions,
+            caseVersion: pipelineCases.version,
+            caseStageKey: pipelineStages.key,
+          })
+          .from(pipelineGraphRuns)
+          .innerJoin(
+            pipelineGraphVersions,
+            and(
+              eq(pipelineGraphVersions.companyId, pipelineGraphRuns.companyId),
+              eq(pipelineGraphVersions.pipelineId, pipelineGraphRuns.pipelineId),
+              eq(pipelineGraphVersions.id, pipelineGraphRuns.graphVersionId),
+            ),
+          )
+          .innerJoin(
+            pipelineCases,
+            and(
+              eq(pipelineCases.companyId, pipelineGraphRuns.companyId),
+              eq(pipelineCases.id, pipelineGraphRuns.caseId),
+            ),
+          )
+          .innerJoin(
+            pipelineStages,
+            and(
+              eq(pipelineStages.pipelineId, pipelineCases.pipelineId),
+              eq(pipelineStages.id, pipelineCases.stageId),
+            ),
+          )
+          .where(and(
+            eq(pipelineGraphRuns.companyId, input.companyId),
+            eq(pipelineGraphRuns.id, input.runId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!row) throw notFound("Graph run not found");
+        const { run, graphVersion } = row;
+        if (run.status !== "running") {
+          throw unprocessable("Only running graph runs can transition", {
+            code: "graph_run_not_running",
+            status: run.status,
+          });
+        }
+        if (run.revision !== input.expectedRevision) {
+          throw conflict("Graph run changed", {
+            code: "graph_run_revision_conflict",
+            expectedRevision: input.expectedRevision,
+            currentRevision: run.revision,
+          });
+        }
+        if (row.caseStageKey !== run.currentNodeKey) {
+          throw conflict("Pipeline case and graph run nodes diverged", {
+            code: "graph_run_case_node_conflict",
+            runNodeKey: run.currentNodeKey,
+            caseNodeKey: row.caseStageKey,
+          });
+        }
+        const edge = graphVersion.definition.edges.find((candidate) =>
+          candidate.fromNodeKey === run.currentNodeKey && candidate.outcome === input.outcome);
+        if (!edge) {
+          throw unprocessable("Outcome is not available from the current pinned graph node", {
+            code: "graph_transition_not_allowed",
+            currentNodeKey: run.currentNodeKey,
+            outcome: input.outcome,
+            graphVersionId: run.graphVersionId,
+          });
+        }
+        const targetNode = graphVersion.definition.nodes.find((node) => node.key === edge.toNodeKey);
+        if (!targetNode) {
+          throw unprocessable("Pinned graph transition target is missing", {
+            code: "graph_transition_target_missing",
+            targetNodeKey: edge.toNodeKey,
+          });
+        }
+        const cycle = evolveCycleState({
+          definition: graphVersion.definition,
+          currentNodeKey: run.currentNodeKey,
+          targetNodeKey: targetNode.key,
+          checkpoint: input.checkpoint,
+          previous: run.cycleState,
+        });
+        const now = new Date();
+        const transitionSequence = run.nextEventSequence;
+        const derivedSequence = transitionSequence + 1;
+
+        if (cycle.interruption) {
+          await pipelineService(db).assertGraphCaseControlWithinTransaction(tx, {
+            companyId: input.companyId,
+            caseId: run.caseId,
+            expectedVersion: row.caseVersion,
+            leaseToken: input.leaseToken,
+            actor: input.actor,
+            graphRunId: run.id,
+          });
+          const interruptionCheckpoint = {
+            ...input.checkpoint,
+            runtimeInterruption: {
+              ...cycle.interruption,
+              attemptedOutcome: input.outcome,
+              responsibilityOwner: "graph_owner",
+              responsibilityReason: "cycle_policy_requires_graph_adjustment",
+            },
+          };
+          const [updated] = await tx
+            .update(pipelineGraphRuns)
+            .set({
+              status: "paused",
+              pausedAt: now,
+              checkpoint: interruptionCheckpoint,
+              cycleState: cycle.state,
+              revision: run.revision + 1,
+              nextEventSequence: run.nextEventSequence + 2,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(pipelineGraphRuns.id, run.id),
+              eq(pipelineGraphRuns.revision, input.expectedRevision),
+            ))
+            .returning();
+          if (!updated) {
+            throw conflict("Graph run changed", {
+              code: "graph_run_revision_conflict",
+              expectedRevision: input.expectedRevision,
+            });
+          }
+          const [event] = await tx
+            .insert(pipelineGraphRunEvents)
+            .values({
+              companyId: input.companyId,
+              runId: run.id,
+              sequence: transitionSequence,
+              type: "run_paused",
+              nodeKey: run.currentNodeKey,
+              outcome: input.outcome,
+              ...actorEnvelope(input.actor),
+              idempotencyKey: input.idempotencyKey,
+              requestHash: hash,
+              payload: {
+                revision: updated!.revision,
+                checkpoint: interruptionCheckpoint,
+                cycleState: cycle.state,
+                interruption: cycle.interruption,
+                responsibilityOwner: "graph_owner",
+              },
+            })
+            .returning();
+          const [wakeEvent] = await tx
+            .insert(pipelineGraphRunEvents)
+            .values({
+              companyId: input.companyId,
+              runId: run.id,
+              sequence: derivedSequence,
+              type: "wake_requested",
+              nodeKey: run.currentNodeKey,
+              actorType: "system",
+              actorId: null,
+              actorRunId: null,
+              idempotencyKey: `${input.idempotencyKey}:redirect`,
+              requestHash: hash,
+              payload: {
+                runRevision: updated!.revision,
+                targetNodeKey: run.currentNodeKey,
+                responsibilityOwner: "graph_owner",
+                reason: cycle.interruption.code,
+              },
+            })
+            .returning();
+          await tx.insert(pipelineGraphWakeOutbox).values({
+            companyId: input.companyId,
+            runId: run.id,
+            eventId: wakeEvent!.id,
+            caseId: run.caseId,
+            targetNodeKey: run.currentNodeKey,
+            idempotencyKey: `${run.id}:${updated!.revision}:graph-owner`,
+            payload: {
+              runRevision: updated!.revision,
+              graphVersionId: run.graphVersionId,
+              responsibilityOwner: "graph_owner",
+              reason: cycle.interruption.code,
+              dispatchEnabled: false,
+            },
+          });
+          return {
+            changed: true as const,
+            redirected: true as const,
+            run: updated!,
+            event: event!,
+            committed: event!.payload,
+          };
+        }
+
+        const terminalStatus = targetNode.kind === "done"
+          ? "succeeded"
+          : targetNode.kind === "cancelled"
+            ? "cancelled"
+            : null;
+        const caseTransition = await pipelineService(db).transitionCaseWithinTransaction(tx, {
+          companyId: input.companyId,
+          caseId: run.caseId,
+          toStageKey: targetNode.key,
+          expectedVersion: row.caseVersion,
+          leaseToken: input.leaseToken,
+          actor: input.actor,
+          transitionClass: "manual",
+          reason: input.reason ?? `graph outcome: ${input.outcome}`,
+          graphRunId: run.id,
+          automationLedgers,
+        });
+        const [updated] = await tx
+          .update(pipelineGraphRuns)
+          .set({
+            status: terminalStatus ?? "running",
+            currentNodeKey: targetNode.key,
+            checkpoint: input.checkpoint,
+            cycleState: cycle.state,
+            revision: run.revision + 1,
+            nextEventSequence: run.nextEventSequence + 2,
+            pausedAt: null,
+            finishedAt: terminalStatus ? now : null,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(pipelineGraphRuns.id, run.id),
+            eq(pipelineGraphRuns.revision, input.expectedRevision),
+          ))
+          .returning();
+        if (!updated) {
+          throw conflict("Graph run changed", {
+            code: "graph_run_revision_conflict",
+            expectedRevision: input.expectedRevision,
+          });
+        }
+        const [event] = await tx
+          .insert(pipelineGraphRunEvents)
+          .values({
+            companyId: input.companyId,
+            runId: run.id,
+            sequence: transitionSequence,
+            type: "transition_committed",
+            nodeKey: targetNode.key,
+            outcome: input.outcome,
+            ...actorEnvelope(input.actor),
+            idempotencyKey: input.idempotencyKey,
+            requestHash: hash,
+            payload: {
+              revision: updated!.revision,
+              checkpoint: input.checkpoint,
+              cycleState: cycle.state,
+              fromNodeKey: run.currentNodeKey,
+              toNodeKey: targetNode.key,
+              status: updated!.status,
+              caseVersion: caseTransition.case.version,
+            },
+          })
+          .returning();
+        const derivedType = terminalStatus === "succeeded"
+          ? "run_succeeded"
+          : terminalStatus === "cancelled"
+            ? "run_cancelled"
+            : "wake_requested";
+        const [derivedEvent] = await tx
+          .insert(pipelineGraphRunEvents)
+          .values({
+            companyId: input.companyId,
+            runId: run.id,
+            sequence: derivedSequence,
+            type: derivedType,
+            nodeKey: targetNode.key,
+            outcome: input.outcome,
+            actorType: "system",
+            actorId: null,
+            actorRunId: null,
+            idempotencyKey: `${input.idempotencyKey}:${derivedType}`,
+            requestHash: hash,
+            payload: {
+              runRevision: updated!.revision,
+              targetNodeKey: targetNode.key,
+              status: updated!.status,
+            },
+          })
+          .returning();
+        if (!terminalStatus) {
+          await tx.insert(pipelineGraphWakeOutbox).values({
+            companyId: input.companyId,
+            runId: run.id,
+            eventId: derivedEvent!.id,
+            caseId: run.caseId,
+            targetNodeKey: targetNode.key,
+            idempotencyKey: `${run.id}:${updated!.revision}:${targetNode.key}`,
+            payload: {
+              runRevision: updated!.revision,
+              graphVersionId: run.graphVersionId,
+              targetNodeKey: targetNode.key,
+              responsibilityOwner: targetNode.config.responsibilityOwner ?? targetNode.key,
+              dispatchEnabled: false,
+            },
+          });
+        }
+        return {
+          changed: true as const,
+          redirected: false as const,
+          run: updated!,
+          event: event!,
+          committed: event!.payload,
+        };
+      });
+      if (automationLedgers.length > 0) {
+        await pipelineService(db).executeTransitionAutomationLedgers(automationLedgers);
+      }
+      return result;
+    },
+
+    async setPaused(input: {
+      companyId: string;
+      runId: string;
+      expectedRevision: number;
+      idempotencyKey: string;
+      paused: boolean;
+      reason: string;
+      actor: PipelineGraphVersionActor;
+    }) {
+      const operation = input.paused ? "pause" : "resume";
+      const hash = requestHash({
+        operation,
+        runId: input.runId,
+        expectedRevision: input.expectedRevision,
+        reason: input.reason,
+        actor: actorEnvelope(input.actor),
+      });
+      return db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + input.runId}, 0))`,
+        );
+        const replay = await tx
+          .select()
+          .from(pipelineGraphRunEvents)
+          .where(and(
+            eq(pipelineGraphRunEvents.companyId, input.companyId),
+            eq(pipelineGraphRunEvents.runId, input.runId),
+            eq(pipelineGraphRunEvents.idempotencyKey, input.idempotencyKey),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (replay) {
+          if (replay.requestHash !== hash) {
+            throw conflict("Graph event idempotency key was reused with a different request", {
+              code: "graph_event_idempotency_conflict",
+            });
+          }
+          const run = await tx.select().from(pipelineGraphRuns).where(and(
+            eq(pipelineGraphRuns.companyId, input.companyId),
+            eq(pipelineGraphRuns.id, input.runId),
+          )).then((rows) => rows[0] ?? null);
+          if (!run) throw notFound("Graph run not found");
+          return { changed: false as const, run, event: replay };
+        }
+        const run = await tx.select().from(pipelineGraphRuns).where(and(
+          eq(pipelineGraphRuns.companyId, input.companyId),
+          eq(pipelineGraphRuns.id, input.runId),
+        )).then((rows) => rows[0] ?? null);
+        if (!run) throw notFound("Graph run not found");
+        const expectedStatus = input.paused ? "running" : "paused";
+        if (run.status !== expectedStatus) {
+          throw unprocessable(`Only ${expectedStatus} graph runs can ${operation}`, {
+            code: `graph_run_cannot_${operation}`,
+            status: run.status,
+          });
+        }
+        if (run.revision !== input.expectedRevision) {
+          throw conflict("Graph run changed", {
+            code: "graph_run_revision_conflict",
+            expectedRevision: input.expectedRevision,
+            currentRevision: run.revision,
+          });
+        }
+        const now = new Date();
+        const [updated] = await tx.update(pipelineGraphRuns).set({
+          status: input.paused ? "paused" : "running",
+          pausedAt: input.paused ? now : null,
+          revision: run.revision + 1,
+          nextEventSequence: run.nextEventSequence + (input.paused ? 1 : 2),
+          updatedAt: now,
+        }).where(and(
+          eq(pipelineGraphRuns.id, run.id),
+          eq(pipelineGraphRuns.revision, input.expectedRevision),
+        )).returning();
+        if (!updated) {
+          throw conflict("Graph run changed", { code: "graph_run_revision_conflict" });
+        }
+        const [event] = await tx.insert(pipelineGraphRunEvents).values({
+          companyId: input.companyId,
+          runId: run.id,
+          sequence: run.nextEventSequence,
+          type: input.paused ? "run_paused" : "run_resumed",
+          nodeKey: run.currentNodeKey,
+          ...actorEnvelope(input.actor),
+          idempotencyKey: input.idempotencyKey,
+          requestHash: hash,
+          payload: {
+            revision: updated!.revision,
+            reason: input.reason,
+            status: updated!.status,
+          },
+        }).returning();
+        if (!input.paused) {
+          const [wakeEvent] = await tx.insert(pipelineGraphRunEvents).values({
+            companyId: input.companyId,
+            runId: run.id,
+            sequence: run.nextEventSequence + 1,
+            type: "wake_requested",
+            nodeKey: run.currentNodeKey,
+            actorType: "system",
+            actorId: null,
+            actorRunId: null,
+            idempotencyKey: `${input.idempotencyKey}:wake_requested`,
+            requestHash: hash,
+            payload: {
+              runRevision: updated!.revision,
+              targetNodeKey: run.currentNodeKey,
+              reason: "run_resumed",
+            },
+          }).returning();
+          await tx.insert(pipelineGraphWakeOutbox).values({
+            companyId: input.companyId,
+            runId: run.id,
+            eventId: wakeEvent!.id,
+            caseId: run.caseId,
+            targetNodeKey: run.currentNodeKey,
+            idempotencyKey: `${run.id}:${updated!.revision}:${run.currentNodeKey}`,
+            payload: {
+              runRevision: updated!.revision,
+              graphVersionId: run.graphVersionId,
+              targetNodeKey: run.currentNodeKey,
+              responsibilityOwner: run.currentNodeKey,
+              reason: "run_resumed",
+              dispatchEnabled: false,
+            },
+          });
+        }
+        return { changed: true as const, run: updated!, event: event! };
       });
     },
 

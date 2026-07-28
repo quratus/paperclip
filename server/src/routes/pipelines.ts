@@ -184,6 +184,19 @@ const checkpointGraphRunSchema = z.object({
   idempotencyKey: z.string().trim().min(1).max(512),
   checkpoint: jsonObjectSchema,
 }).strict();
+const transitionGraphRunSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string().trim().min(1).max(512),
+  outcome: z.string().trim().min(1).max(120),
+  checkpoint: jsonObjectSchema,
+  leaseToken: z.string().uuid().nullable().optional(),
+  reason: z.string().trim().min(1).max(2_000).nullable().optional(),
+}).strict();
+const graphRunLifecycleSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string().trim().min(1).max(512),
+  reason: z.string().trim().min(1).max(2_000),
+}).strict();
 const activateGraphVersionSchema = z.object({
   expectedActiveVersionId: z.string().uuid().nullable(),
 }).strict();
@@ -1692,6 +1705,62 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       }));
     },
   );
+
+  router.post(
+    "/graph-runs/:runId/transitions",
+    validate(transitionGraphRunSchema),
+    async (req, res) => {
+      const runId = z.string().uuid().safeParse(req.params.runId);
+      if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+      const scope = await graphRunAccess(req, runId.data);
+      await assertPipelineWriteAccess(req, {
+        access,
+        companyId: scope.companyId,
+        pipelineId: scope.pipelineId,
+      });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      res.json(await graphRuns.transition({
+        companyId: scope.companyId,
+        runId: runId.data,
+        expectedRevision: req.body.expectedRevision,
+        idempotencyKey: req.body.idempotencyKey,
+        outcome: req.body.outcome,
+        checkpoint: req.body.checkpoint,
+        leaseToken: req.body.leaseToken,
+        reason: req.body.reason,
+        actor,
+      }));
+    },
+  );
+
+  for (const [path, paused] of [["pause", true], ["resume", false]] as const) {
+    router.post(
+      `/graph-runs/:runId/${path}`,
+      validate(graphRunLifecycleSchema),
+      async (req, res) => {
+        const runId = z.string().uuid().safeParse(req.params.runId);
+        if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+        const scope = await graphRunAccess(req, runId.data);
+        await assertPipelineWriteAccess(req, {
+          access,
+          companyId: scope.companyId,
+          pipelineId: scope.pipelineId,
+        });
+        const actor = actorForMutation(req);
+        if (actor.type === "system") throw forbidden("A user or agent actor is required");
+        res.json(await graphRuns.setPaused({
+          companyId: scope.companyId,
+          runId: runId.data,
+          expectedRevision: req.body.expectedRevision,
+          idempotencyKey: req.body.idempotencyKey,
+          paused,
+          reason: req.body.reason,
+          actor,
+        }));
+      },
+    );
+  }
 
   router.post("/pipelines/:pipelineId/cases/batch", validate(batchIngestSchema), async (req, res) => {
     const pipelineId = req.params.pipelineId as string;
