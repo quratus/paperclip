@@ -1674,6 +1674,21 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     res.json(await graphRuns.get({ companyId: scope.companyId, runId: runId.data }));
   });
 
+  router.get("/graph-runs/:runId/diagnostics", async (req, res) => {
+    const runId = z.string().uuid().safeParse(req.params.runId);
+    if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+    const scope = await graphRunAccess(req, runId.data);
+    await assertPipelineWriteAccess(req, {
+      access,
+      companyId: scope.companyId,
+      pipelineId: scope.pipelineId,
+    });
+    res.json(await graphRuns.diagnostics({
+      companyId: scope.companyId,
+      runId: runId.data,
+    }));
+  });
+
   router.get("/graph-runs/:runId/events", async (req, res) => {
     const runId = z.string().uuid().safeParse(req.params.runId);
     if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });

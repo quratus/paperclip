@@ -1072,6 +1072,83 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       targetNodeKey: "review",
       payload: { responsibilityOwner: "graph_owner", dispatchEnabled: false },
     });
+    const diagnostics = await runs.diagnostics({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      now: new Date(started.run.startedAt.getTime() + 1_000),
+    });
+    expect(diagnostics).toMatchObject({
+      graph: {
+        versionId: draft.version.id,
+        version: draft.version.version,
+        schemaVersion: 1,
+        definitionHash: draft.version.definitionHash,
+      },
+      current: {
+        node: { key: "review", kind: "review" },
+        responsibilityOwner: "review",
+        targetAgentId: null,
+        redirect: {
+          responsibilityOwner: "graph_owner",
+          reason: "cycle_no_progress",
+        },
+        interruption: { code: "cycle_no_progress" },
+      },
+      wakeDelivery: {
+        statusCounts: { pending: 4 },
+        pending: 4,
+        claimed: 0,
+        dispatched: 0,
+        failed: 0,
+        cancelled: 0,
+        averageDispatchLatencyMs: null,
+        latestReceipt: null,
+      },
+      kpis: {
+        elapsedMs: 1_000,
+        transitionCount: 3,
+        checkpointCount: 0,
+        redirectCount: 1,
+        wakeRequestCount: 4,
+        lastOutcome: "revise",
+        terminalOutcome: null,
+      },
+    });
+    expect(diagnostics.trajectory).toHaveLength(9);
+    await expect(runs.diagnostics({
+      companyId: randomUUID(),
+      runId: started.run.id,
+    })).rejects.toMatchObject({ status: 404 });
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+      };
+      next();
+    });
+    app.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    app.use(errorHandler);
+    const diagnosticsResponse = await request(app)
+      .get(`/api/graph-runs/${started.run.id}/diagnostics`);
+    expect(diagnosticsResponse.status).toBe(200);
+    expect(diagnosticsResponse.body).toMatchObject({
+      run: { id: started.run.id, status: "paused" },
+      graph: { versionId: draft.version.id },
+      current: {
+        node: { key: "review" },
+        redirect: { reason: "cycle_no_progress" },
+      },
+      kpis: {
+        transitionCount: 3,
+        redirectCount: 1,
+        lastOutcome: "revise",
+      },
+    });
 
     const dispatcher = pipelineGraphOutboxService(db);
     await expect(dispatcher.claim({

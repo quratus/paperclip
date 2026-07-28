@@ -924,6 +924,160 @@ export function pipelineGraphRunService(db: Db) {
       return run;
     },
 
+    async diagnostics(input: { companyId: string; runId: string; now?: Date }) {
+      const row = await db
+        .select({
+          run: pipelineGraphRuns,
+          graphVersion: pipelineGraphVersions,
+        })
+        .from(pipelineGraphRuns)
+        .innerJoin(
+          pipelineGraphVersions,
+          and(
+            eq(pipelineGraphVersions.companyId, pipelineGraphRuns.companyId),
+            eq(pipelineGraphVersions.pipelineId, pipelineGraphRuns.pipelineId),
+            eq(pipelineGraphVersions.id, pipelineGraphRuns.graphVersionId),
+          ),
+        )
+        .where(and(
+          eq(pipelineGraphRuns.companyId, input.companyId),
+          eq(pipelineGraphRuns.id, input.runId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!row) throw notFound("Graph run not found");
+
+      const [events, wakeOutbox] = await Promise.all([
+        db
+          .select()
+          .from(pipelineGraphRunEvents)
+          .where(and(
+            eq(pipelineGraphRunEvents.companyId, input.companyId),
+            eq(pipelineGraphRunEvents.runId, input.runId),
+          ))
+          .orderBy(asc(pipelineGraphRunEvents.sequence)),
+        db
+          .select()
+          .from(pipelineGraphWakeOutbox)
+          .where(and(
+            eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+            eq(pipelineGraphWakeOutbox.runId, input.runId),
+          ))
+          .orderBy(asc(pipelineGraphWakeOutbox.createdAt)),
+      ]);
+      const currentNode = row.graphVersion.definition.nodes.find(
+        (node) => node.key === row.run.currentNodeKey,
+      ) ?? null;
+      const cycleContracts = row.graphVersion.definition.cycleContracts.filter(
+        (contract) => contract.nodeKeys.includes(row.run.currentNodeKey),
+      );
+      const wakeStatusCounts = wakeOutbox.reduce<Record<string, number>>((counts, wake) => {
+        counts[wake.status] = (counts[wake.status] ?? 0) + 1;
+        return counts;
+      }, {});
+      const deliveredWakeLatencies = wakeOutbox
+        .filter((wake) => wake.dispatchedAt)
+        .map((wake) => wake.dispatchedAt!.getTime() - wake.createdAt.getTime());
+      const latestRedirect = [...events].reverse().find((event) =>
+        event.type === "run_paused" &&
+        typeof event.payload.responsibilityOwner === "string"
+      ) ?? null;
+      const runtimeInterruption =
+        row.run.checkpoint.runtimeInterruption &&
+        typeof row.run.checkpoint.runtimeInterruption === "object" &&
+        !Array.isArray(row.run.checkpoint.runtimeInterruption)
+          ? row.run.checkpoint.runtimeInterruption as Record<string, unknown>
+          : null;
+      const redirectInterruption =
+        latestRedirect?.payload.interruption &&
+        typeof latestRedirect.payload.interruption === "object" &&
+        !Array.isArray(latestRedirect.payload.interruption)
+          ? latestRedirect.payload.interruption as Record<string, unknown>
+          : null;
+      const now = input.now ?? new Date();
+      const finishedAt = row.run.finishedAt ?? now;
+
+      return {
+        run: row.run,
+        graph: {
+          versionId: row.graphVersion.id,
+          version: row.graphVersion.version,
+          schemaVersion: row.graphVersion.schemaVersion,
+          definitionHash: row.graphVersion.definitionHash,
+        },
+        current: {
+          node: currentNode,
+          responsibilityOwner:
+            typeof currentNode?.config.responsibilityOwner === "string"
+              ? currentNode.config.responsibilityOwner
+              : row.run.currentNodeKey,
+          targetAgentId:
+            typeof currentNode?.config.targetAgentId === "string"
+              ? currentNode.config.targetAgentId
+              : null,
+          budgets:
+            currentNode?.config.budgets &&
+            typeof currentNode.config.budgets === "object" &&
+            !Array.isArray(currentNode.config.budgets)
+              ? currentNode.config.budgets
+              : null,
+          cycleContracts,
+          cycleState: row.run.cycleState,
+          checkpoint: row.run.checkpoint,
+          interruption: runtimeInterruption,
+          redirect: latestRedirect
+            ? {
+                eventId: latestRedirect.id,
+                sequence: latestRedirect.sequence,
+                responsibilityOwner: latestRedirect.payload.responsibilityOwner,
+                reason: typeof redirectInterruption?.code === "string"
+                  ? redirectInterruption.code
+                  : null,
+              }
+            : null,
+        },
+        trajectory: events.map((event) => ({
+          sequence: event.sequence,
+          type: event.type,
+          nodeKey: event.nodeKey,
+          outcome: event.outcome,
+          actorType: event.actorType,
+          actorId: event.actorId,
+          createdAt: event.createdAt,
+        })),
+        wakeDelivery: {
+          statusCounts: wakeStatusCounts,
+          pending: wakeOutbox.filter((wake) => wake.status === "pending").length,
+          claimed: wakeOutbox.filter((wake) => wake.status === "claimed").length,
+          dispatched: wakeOutbox.filter((wake) => wake.status === "dispatched").length,
+          failed: wakeOutbox.filter((wake) => wake.status === "failed").length,
+          cancelled: wakeOutbox.filter((wake) => wake.status === "cancelled").length,
+          averageDispatchLatencyMs: deliveredWakeLatencies.length > 0
+            ? Math.round(
+                deliveredWakeLatencies.reduce((sum, latency) => sum + latency, 0) /
+                deliveredWakeLatencies.length,
+              )
+            : null,
+          latestReceipt:
+            [...wakeOutbox].reverse().find((wake) => wake.dispatchReceipt)?.dispatchReceipt ?? null,
+        },
+        kpis: {
+          elapsedMs: Math.max(0, finishedAt.getTime() - row.run.startedAt.getTime()),
+          transitionCount: events.filter((event) => event.type === "transition_committed").length,
+          checkpointCount: events.filter((event) => event.type === "checkpoint_saved").length,
+          redirectCount: events.filter((event) =>
+            event.type === "run_paused" &&
+            typeof event.payload.responsibilityOwner === "string"
+          ).length,
+          wakeRequestCount: events.filter((event) => event.type === "wake_requested").length,
+          lastOutcome:
+            [...events].reverse().find((event) => event.outcome)?.outcome ?? null,
+          terminalOutcome: ["succeeded", "failed", "cancelled"].includes(row.run.status)
+            ? row.run.status
+            : null,
+        },
+      };
+    },
+
     async listEvents(input: { companyId: string; runId: string }) {
       await this.get(input);
       return db
