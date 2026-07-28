@@ -10,6 +10,8 @@ import {
   createDb,
   heartbeatRuns,
   pipelineCases,
+  pipelineGraphRunEvents,
+  pipelineGraphRuns,
   pipelineGraphVersions,
   pipelineStages,
   pipelineTransitions,
@@ -21,6 +23,7 @@ import {
   decodePipelineGraphVersionCursor,
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
+import { pipelineGraphRunService } from "../services/pipeline-graph-runs.js";
 import { pipelineService } from "../services/pipelines.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -42,6 +45,8 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(pipelineGraphRunEvents);
+    await db.delete(pipelineGraphRuns);
     await db.delete(pipelineCases);
     await db.delete(pipelineGraphVersions);
     await db.delete(pipelineTransitions);
@@ -607,5 +612,147 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}`);
     expect(fetched.status).toBe(200);
     expect(fetched.body.definitionHash).toBe(preview.body.definitionHash);
+  });
+
+  it("starts one pinned run and saves replay-safe CAS checkpoints", async () => {
+    const fixture = await seedLinearPipeline();
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "runtime-case",
+      title: "Runtime case",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const startInput = {
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start:runtime-case",
+      checkpoint: { attempt: 0 },
+      actor: { type: "user" as const, userId: "board-user" },
+    };
+    const [left, right] = await Promise.all([runs.start(startInput), runs.start(startInput)]);
+    expect([left.created, right.created].sort()).toEqual([false, true]);
+    expect(left.run.id).toBe(right.run.id);
+    expect(left.run.graphVersionId).toBe(draft.version.id);
+    expect(left.run.currentNodeKey).toBe("work");
+    expect(left.run.revision).toBe(1);
+
+    await expect(runs.start({ ...startInput, idempotencyKey: "start:other" })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_run_already_active" },
+    });
+    await expect(runs.start({ ...startInput, checkpoint: { attempt: 1 } })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_run_idempotency_conflict" },
+    });
+
+    const checkpointInput = {
+      companyId: fixture.companyId,
+      runId: left.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "checkpoint:1",
+      checkpoint: { attempt: 1, proof: "reviewed" },
+    };
+    const saved = await runs.checkpoint(checkpointInput);
+    expect(saved.changed).toBe(true);
+    expect(saved.run.revision).toBe(2);
+    expect(saved.event.sequence).toBe(2);
+    const replay = await runs.checkpoint(checkpointInput);
+    expect(replay.changed).toBe(false);
+    expect(replay.event.id).toBe(saved.event.id);
+
+    await expect(runs.checkpoint({
+      ...checkpointInput,
+      idempotencyKey: "checkpoint:stale",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_run_revision_conflict", currentRevision: 2 },
+    });
+    await expect(runs.checkpoint({
+      ...checkpointInput,
+      checkpoint: { attempt: 99 },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_event_idempotency_conflict" },
+    });
+    expect((await runs.listEvents({
+      companyId: fixture.companyId,
+      runId: left.run.id,
+    })).map((event) => [event.sequence, event.type])).toEqual([
+      [1, "run_started"],
+      [2, "checkpoint_saved"],
+    ]);
+  });
+
+  it("enforces graph-run tenant foreign keys and route UUID validation", async () => {
+    const fixture = await seedLinearPipeline();
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Other runtime company",
+      issuePrefix: `R${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "tenant-case",
+      title: "Tenant case",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await expect(db.insert(pipelineGraphRuns).values({
+      companyId: otherCompany!.id,
+      pipelineId: fixture.pipeline.id,
+      graphVersionId: draft.version.id,
+      caseId: ingested.case.id,
+      startIdempotencyKey: "cross-tenant",
+      currentNodeKey: "work",
+      startedByType: "user",
+      startedById: "board-user",
+    })).rejects.toThrow();
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+      };
+      next();
+    });
+    app.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    app.use(errorHandler);
+    const response = await request(app)
+      .get("/api/graph-runs/not-a-uuid");
+    expect(response.status).toBe(400);
+    expect(response.body.details).toMatchObject({ code: "validation" });
   });
 });

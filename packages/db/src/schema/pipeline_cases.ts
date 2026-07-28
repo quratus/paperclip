@@ -74,6 +74,9 @@ export const pipelineCases = pgTable(
   },
   (table) => ({
     pipelineCaseKeyUq: uniqueIndex("pipeline_cases_pipeline_case_key_uq").on(table.pipelineId, table.caseKey),
+    companyPipelineIdUq: uniqueIndex("pipeline_cases_company_pipeline_id_uq")
+      .on(table.companyId, table.pipelineId, table.id),
+    companyIdUq: uniqueIndex("pipeline_cases_company_id_uq").on(table.companyId, table.id),
     pipelineCompanyFk: foreignKey({
       columns: [table.companyId, table.pipelineId],
       foreignColumns: [pipelines.companyId, pipelines.id],
