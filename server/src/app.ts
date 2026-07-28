@@ -54,6 +54,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
+import { showroomRoutes } from "./routes/showrooms.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
 import { adapterRoutes } from "./routes/adapters.js";
@@ -303,6 +304,7 @@ export async function createApp(
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
   }));
+  api.use(showroomRoutes(db, opts.storageService));
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(toolAccessRoutes(db, {
     deploymentMode: opts.deploymentMode,

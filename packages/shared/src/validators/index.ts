@@ -868,3 +868,4 @@ export {
   type RevokeToolTrustRule,
 } from "./tool-access.js";
 export * from "./skill-policy.js";
+export * from "./showroom.js";
