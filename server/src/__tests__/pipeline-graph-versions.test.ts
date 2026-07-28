@@ -1029,7 +1029,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
         expectedRevision,
         idempotencyKey: key,
         outcome,
-        checkpoint: { score: 10 },
+        checkpoint: { score: 10, accessToken: "must-not-leak" },
         leaseToken,
         actor,
       });
@@ -1071,6 +1071,144 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       status: "pending",
       targetNodeKey: "review",
       payload: { responsibilityOwner: "graph_owner", dispatchEnabled: false },
+    });
+    const diagnostics = await runs.diagnostics({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      now: new Date(started.run.startedAt.getTime() + 1_000),
+    });
+    expect(diagnostics).toMatchObject({
+      graph: {
+        versionId: draft.version.id,
+        version: draft.version.version,
+        schemaVersion: 1,
+        definitionHash: draft.version.definitionHash,
+      },
+      current: {
+        node: { key: "review", kind: "review" },
+        responsibilityOwner: "review",
+        targetAgentId: null,
+        checkpoint: {
+          present: true,
+          keys: ["accessToken", "runtimeInterruption", "score"],
+        },
+        redirect: {
+          responsibilityOwner: "graph_owner",
+          reason: "cycle_no_progress",
+        },
+        interruption: { code: "cycle_no_progress" },
+      },
+      wakeDelivery: {
+        statusCounts: { pending: 4 },
+        pending: 4,
+        claimed: 0,
+        dispatched: 0,
+        failed: 0,
+        cancelled: 0,
+        averageDispatchLatencyMs: null,
+        latestReceipt: null,
+      },
+      kpis: {
+        elapsedMs: 1_000,
+        transitionCount: 3,
+        checkpointCount: 0,
+        redirectCount: 1,
+        wakeRequestCount: 4,
+        lastOutcome: "revise",
+        terminalOutcome: null,
+      },
+    });
+    expect(diagnostics.trajectory).toHaveLength(9);
+    expect(JSON.stringify(diagnostics)).not.toContain("must-not-leak");
+    await expect(runs.diagnostics({
+      companyId: randomUUID(),
+      runId: started.run.id,
+    })).rejects.toMatchObject({ status: 404 });
+    await db.update(pipelineGraphRuns)
+      .set({ currentNodeKey: "missing-from-pinned-graph" })
+      .where(eq(pipelineGraphRuns.id, started.run.id));
+    await expect(runs.diagnostics({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+    })).resolves.toMatchObject({
+      current: { node: null },
+      invariants: [{ code: "current_node_missing" }],
+    });
+    await db.update(pipelineGraphRuns)
+      .set({ currentNodeKey: "review" })
+      .where(eq(pipelineGraphRuns.id, started.run.id));
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+      };
+      next();
+    });
+    app.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    app.use(errorHandler);
+    const diagnosticsResponse = await request(app)
+      .get(`/api/graph-runs/${started.run.id}/diagnostics`);
+    expect(diagnosticsResponse.status).toBe(200);
+    expect(diagnosticsResponse.body).toMatchObject({
+      run: { id: started.run.id, status: "paused" },
+      graph: { versionId: draft.version.id },
+      current: {
+        node: { key: "review" },
+        redirect: { reason: "cycle_no_progress" },
+      },
+      kpis: {
+        transitionCount: 3,
+        redirectCount: 1,
+        lastOutcome: "revise",
+      },
+    });
+    expect(JSON.stringify(diagnosticsResponse.body)).not.toContain("must-not-leak");
+
+    const [diagnosticsAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Diagnostics agent",
+      role: "engineer",
+    }).returning();
+    const agentApp = express();
+    agentApp.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId: diagnosticsAgent!.id,
+        companyId: fixture.companyId,
+        source: "agent_key",
+      };
+      next();
+    });
+    agentApp.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    agentApp.use(errorHandler);
+    const deniedDiagnostics = await request(agentApp)
+      .get(`/api/graph-runs/${started.run.id}/diagnostics`);
+    expect(deniedDiagnostics.status).toBe(403);
+    expect(deniedDiagnostics.body.details).toMatchObject({
+      code: "graph_diagnostics_operator_required",
+    });
+
+    await runs.setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 5,
+      idempotencyKey: "cycle:resume",
+      paused: false,
+      reason: "operator repaired responsibility",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const resumedDiagnostics = await runs.diagnostics({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+    });
+    expect(resumedDiagnostics).toMatchObject({
+      run: { status: "running", revision: 6 },
+      current: { redirect: null, interruption: null },
     });
 
     const dispatcher = pipelineGraphOutboxService(db);

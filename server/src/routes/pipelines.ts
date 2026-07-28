@@ -1674,6 +1674,26 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     res.json(await graphRuns.get({ companyId: scope.companyId, runId: runId.data }));
   });
 
+  router.get("/graph-runs/:runId/diagnostics", async (req, res) => {
+    const runId = z.string().uuid().safeParse(req.params.runId);
+    if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+    if (req.actor.type === "agent") {
+      throw forbidden("Graph runtime diagnostics require a human operator", {
+        code: "graph_diagnostics_operator_required",
+      });
+    }
+    const scope = await graphRunAccess(req, runId.data);
+    await assertPipelineWriteAccess(req, {
+      access,
+      companyId: scope.companyId,
+      pipelineId: scope.pipelineId,
+    });
+    res.json(await graphRuns.diagnostics({
+      companyId: scope.companyId,
+      runId: runId.data,
+    }));
+  });
+
   router.get("/graph-runs/:runId/events", async (req, res) => {
     const runId = z.string().uuid().safeParse(req.params.runId);
     if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
