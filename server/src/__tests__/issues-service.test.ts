@@ -3495,6 +3495,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       id: approvalId,
       companyId,
       type: "request_board_approval",
+      requestedByUserId: "approval-requester",
       status: "pending",
       payload: {},
     });
@@ -3519,6 +3520,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     expect(consumed).toEqual([expect.objectContaining({ id: issue.id, identifier: issue.identifier, status: "todo" })]);
     expect(released?.status).toBe("todo");
+    expect(released?.assigneeUserId).toBe("approval-requester");
     expect(comments.some((comment) => comment.body.includes("Approval blocker consumed"))).toBe(true);
   });
 
@@ -3529,6 +3531,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       id: approvalId,
       companyId,
       type: "request_board_approval",
+      requestedByUserId: "approval-requester",
       status: "pending",
       payload: {},
     });
@@ -3554,6 +3557,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       id: approvalId,
       companyId,
       type: "request_board_approval",
+      requestedByUserId: "approval-requester",
       status: "pending",
       payload: {},
     });
@@ -3572,8 +3576,12 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     expect(consumed).toEqual([expect.objectContaining({ id: issue.id, identifier: issue.identifier, status: "todo" })]);
     expect(released?.status).toBe("todo");
+    expect(released?.assigneeUserId).toBe("approval-requester");
     expect(comments.some((comment) =>
-      comment.body.includes("Approval blocker consumed") && comment.body.includes("Decision note: Not approved yet."),
+      comment.body.includes("Approval blocker consumed") &&
+      comment.body.includes("Decision note: Not approved yet.") &&
+      comment.body.includes("Current owner: user approval-requester.") &&
+      comment.body.includes("Next action: Address the decision note"),
     )).toBe(true);
   });
 
