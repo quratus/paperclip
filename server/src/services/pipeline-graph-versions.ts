@@ -30,6 +30,7 @@ export type PipelineGraphCompileInput = {
 export function decodePipelineGraphVersionCursor(cursor: string) {
   try {
     const decoded = Buffer.from(cursor, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== cursor) return null;
     if (!/^[1-9]\d{0,9}$/.test(decoded)) return null;
     const version = Number(decoded);
     return Number.isInteger(version) && version <= 2_147_483_647 ? version : null;

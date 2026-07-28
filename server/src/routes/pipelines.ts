@@ -173,7 +173,7 @@ const compileGraphSchema = z.object({
   cycleContracts: z.array(graphCycleContractSchema).max(100).optional(),
 });
 const listGraphVersionsQuerySchema = z.object({
-  cursor: z.string().trim().min(1).max(200).optional(),
+  cursor: z.string().min(1).max(200).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 const graphPipelineIdSchema = z.string().uuid();

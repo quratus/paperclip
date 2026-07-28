@@ -315,6 +315,14 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(invalidCursor.status).toBe(400);
     expect(invalidCursor.body.details).toMatchObject({ code: "invalid_cursor" });
 
+    for (const alias of ["MQ==", "MQ=", "M%Q", "M Q", " MQ "]) {
+      const noncanonicalCursor = await http
+        .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions`)
+        .query({ cursor: alias });
+      expect(noncanonicalCursor.status).toBe(400);
+      expect(noncanonicalCursor.body.details).toMatchObject({ code: "invalid_cursor" });
+    }
+
     const invalidPipeline = await http
       .post("/api/pipelines/not-a-uuid/graph/compile-preview")
       .send({ entryNodeKey: "work" });
