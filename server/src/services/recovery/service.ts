@@ -75,7 +75,10 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { evaluateIssueAdmission } from "../issue-admission.js";
-import { handBackCompletedAdmissionRedirect } from "../issue-admission-redirect.js";
+import {
+  handBackCompletedAdmissionRedirect,
+  redirectIssueAdmission,
+} from "../issue-admission-redirect.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -1086,6 +1089,94 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         source: "issue.assigned_todo_liveness_dispatch",
       }, "normal_model"),
     });
+  }
+
+  async function reconcileMissingDispositionAdmissionRedirects() {
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.kind, "missing_disposition"),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+    const result = {
+      checked: actions.length,
+      redirected: 0,
+      externalIntervention: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+
+    for (const action of actions) {
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, action.companyId),
+          eq(issues.id, action.sourceIssueId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!issue) {
+        result.skipped += 1;
+        continue;
+      }
+      const disposition = evaluateIssueAdmission({
+        issue,
+        source: "assignment",
+        actorType: "agent",
+      });
+      if (disposition.kind !== "redirect") {
+        result.skipped += 1;
+        continue;
+      }
+      const deniedAgentId =
+        action.returnOwnerAgentId ??
+        action.previousOwnerAgentId ??
+        issue.assigneeAgentId;
+      const redirect = await redirectIssueAdmission(db, {
+        companyId: action.companyId,
+        issueId: action.sourceIssueId,
+        deniedAgentId,
+        returnOwnerAgentId: deniedAgentId,
+        disposition,
+        requestedByActorType: "system",
+        requestedByActorId: "recovery.missing_disposition_admission_redirect",
+        checkoutRunId: null,
+        expectedStatuses: [issue.status],
+      });
+      if (redirect.kind === "retry") {
+        result.skipped += 1;
+        continue;
+      }
+      result.issueIds.push(action.sourceIssueId);
+      if (redirect.kind === "external_intervention") {
+        result.externalIntervention += 1;
+        continue;
+      }
+      await deps.enqueueWakeup(redirect.ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_admission_redirect",
+        payload: {
+          issueId: action.sourceIssueId,
+          recoveryActionId: redirect.recoveryActionId,
+          disposition: redirect.disposition,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        idempotencyKey: redirect.wakeIdempotencyKey,
+        contextSnapshot: {
+          issueId: action.sourceIssueId,
+          taskId: action.sourceIssueId,
+          source: "recovery.missing_disposition_admission_redirect",
+          recoveryActionId: redirect.recoveryActionId,
+        },
+      });
+      result.redirected += 1;
+    }
+
+    return result;
   }
 
   async function isInvocationBudgetBlocked(issue: typeof issues.$inferSelect, agentId: string) {
@@ -3727,6 +3818,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const missingDispositionAdmissionRedirects =
+      await reconcileMissingDispositionAdmissionRedirects();
     const admissionRedirectWakes = await reconcileAdmissionRedirectWakes();
     const candidates = await db
       .select()
@@ -3758,6 +3851,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
+      missingDispositionAdmissionRedirects,
       admissionRedirectWakes,
     };
 

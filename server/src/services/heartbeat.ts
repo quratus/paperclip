@@ -16413,6 +16413,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
+      if (opts.idempotencyKey) {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${
+            `heartbeat-wakeup:${agent.companyId}:${agentId}:${opts.idempotencyKey}`
+          }, 0))`,
+        );
+        const existingWake = await tx
+          .select({ runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, agent.companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            sql`${agentWakeupRequests.runId} is not null`,
+          ))
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingWake?.runId) {
+          const existingRun = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, agent.companyId),
+              eq(heartbeatRuns.agentId, agentId),
+              eq(heartbeatRuns.id, existingWake.runId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (existingRun) return { kind: "idempotent_replay" as const, run: existingRun };
+        }
+      }
+
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
@@ -16498,6 +16530,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind === "idempotent_replay") return queueOutcome.run;
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
