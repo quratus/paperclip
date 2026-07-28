@@ -3506,6 +3506,11 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     const blocked = await svc.update(issue.id, { status: "blocked", blockedByApprovalId: approvalId });
     expect(blocked?.status).toBe("blocked");
+    expect(blocked?.blockedByApprovalId).toBe(approvalId);
+
+    const [listedBlocked] = await svc.list(companyId, { status: "blocked" });
+    expect(listedBlocked?.blockedByApprovalId).toBe(approvalId);
+
     await db.update(approvals).set({ status: "approved", decidedAt: new Date() }).where(eq(approvals.id, approvalId));
 
     const consumed = await svc.consumeApprovalBlocker(approvalId, "approved");
@@ -3515,6 +3520,31 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(consumed).toEqual([expect.objectContaining({ id: issue.id, identifier: issue.identifier, status: "todo" })]);
     expect(released?.status).toBe("todo");
     expect(comments.some((comment) => comment.body.includes("Approval blocker consumed"))).toBe(true);
+  });
+
+  it("rejects clearing the only approval blocker on an already-blocked issue", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Approval wait",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await svc.update(issue.id, { status: "blocked", blockedByApprovalId: approvalId });
+
+    await expect(svc.update(issue.id, { blockedByApprovalId: null }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: { code: "blocked_state_requires_typed_blocker" },
+      });
   });
 
   it("consumes rejected approval blockers with the decision note", async () => {

@@ -8,6 +8,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  isUuidLike,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
@@ -24,6 +25,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, 
 import { redactEventPayload } from "../redaction.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { badRequest } from "../errors.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -124,8 +126,19 @@ export function approvalRoutes(
     return false;
   }
 
-  router.get("/companies/:companyId/approvals", async (req, res) => {
+  function requireCompanyIdParam(req: Request) {
     const companyId = req.params.companyId as string;
+    if (!isUuidLike(companyId)) {
+      throw badRequest("Invalid company id", {
+        code: "invalid_company_id",
+        parameter: "companyId",
+      });
+    }
+    return companyId;
+  }
+
+  router.get("/companies/:companyId/approvals", async (req, res) => {
+    const companyId = requireCompanyIdParam(req);
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     const status = req.query.status as string | undefined;
@@ -142,7 +155,7 @@ export function approvalRoutes(
   });
 
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
-    const companyId = req.params.companyId as string;
+    const companyId = requireCompanyIdParam(req);
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;

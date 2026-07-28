@@ -2584,6 +2584,7 @@ const issueListSelect = {
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
+  blockedByApprovalId: issues.blockedByApprovalId,
   blockedByExternal: issues.blockedByExternal,
   sourceTrust: issues.sourceTrust,
   startedAt: issues.startedAt,
@@ -4582,8 +4583,10 @@ export function issueService(db: Db) {
       : input.issueId
         ? await issueHasExistingIssueBlockers(input.companyId, input.issueId, dbOrTx)
         : false;
-    const hasApprovalBlocker = input.blockedByApprovalId
-      ? (await assertApprovalCanBlock(input.companyId, input.blockedByApprovalId, dbOrTx), true)
+    const hasApprovalBlocker = input.blockedByApprovalId !== undefined
+      ? input.blockedByApprovalId
+        ? (await assertApprovalCanBlock(input.companyId, input.blockedByApprovalId, dbOrTx), true)
+        : false
       : input.issueId
         ? await issueHasActiveApprovalBlocker(input.companyId, input.issueId, dbOrTx)
         : false;
@@ -6331,7 +6334,7 @@ export function issueService(db: Db) {
         blockedByExternal: issueData.blockedByExternal,
       });
       if (blockedByApprovalId) await assertApprovalCanBlock(companyId, blockedByApprovalId);
-      issueData.blockedByApprovalId = blockedByApprovalId ?? null;
+      (issueData as Partial<typeof issues.$inferInsert>).blockedByApprovalId = blockedByApprovalId ?? null;
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -6785,7 +6788,7 @@ export function issueService(db: Db) {
         dbOrTx,
       });
       if (blockedByApprovalId) await assertApprovalCanBlock(existing.companyId, blockedByApprovalId, dbOrTx);
-      if (blockedByApprovalId !== undefined) issueData.blockedByApprovalId = blockedByApprovalId;
+      if (blockedByApprovalId !== undefined) patch.blockedByApprovalId = blockedByApprovalId;
       if (patch.status === "in_progress") {
         const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
           ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
