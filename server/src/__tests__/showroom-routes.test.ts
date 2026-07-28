@@ -11,6 +11,7 @@ const mockIssues = vi.hoisted(() => ({
   createAttachment: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockStorage = vi.hoisted(() => ({ putFile: vi.fn() }));
 
 vi.mock("../services/index.js", () => ({
   issueService: () => mockIssues,
@@ -32,7 +33,7 @@ function app() {
   };
   const server = express();
   server.use(express.json());
-  server.use("/api", showroomRoutes(db as never, {} as never));
+  server.use("/api", showroomRoutes(db as never, mockStorage as never));
   server.use((error: { status?: number; message?: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(error.status ?? 500).json({ error: { message: error.message } });
   });
@@ -43,9 +44,18 @@ describe("showroom feedback routing", () => {
   beforeEach(() => {
     Object.values(mockIssues).forEach((mock) => mock.mockReset());
     mockLogActivity.mockReset();
+    mockStorage.putFile.mockReset();
     mockIssues.getById.mockResolvedValue({ id: "issue-1", companyId: "company-1", identifier: "OPS-12", status: "done" });
     mockIssues.update.mockResolvedValue({ id: "issue-1", companyId: "company-1", identifier: "OPS-12", status: "todo" });
     mockIssues.addComment.mockResolvedValue({ id: "comment-1" });
+    mockStorage.putFile.mockResolvedValue({
+      provider: "local",
+      objectKey: "issues/issue-1/showroom-feedback/screenshot.png",
+      contentType: "image/png",
+      byteSize: 68,
+      sha256: "a".repeat(64),
+      originalFilename: "showroom-feedback.png",
+    });
   });
 
   it("adds contextual feedback to matched work and reopens completed work", async () => {
@@ -86,5 +96,25 @@ describe("showroom feedback routing", () => {
     expect(response.status).toBe(201);
     expect(response.body).toMatchObject({ identifier: "OPS-13", routed: false, reopened: false });
     expect(mockIssues.create).toHaveBeenCalledWith("company-1", expect.objectContaining({ status: "backlog" }));
+  });
+
+  it("attaches an explicitly supplied screenshot to the routed feedback comment", async () => {
+    const response = await request(app())
+      .post(`/api/showrooms/${token}/feedback`)
+      .send({
+        submissionId: "c59fce25-9f88-4cd4-a74a-b28e8fecb543",
+        text: "This control needs more explanation.",
+        viewport: { width: 1440, height: 900 },
+        context: { sourceIssueId: "17ef2c4b-1ed2-4cf8-9f4d-d7bdb0d33b13" },
+        screenshotDataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+Gyr7AAAAAElFTkSuQmCC",
+      });
+
+    expect(response.status).toBe(201);
+    expect(mockStorage.putFile).toHaveBeenCalledOnce();
+    expect(mockIssues.createAttachment).toHaveBeenCalledWith(expect.objectContaining({
+      issueId: "issue-1",
+      issueCommentId: "comment-1",
+      contentType: "image/png",
+    }));
   });
 });
