@@ -355,6 +355,37 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(firstActivation.version.status).toBe("active");
     expect(firstActivation.version.activatedAt).toBeInstanceOf(Date);
 
+    await db.update(pipelineStages)
+      .set({ position: 300 })
+      .where(eq(pipelineStages.id, fixture.stages[0]!.id));
+    await expect(cases.ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "stale-topology-case",
+      title: "Stale topology case",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_activation_stale" },
+    });
+    await db.update(pipelineStages)
+      .set({ position: 100 })
+      .where(eq(pipelineStages.id, fixture.stages[0]!.id));
+    await expect(cases.ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "wrong-entry-case",
+      title: "Wrong entry case",
+      stageKey: "done",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "pipeline_graph_entry_mismatch",
+        entryNodeKey: "work",
+      },
+    });
+
     const firstCase = await cases.ingestCase({
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,

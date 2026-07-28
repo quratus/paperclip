@@ -25,6 +25,7 @@ import {
   routines,
 } from "@paperclipai/db";
 import {
+  compilePipelineGraph,
   extractRoutineVariableNames,
   isBuiltinRoutineVariable,
   syncRoutineVariablesWithTemplate,
@@ -3261,37 +3262,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
     assertStageEnabled(toStage, "transition");
-    if (current.graphVersionId && fromStage.id !== toStage.id) {
-      const pinnedVersion = await tx
-        .select({ definition: pipelineGraphVersions.definition })
-        .from(pipelineGraphVersions)
-        .where(and(
-          eq(pipelineGraphVersions.id, current.graphVersionId),
-          eq(pipelineGraphVersions.companyId, input.companyId),
-          eq(pipelineGraphVersions.pipelineId, current.pipelineId),
-        ))
-        .then((rows) => rows[0] ?? null);
-      if (!pinnedVersion) {
-        throw conflict("Pinned pipeline graph version is unavailable", {
-          code: "pipeline_graph_version_missing",
-          graphVersionId: current.graphVersionId,
-        });
-      }
-      const nodeKeys = new Set(pinnedVersion.definition.nodes.map((node) => node.key));
-      const allowed = nodeKeys.has(fromStage.key)
-        && nodeKeys.has(toStage.key)
-        && pinnedVersion.definition.edges.some(
-          (edge) => edge.fromNodeKey === fromStage.key && edge.toNodeKey === toStage.key,
-        );
-      if (!allowed) {
-        throw conflict("Transition is not allowed by the pinned graph version", {
-          code: "pinned_graph_transition_not_allowed",
-          graphVersionId: current.graphVersionId,
-          fromStageKey: fromStage.key,
-          toStageKey: toStage.key,
-        });
-      }
-    }
+    await assertPinnedGraphTransitionAllowed(tx, {
+      companyId: input.companyId,
+      caseRow: current,
+      fromStage,
+      toStage,
+    });
     if (fromStage.id !== toStage.id) {
       assertActorCanApproveStageExit(fromStage, input.actor);
       await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
@@ -3412,6 +3388,47 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       });
     }
     return { case: updated, event, automationLedger: ledger };
+  }
+
+  async function assertPinnedGraphTransitionAllowed(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      caseRow: typeof pipelineCases.$inferSelect;
+      fromStage: typeof pipelineStages.$inferSelect;
+      toStage: typeof pipelineStages.$inferSelect;
+    },
+  ) {
+    if (!input.caseRow.graphVersionId || input.fromStage.id === input.toStage.id) return;
+    const pinnedVersion = await tx
+      .select({ definition: pipelineGraphVersions.definition })
+      .from(pipelineGraphVersions)
+      .where(and(
+        eq(pipelineGraphVersions.id, input.caseRow.graphVersionId),
+        eq(pipelineGraphVersions.companyId, input.companyId),
+        eq(pipelineGraphVersions.pipelineId, input.caseRow.pipelineId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!pinnedVersion) {
+      throw conflict("Pinned pipeline graph version is unavailable", {
+        code: "pipeline_graph_version_missing",
+        graphVersionId: input.caseRow.graphVersionId,
+      });
+    }
+    const nodeKeys = new Set(pinnedVersion.definition.nodes.map((node) => node.key));
+    const allowed = nodeKeys.has(input.fromStage.key)
+      && nodeKeys.has(input.toStage.key)
+      && pinnedVersion.definition.edges.some(
+        (edge) => edge.fromNodeKey === input.fromStage.key && edge.toNodeKey === input.toStage.key,
+      );
+    if (!allowed) {
+      throw conflict("Transition is not allowed by the pinned graph version", {
+        code: "pinned_graph_transition_not_allowed",
+        graphVersionId: input.caseRow.graphVersionId,
+        fromStageKey: input.fromStage.key,
+        toStageKey: input.toStage.key,
+      });
+    }
   }
 
   // A case can enter an auto-advance stage after its children are already
@@ -3989,7 +4006,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
         );
         const activeGraphVersion = await tx
-          .select({ id: pipelineGraphVersions.id })
+          .select({
+            id: pipelineGraphVersions.id,
+            definition: pipelineGraphVersions.definition,
+          })
           .from(pipelineGraphVersions)
           .where(and(
             eq(pipelineGraphVersions.companyId, input.companyId),
@@ -3998,6 +4018,42 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           ))
           .limit(1)
           .then((rows) => rows[0] ?? null);
+        if (activeGraphVersion) {
+          const [liveStages, liveTransitions] = await Promise.all([
+            tx.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, input.pipelineId)),
+            tx.select().from(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, input.pipelineId)),
+          ]);
+          const stageKeyById = new Map(liveStages.map((stage) => [stage.id, stage.key]));
+          const compiled = compilePipelineGraph({
+            entryNodeKey: activeGraphVersion.definition.entryNodeKey,
+            nodes: liveStages.map((stage) => ({
+              key: stage.key,
+              name: stage.name,
+              kind: stage.kind as "working" | "review" | "done" | "cancelled",
+              position: stage.position,
+              config: stage.config,
+            })),
+            edges: liveTransitions.map((transition) => ({
+              fromNodeKey: stageKeyById.get(transition.fromStageId) ?? transition.fromStageId,
+              toNodeKey: stageKeyById.get(transition.toStageId) ?? transition.toStageId,
+              outcome: transition.label,
+            })),
+            cycleContracts: activeGraphVersion.definition.cycleContracts,
+          });
+          if (!compiled.ok || !isDeepStrictEqual(compiled.definition, activeGraphVersion.definition)) {
+            throw conflict("Live pipeline topology differs from the active graph version", {
+              code: "pipeline_graph_activation_stale",
+              graphVersionId: activeGraphVersion.id,
+            });
+          }
+          if (input.stageKey && input.stageKey !== activeGraphVersion.definition.entryNodeKey) {
+            throw conflict("Versioned cases must start at the pinned graph entry node", {
+              code: "pipeline_graph_entry_mismatch",
+              graphVersionId: activeGraphVersion.id,
+              entryNodeKey: activeGraphVersion.definition.entryNodeKey,
+            });
+          }
+        }
         const requestKey = input.requestKey?.trim() || null;
         const parentCase = await assertValidParentCase(tx, { companyId: input.companyId, parentCaseId: input.parentCaseId ?? null });
         if (requestKey && !input.parentCaseId) {
@@ -4033,8 +4089,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             ...Array.from(blockedByCaseKeyMap.values()),
           ],
         });
-        const stage = input.stageKey
-          ? await getStageByKeyOrThrow(tx, input.pipelineId, input.stageKey)
+        const stageKey = activeGraphVersion?.definition.entryNodeKey ?? input.stageKey;
+        const stage = stageKey
+          ? await getStageByKeyOrThrow(tx, input.pipelineId, stageKey)
           : await tx
             .select()
             .from(pipelineStages)
@@ -4606,6 +4663,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             blockers: plan.blockers,
           });
         }
+        await assertPinnedGraphTransitionAllowed(tx, {
+          companyId: input.companyId,
+          caseRow: detail.case,
+          fromStage: detail.stage,
+          toStage: plan.targetStageRow,
+        });
         const requestedEvent = await writeCaseEvent(tx, {
           companyId: input.companyId,
           caseId: input.caseId,
