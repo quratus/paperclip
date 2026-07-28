@@ -58,6 +58,7 @@ import {
   issueWorkProducts,
   projects,
   projectWorkspaces,
+  pipelineGraphRuns,
   routineRevisions,
   routineRuns,
   routines,
@@ -15264,6 +15265,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload,
     });
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    const isPipelineGraphWake = reason === "pipeline_graph_wake";
+    const graphRunId = isPipelineGraphWake
+      ? readNonEmptyString(enrichedContextSnapshot.graphRunId)
+      : null;
+    const graphRunRevisionValue = enrichedContextSnapshot.graphRunRevision;
+    const graphRunRevision =
+      typeof graphRunRevisionValue === "number" &&
+      Number.isInteger(graphRunRevisionValue) &&
+      graphRunRevisionValue > 0
+        ? graphRunRevisionValue
+        : null;
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
@@ -16374,10 +16386,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       sameScopeScheduledRetryRun ??
       (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
 
-    const coalescedTargetRun = filterZombieCoalesceTarget(
-      rawCoalescedTarget,
-      liveRunExecutions,
-    );
+    const coalescedTargetRun = isPipelineGraphWake
+      ? null
+      : filterZombieCoalesceTarget(
+          rawCoalescedTarget,
+          liveRunExecutions,
+        );
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -16413,6 +16427,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
+      if (isPipelineGraphWake) {
+        if (graphRunId) {
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + graphRunId}, 0))`,
+          );
+        }
+        const graphRun = graphRunId
+          ? await tx
+            .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+            .from(pipelineGraphRuns)
+            .where(and(
+              eq(pipelineGraphRuns.companyId, agent.companyId),
+              eq(pipelineGraphRuns.id, graphRunId),
+            ))
+            .then((rows) => rows[0] ?? null)
+          : null;
+        if (
+          !graphRun ||
+          !["running", "paused"].includes(graphRun.status) ||
+          graphRunRevision === null ||
+          graphRun.revision !== graphRunRevision
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "pipeline_graph_wake_superseded",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+      }
       if (opts.idempotencyKey) {
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${

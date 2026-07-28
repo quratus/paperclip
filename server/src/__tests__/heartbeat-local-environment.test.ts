@@ -12,12 +12,18 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  pipelineStages,
+  pipelineTransitions,
+  pipelines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { pipelineGraphRunService } from "../services/pipeline-graph-runs.ts";
+import { pipelineGraphVersionService } from "../services/pipeline-graph-versions.ts";
+import { pipelineService } from "../services/pipelines.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -204,6 +210,60 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       permissions: {},
     });
 
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId,
+      key: "heartbeat-idempotency",
+      name: "Heartbeat idempotency",
+    }).returning();
+    const stages = await db.insert(pipelineStages).values([
+      {
+        pipelineId: pipeline!.id,
+        key: "work",
+        name: "Work",
+        kind: "working",
+        position: 100,
+        config: { targetAgentId: agentId },
+      },
+      {
+        pipelineId: pipeline!.id,
+        key: "done",
+        name: "Done",
+        kind: "done",
+        position: 200,
+      },
+    ]).returning();
+    await db.insert(pipelineTransitions).values({
+      pipelineId: pipeline!.id,
+      fromStageId: stages[0]!.id,
+      toStageId: stages[1]!.id,
+      label: "complete",
+    });
+    const graphVersion = await pipelineGraphVersionService(db).createDraft({
+      companyId,
+      pipelineId: pipeline!.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphVersionService(db).activate({
+      companyId,
+      pipelineId: pipeline!.id,
+      versionId: graphVersion.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId,
+      pipelineId: pipeline!.id,
+      caseKey: "heartbeat-idempotency",
+      title: "Heartbeat idempotency",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const graphRun = await pipelineGraphRunService(db).start({
+      companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "heartbeat-idempotency:start",
+      actor: { type: "user", userId: "board-user" },
+    });
     const heartbeat = heartbeatService(db);
     const wakeOptions = {
       source: "automation" as const,
@@ -212,7 +272,11 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       idempotencyKey,
       requestedByActorType: "system" as const,
       requestedByActorId: "pipeline_graph_outbox",
-      contextSnapshot: { pipelineGraphWake: true },
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: graphRun.run.id,
+        graphRunRevision: graphRun.run.revision,
+      },
     };
     const accepted = await heartbeat.wakeup(agentId, wakeOptions);
     expect(accepted).not.toBeNull();
@@ -238,6 +302,30 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       ));
     expect(wakeups).toHaveLength(1);
     expect(wakeups[0]).toMatchObject({ runId: accepted!.id });
+
+    await pipelineGraphRunService(db).cancel({
+      companyId,
+      runId: graphRun.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "heartbeat-idempotency:cancel",
+      reason: "operator cancelled before another acceptance",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const rejected = await heartbeat.wakeup(agentId, {
+      ...wakeOptions,
+      idempotencyKey: `${idempotencyKey}:after-cancel`,
+    });
+    expect(rejected).toBeNull();
+    const rejectedWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.idempotencyKey, `${idempotencyKey}:after-cancel`))
+      .then((rows) => rows[0] ?? null);
+    expect(rejectedWake).toMatchObject({
+      status: "skipped",
+      reason: "pipeline_graph_wake_superseded",
+      runId: null,
+    });
   });
 
   it("injects run-scoped Paperclip env into process agents", async () => {

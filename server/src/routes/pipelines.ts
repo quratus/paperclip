@@ -88,6 +88,7 @@ import {
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
 import { pipelineGraphRunService } from "../services/pipeline-graph-runs.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
 const STAGE_INSTRUCTIONS_PREFIX = "stage-instructions:";
@@ -867,11 +868,30 @@ async function assertIssueLinkMutationAllowed(
   await input.issuesSvc.assertCheckoutOwner(input.issue.id, actorAgentId, runId);
 }
 
-export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineService>[1] = {}) {
+type PipelineRouteOptions = Parameters<typeof pipelineService>[1] & {
+  graphHeartbeat?: {
+    cancelRun: (
+      runId: string,
+      reason?: string,
+      options?: {
+        errorCode?: string;
+        suppressImmediateRecovery?: boolean;
+      },
+    ) => Promise<unknown>;
+  };
+};
+
+export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
   const router = Router();
   const svc = pipelineService(db, options);
   const graphVersions = pipelineGraphVersionService(db);
-  const graphRuns = pipelineGraphRunService(db);
+  const graphHeartbeat = options.graphHeartbeat ?? heartbeatService(db);
+  const graphRuns = pipelineGraphRunService(db, {
+    cancelHeartbeatRun: (runId, reason) => graphHeartbeat.cancelRun(runId, reason, {
+      errorCode: "pipeline_graph_cancelled",
+      suppressImmediateRecovery: true,
+    }),
+  });
   const outputsSvc = pipelineCaseOutputsService(db);
   const access = accessService(db);
   const issuesSvc = issueService(db);
@@ -1781,6 +1801,36 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       },
     );
   }
+
+  router.post(
+    "/graph-runs/:runId/cancel",
+    validate(graphRunLifecycleSchema),
+    async (req, res) => {
+      const runId = z.string().uuid().safeParse(req.params.runId);
+      if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+      if (req.actor.type === "agent") {
+        throw forbidden("Graph runtime cancellation requires a human operator", {
+          code: "graph_control_operator_required",
+        });
+      }
+      const scope = await graphRunAccess(req, runId.data);
+      await assertPipelineWriteAccess(req, {
+        access,
+        companyId: scope.companyId,
+        pipelineId: scope.pipelineId,
+      });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user actor is required");
+      res.json(await graphRuns.cancel({
+        companyId: scope.companyId,
+        runId: runId.data,
+        expectedRevision: req.body.expectedRevision,
+        idempotencyKey: req.body.idempotencyKey,
+        reason: req.body.reason,
+        actor,
+      }));
+    },
+  );
 
   router.post("/pipelines/:pipelineId/cases/batch", validate(batchIngestSchema), async (req, res) => {
     const pipelineId = req.params.pipelineId as string;
