@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, pipelineGraphWakeOutbox } from "@paperclipai/db";
+import { agents, pipelineGraphRuns, pipelineGraphWakeOutbox } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
 function stableStringify(value: unknown): string {
@@ -116,6 +116,7 @@ export function pipelineGraphOutboxService(db: Db) {
           code: "graph_wake_receipt_conflict",
         });
       }
+      if (existing.status === "cancelled") return existing;
       throw conflict("Graph wake claim is stale", {
         code: "graph_wake_claim_stale",
         status: existing.status,
@@ -148,6 +149,32 @@ export function pipelineGraphOutboxService(db: Db) {
       const retryDelayMs = Math.max(input.retryDelayMs ?? 5_000, 0);
       for (const row of rows) {
         const payload = row.payload ?? {};
+        const expectedRevision = typeof payload.runRevision === "number"
+          ? payload.runRevision
+          : null;
+        const graphRun = await db
+          .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+          .from(pipelineGraphRuns)
+          .where(and(
+            eq(pipelineGraphRuns.companyId, input.companyId),
+            eq(pipelineGraphRuns.id, row.runId),
+          ))
+          .then((runRows) => runRows[0] ?? null);
+        if (
+          !graphRun ||
+          !["running", "paused"].includes(graphRun.status) ||
+          expectedRevision === null ||
+          graphRun.revision !== expectedRevision
+        ) {
+          await this.cancelClaim({
+            companyId: input.companyId,
+            outboxId: row.id,
+            claimToken: row.claimToken!,
+            reason: "Graph wake superseded by graph run status or revision",
+            now: input.now,
+          });
+          continue;
+        }
         const targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId : null;
         if (payload.dispatchEnabled !== true || !targetAgentId) {
           await this.release({
@@ -197,6 +224,7 @@ export function pipelineGraphOutboxService(db: Db) {
             contextSnapshot: {
               pipelineGraphWake: true,
               graphRunId: row.runId,
+              graphRunRevision: payload.runRevision,
               graphEventId: row.eventId,
               pipelineCaseId: row.caseId,
               targetNodeKey: row.targetNodeKey,
@@ -204,7 +232,7 @@ export function pipelineGraphOutboxService(db: Db) {
             },
           });
           if (!run) throw new Error("Heartbeat wake was not accepted");
-          await this.acknowledge({
+          const acknowledged = await this.acknowledge({
             companyId: input.companyId,
             outboxId: row.id,
             claimToken: row.claimToken!,
@@ -215,20 +243,73 @@ export function pipelineGraphOutboxService(db: Db) {
             },
             now: input.now,
           });
-          dispatched += 1;
+          if (acknowledged.status === "dispatched") dispatched += 1;
         } catch (error) {
-          await this.release({
-            companyId: input.companyId,
-            outboxId: row.id,
-            claimToken: row.claimToken!,
-            error: error instanceof Error ? error.message : "Graph wake dispatch failed",
-            retryAt: new Date((input.now ?? new Date()).getTime() + retryDelayMs),
-            now: input.now,
-          });
-          retried += 1;
+          const current = await db
+            .select({ status: pipelineGraphWakeOutbox.status })
+            .from(pipelineGraphWakeOutbox)
+            .where(and(
+              eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+              eq(pipelineGraphWakeOutbox.id, row.id),
+            ))
+            .then((outboxRows) => outboxRows[0] ?? null);
+          if (current?.status !== "cancelled") {
+            await this.release({
+              companyId: input.companyId,
+              outboxId: row.id,
+              claimToken: row.claimToken!,
+              error: error instanceof Error ? error.message : "Graph wake dispatch failed",
+              retryAt: new Date((input.now ?? new Date()).getTime() + retryDelayMs),
+              now: input.now,
+            });
+            retried += 1;
+          }
         }
       }
       return { claimed: rows.length, dispatched, retried };
+    },
+
+    async cancelClaim(input: {
+      companyId: string;
+      outboxId: string;
+      claimToken: string;
+      reason: string;
+      now?: Date;
+    }) {
+      const now = input.now ?? new Date();
+      const [row] = await db
+        .update(pipelineGraphWakeOutbox)
+        .set({
+          status: "cancelled",
+          claimToken: null,
+          claimedBy: null,
+          claimedAt: null,
+          claimExpiresAt: null,
+          lastError: input.reason,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+          eq(pipelineGraphWakeOutbox.id, input.outboxId),
+          eq(pipelineGraphWakeOutbox.status, "claimed"),
+          eq(pipelineGraphWakeOutbox.claimToken, input.claimToken),
+        ))
+        .returning();
+      if (row) return row;
+      const existing = await db
+        .select()
+        .from(pipelineGraphWakeOutbox)
+        .where(and(
+          eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+          eq(pipelineGraphWakeOutbox.id, input.outboxId),
+        ))
+        .then((existingRows) => existingRows[0] ?? null);
+      if (!existing) throw notFound("Graph wake outbox item not found");
+      if (existing.status === "cancelled") return existing;
+      throw conflict("Graph wake claim is stale", {
+        code: "graph_wake_claim_stale",
+        status: existing.status,
+      });
     },
 
     async release(input: {
@@ -261,6 +342,15 @@ export function pipelineGraphOutboxService(db: Db) {
         ))
         .returning();
       if (!row) {
+        const existing = await db
+          .select()
+          .from(pipelineGraphWakeOutbox)
+          .where(and(
+            eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+            eq(pipelineGraphWakeOutbox.id, input.outboxId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (existing?.status === "cancelled") return existing;
         throw unprocessable("Graph wake claim cannot be released", {
           code: "graph_wake_claim_stale",
         });

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  heartbeatRuns,
   pipelineCases,
   pipelineAutomationExecutions,
   pipelineGraphRunEvents,
@@ -129,7 +130,12 @@ function evolveCycleState(input: {
   return { state, interruption };
 }
 
-export function pipelineGraphRunService(db: Db) {
+export function pipelineGraphRunService(
+  db: Db,
+  deps: {
+    cancelHeartbeatRun?: (runId: string, reason: string) => Promise<unknown>;
+  } = {},
+) {
   return {
     async start(input: {
       companyId: string;
@@ -909,6 +915,138 @@ export function pipelineGraphRunService(db: Db) {
         }
         return { changed: true as const, run: updated!, event: event! };
       });
+    },
+
+    async cancel(input: {
+      companyId: string;
+      runId: string;
+      expectedRevision: number;
+      idempotencyKey: string;
+      reason: string;
+      actor: PipelineGraphVersionActor;
+    }) {
+      const hash = requestHash({
+        operation: "cancel",
+        runId: input.runId,
+        expectedRevision: input.expectedRevision,
+        reason: input.reason,
+        actor: actorEnvelope(input.actor),
+      });
+      const result = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + input.runId}, 0))`,
+        );
+        const replay = await tx
+          .select()
+          .from(pipelineGraphRunEvents)
+          .where(and(
+            eq(pipelineGraphRunEvents.companyId, input.companyId),
+            eq(pipelineGraphRunEvents.runId, input.runId),
+            eq(pipelineGraphRunEvents.idempotencyKey, input.idempotencyKey),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (replay && replay.requestHash !== hash) {
+          throw conflict("Graph event idempotency key was reused with a different request", {
+            code: "graph_event_idempotency_conflict",
+          });
+        }
+        const run = await tx.select().from(pipelineGraphRuns).where(and(
+          eq(pipelineGraphRuns.companyId, input.companyId),
+          eq(pipelineGraphRuns.id, input.runId),
+        )).then((rows) => rows[0] ?? null);
+        if (!run) throw notFound("Graph run not found");
+        if (!replay) {
+          if (run.status !== "running" && run.status !== "paused") {
+            throw unprocessable("Only active graph runs can be cancelled", {
+              code: "graph_run_cannot_cancel",
+              status: run.status,
+            });
+          }
+          if (run.revision !== input.expectedRevision) {
+            throw conflict("Graph run changed", {
+              code: "graph_run_revision_conflict",
+              expectedRevision: input.expectedRevision,
+              currentRevision: run.revision,
+            });
+          }
+        }
+        const now = new Date();
+        const updated = replay
+          ? run
+          : await tx.update(pipelineGraphRuns).set({
+              status: "cancelled",
+              pausedAt: null,
+              finishedAt: now,
+              revision: run.revision + 1,
+              nextEventSequence: run.nextEventSequence + 1,
+              updatedAt: now,
+            }).where(and(
+              eq(pipelineGraphRuns.id, run.id),
+              eq(pipelineGraphRuns.revision, input.expectedRevision),
+            )).returning().then((rows) => rows[0] ?? null);
+        if (!updated) {
+          throw conflict("Graph run changed", { code: "graph_run_revision_conflict" });
+        }
+        const event = replay ?? await tx.insert(pipelineGraphRunEvents).values({
+          companyId: input.companyId,
+          runId: run.id,
+          sequence: run.nextEventSequence,
+          type: "run_cancelled",
+          nodeKey: run.currentNodeKey,
+          ...actorEnvelope(input.actor),
+          idempotencyKey: input.idempotencyKey,
+          requestHash: hash,
+          payload: {
+            revision: updated.revision,
+            reason: input.reason,
+            status: updated.status,
+          },
+        }).returning().then((rows) => rows[0]!);
+        if (!replay) {
+          await tx.update(pipelineGraphWakeOutbox).set({
+            status: "cancelled",
+            claimToken: null,
+            claimedBy: null,
+            claimedAt: null,
+            claimExpiresAt: null,
+            lastError: input.reason,
+            updatedAt: now,
+          }).where(and(
+            eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+            eq(pipelineGraphWakeOutbox.runId, input.runId),
+            inArray(pipelineGraphWakeOutbox.status, ["pending", "claimed"]),
+          ));
+        }
+        const heartbeatRunIds = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, input.companyId),
+            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'graphRunId' = ${input.runId}`,
+          ))
+          .then((rows) => rows.map((row) => row.id));
+        return {
+          changed: !replay,
+          run: updated,
+          event,
+          heartbeatRunIds,
+        };
+      });
+      if (deps.cancelHeartbeatRun) {
+        await Promise.all(result.heartbeatRunIds.map((heartbeatRunId) =>
+          deps.cancelHeartbeatRun!(
+            heartbeatRunId,
+            `Cancelled because graph run ${input.runId} was cancelled: ${input.reason}`,
+          ),
+        ));
+      }
+      return {
+        changed: result.changed,
+        run: result.run,
+        event: result.event,
+        cancelledHeartbeatRunCount: result.heartbeatRunIds.length,
+      };
     },
 
     async get(input: { companyId: string; runId: string }) {

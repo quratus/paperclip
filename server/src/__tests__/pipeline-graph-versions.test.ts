@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -1328,7 +1328,10 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     const [crossCompanyTarget] = await db
       .select()
       .from(pipelineGraphWakeOutbox)
-      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
+      .where(and(
+        eq(pipelineGraphWakeOutbox.status, "pending"),
+        sql`${pipelineGraphWakeOutbox.payload} ->> 'runRevision' = '6'`,
+      ))
       .limit(1);
     await db.update(pipelineGraphWakeOutbox)
       .set({
@@ -1365,20 +1368,18 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       name: "Graph target agent",
       role: "engineer",
     });
-    const [dispatchable] = await db
-      .select()
-      .from(pipelineGraphWakeOutbox)
-      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
-      .limit(1);
+    const dispatchable = crossCompanyTarget!;
     await db.update(pipelineGraphWakeOutbox)
       .set({
+        status: "pending",
+        lastError: null,
         payload: {
-          ...dispatchable!.payload,
+          ...dispatchable.payload,
           dispatchEnabled: true,
           targetAgentId,
         },
       })
-      .where(eq(pipelineGraphWakeOutbox.id, dispatchable!.id));
+      .where(eq(pipelineGraphWakeOutbox.id, dispatchable.id));
     const heartbeatRunId = randomUUID();
     const wakeupRequestId = randomUUID();
     const wakeCalls: Array<{ agentId: string; opts: Record<string, unknown> }> = [];
@@ -1420,10 +1421,31 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       },
     });
 
+    await runs.setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 6,
+      idempotencyKey: "cycle:pause-for-retry-test",
+      paused: true,
+      reason: "prepare retry fixture",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await runs.setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 7,
+      idempotencyKey: "cycle:resume-for-retry-test",
+      paused: false,
+      reason: "prepare retry fixture",
+      actor: { type: "user", userId: "board-user" },
+    });
     const [retryable] = await db
       .select()
       .from(pipelineGraphWakeOutbox)
-      .where(eq(pipelineGraphWakeOutbox.status, "pending"))
+      .where(and(
+        eq(pipelineGraphWakeOutbox.status, "pending"),
+        sql`${pipelineGraphWakeOutbox.payload} ->> 'runRevision' = '8'`,
+      ))
       .limit(1);
     await db.update(pipelineGraphWakeOutbox)
       .set({
@@ -1453,5 +1475,163 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       lastError: "temporary heartbeat outage",
     });
     expect(retriedRow!.availableAt.getTime()).toBe(retryNow.getTime() + 60_000);
+  });
+
+  it("cancels graph work, pending wakes, and accepted heartbeat runs idempotently", async () => {
+    const fixture = await seedLinearPipeline();
+    const draft = await pipelineGraphVersionService(db).createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphVersionService(db).activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "cancel-race",
+      title: "Cancel race",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [targetAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Cancellation target",
+      role: "engineer",
+    }).returning();
+    const started = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "cancel-race:start",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphRunService(db).setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "cancel-race:pause",
+      paused: true,
+      reason: "prepare controlled cancellation",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphRunService(db).setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 2,
+      idempotencyKey: "cancel-race:resume",
+      paused: false,
+      reason: "create a pending graph wake",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [claimedWake] = await pipelineGraphOutboxService(db).claim({
+      companyId: fixture.companyId,
+      workerId: "cancel-race-dispatcher",
+      limit: 1,
+    });
+    expect(claimedWake).toMatchObject({ status: "claimed" });
+    const [acceptedHeartbeatRun] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgent!.id,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 3,
+      },
+    }).returning();
+    const cancelHeartbeatRun = vi.fn(async () => null);
+    const runs = pipelineGraphRunService(db, { cancelHeartbeatRun });
+    const cancelled = await runs.cancel({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 3,
+      idempotencyKey: "cancel-race:cancel",
+      reason: "operator stopped unsafe trajectory",
+      actor: { type: "user", userId: "board-user" },
+    });
+    expect(cancelled).toMatchObject({
+      changed: true,
+      run: { status: "cancelled", revision: 4 },
+      event: { type: "run_cancelled" },
+      cancelledHeartbeatRunCount: 1,
+    });
+    expect(cancelHeartbeatRun).toHaveBeenCalledWith(
+      acceptedHeartbeatRun!.id,
+      expect.stringContaining("operator stopped unsafe trajectory"),
+    );
+    const wakeRows = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id));
+    expect(wakeRows).toHaveLength(1);
+    expect(wakeRows[0]).toMatchObject({
+      status: "cancelled",
+      claimToken: null,
+      claimedBy: null,
+      claimExpiresAt: null,
+    });
+    await expect(pipelineGraphOutboxService(db).release({
+      companyId: fixture.companyId,
+      outboxId: claimedWake!.id,
+      claimToken: claimedWake!.claimToken!,
+      error: "late dispatcher failure",
+    })).resolves.toMatchObject({ status: "cancelled" });
+
+    const replay = await runs.cancel({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 3,
+      idempotencyKey: "cancel-race:cancel",
+      reason: "operator stopped unsafe trajectory",
+      actor: { type: "user", userId: "board-user" },
+    });
+    expect(replay).toMatchObject({
+      changed: false,
+      run: { status: "cancelled", revision: 4 },
+      cancelledHeartbeatRunCount: 1,
+    });
+    expect(cancelHeartbeatRun).toHaveBeenCalledTimes(2);
+    await expect(runs.cancel({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 3,
+      idempotencyKey: "cancel-race:cancel",
+      reason: "different request",
+      actor: { type: "user", userId: "board-user" },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_event_idempotency_conflict" },
+    });
+
+    const agentApp = express();
+    agentApp.use(express.json());
+    agentApp.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId: targetAgent!.id,
+        companyId: fixture.companyId,
+        source: "agent_key",
+      };
+      next();
+    });
+    agentApp.use("/api", pipelineRoutes(db, {
+      graphHeartbeat: { cancelRun: async () => null },
+    }));
+    agentApp.use(errorHandler);
+    const denied = await request(agentApp)
+      .post(`/api/graph-runs/${started.run.id}/cancel`)
+      .send({
+        expectedRevision: 4,
+        idempotencyKey: "cancel-race:agent-cancel",
+        reason: "agent must not control cancellation",
+      });
+    expect(denied.status).toBe(403);
+    expect(denied.body.details).toMatchObject({
+      code: "graph_control_operator_required",
+    });
   });
 });

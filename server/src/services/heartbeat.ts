@@ -58,6 +58,7 @@ import {
   issueWorkProducts,
   projects,
   projectWorkspaces,
+  pipelineGraphRuns,
   routineRevisions,
   routineRuns,
   routines,
@@ -10647,6 +10648,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  async function graphHeartbeatInvalidReason(run: typeof heartbeatRuns.$inferSelect) {
+    const context = parseObject(run.contextSnapshot);
+    if (context.pipelineGraphWake !== true) return null;
+    const graphRunId = readNonEmptyString(context.graphRunId);
+    const expectedRevision = context.graphRunRevision;
+    if (
+      !graphRunId ||
+      typeof expectedRevision !== "number" ||
+      !Number.isInteger(expectedRevision) ||
+      expectedRevision < 1
+    ) {
+      return "Graph wake is missing its run id or expected revision";
+    }
+    const graphRun = await db
+      .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+      .from(pipelineGraphRuns)
+      .where(and(
+        eq(pipelineGraphRuns.companyId, run.companyId),
+        eq(pipelineGraphRuns.id, graphRunId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!graphRun) return "Graph wake references a missing or cross-company graph run";
+    if (!["running", "paused"].includes(graphRun.status)) {
+      return `Graph run is ${graphRun.status}`;
+    }
+    if (graphRun.revision !== expectedRevision) {
+      return `Graph wake revision ${expectedRevision} was superseded by revision ${graphRun.revision}`;
+    }
+    return null;
+  }
+
+  async function reconcileInvalidGraphHeartbeatRuns() {
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'pipelineGraphWake' = 'true'`,
+      ));
+    const cancelledRunIds: string[] = [];
+    for (const candidate of candidates) {
+      const reason = await graphHeartbeatInvalidReason(candidate);
+      if (!reason) continue;
+      const cancelled = await cancelRunInternal(
+        candidate.id,
+        `Cancelled by durable graph control: ${reason}`,
+        {
+          errorCode: "pipeline_graph_superseded",
+          suppressImmediateRecovery: true,
+          eventMessage: "run cancelled by durable graph control reconciliation",
+          eventPayload: {
+            graphRunId: readNonEmptyString(parseObject(candidate.contextSnapshot).graphRunId),
+            reason,
+          },
+        },
+      );
+      if (cancelled?.status === "cancelled") cancelledRunIds.push(cancelled.id);
+    }
+    return { cancelled: cancelledRunIds.length, runIds: cancelledRunIds };
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -10663,6 +10725,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const context = parseObject(run.contextSnapshot);
+    const graphInvalidReason = await graphHeartbeatInvalidReason(run);
+    if (graphInvalidReason) {
+      await cancelRunInternal(
+        run.id,
+        `Cancelled before claim: ${graphInvalidReason}`,
+        {
+          errorCode: "pipeline_graph_superseded",
+          suppressImmediateRecovery: true,
+          eventMessage: "queued run rejected by graph control admission",
+        },
+      );
+      return null;
+    }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
       issueId: readNonEmptyString(context.issueId),
       projectId: readNonEmptyString(context.projectId),
@@ -11361,6 +11436,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    await reconcileInvalidGraphHeartbeatRuns();
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -11792,6 +11868,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return;
       }
       run = claimed;
+    }
+
+    const graphInvalidReason = await graphHeartbeatInvalidReason(run);
+    if (graphInvalidReason) {
+      await cancelRunInternal(
+        run.id,
+        `Cancelled before execution: ${graphInvalidReason}`,
+        {
+          errorCode: "pipeline_graph_superseded",
+          suppressImmediateRecovery: true,
+          eventMessage: "running run rejected by graph control admission",
+        },
+      );
+      return;
     }
 
     activeRunExecutions.add(run.id);
@@ -15264,6 +15354,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload,
     });
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    const isPipelineGraphWake = reason === "pipeline_graph_wake";
+    const graphRunId = isPipelineGraphWake
+      ? readNonEmptyString(enrichedContextSnapshot.graphRunId)
+      : null;
+    const graphRunRevisionValue = enrichedContextSnapshot.graphRunRevision;
+    const graphRunRevision =
+      typeof graphRunRevisionValue === "number" &&
+      Number.isInteger(graphRunRevisionValue) &&
+      graphRunRevisionValue > 0
+        ? graphRunRevisionValue
+        : null;
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
@@ -16374,10 +16475,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       sameScopeScheduledRetryRun ??
       (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
 
-    const coalescedTargetRun = filterZombieCoalesceTarget(
-      rawCoalescedTarget,
-      liveRunExecutions,
-    );
+    const coalescedTargetRun = isPipelineGraphWake
+      ? null
+      : filterZombieCoalesceTarget(
+          rawCoalescedTarget,
+          liveRunExecutions,
+        );
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -16413,6 +16516,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
+      if (isPipelineGraphWake) {
+        if (graphRunId) {
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + graphRunId}, 0))`,
+          );
+        }
+        const graphRun = graphRunId
+          ? await tx
+            .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+            .from(pipelineGraphRuns)
+            .where(and(
+              eq(pipelineGraphRuns.companyId, agent.companyId),
+              eq(pipelineGraphRuns.id, graphRunId),
+            ))
+            .then((rows) => rows[0] ?? null)
+          : null;
+        if (
+          !graphRun ||
+          !["running", "paused"].includes(graphRun.status) ||
+          graphRunRevision === null ||
+          graphRun.revision !== graphRunRevision
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "pipeline_graph_wake_superseded",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+      }
       if (opts.idempotencyKey) {
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${
