@@ -44,6 +44,7 @@ export const pipelineStages = pgTable(
   },
   (table) => ({
     pipelineKeyUq: uniqueIndex("pipeline_stages_pipeline_key_uq").on(table.pipelineId, table.key),
+    pipelineIdUq: uniqueIndex("pipeline_stages_pipeline_id_uq").on(table.pipelineId, table.id),
     pipelinePositionIdx: index("pipeline_stages_pipeline_position_idx").on(table.pipelineId, table.position),
     kindCheck: check("pipeline_stages_kind_check", sql`${table.kind} in ('working', 'review', 'done', 'cancelled')`),
   }),
@@ -98,6 +99,8 @@ export const pipelineGraphVersions = pgTable(
       .on(table.pipelineId, table.definitionHash),
     pipelineIdUq: uniqueIndex("pipeline_graph_versions_pipeline_id_uq")
       .on(table.pipelineId, table.id),
+    companyPipelineIdUq: uniqueIndex("pipeline_graph_versions_company_pipeline_id_uq")
+      .on(table.companyId, table.pipelineId, table.id),
     pipelineActiveUq: uniqueIndex("pipeline_graph_versions_pipeline_active_uq")
       .on(table.pipelineId)
       .where(sql`${table.status} = 'active'`),

@@ -29,6 +29,7 @@ import {
   PIPELINE_CASE_EVENTS_DEFAULT_LIMIT,
   PIPELINE_CASE_EVENTS_MAX_LIMIT,
   PIPELINE_CONTEXT_PACK_EVENT_LIMIT,
+  assertPipelineGraphTopologyMutable,
   ensurePipelineCaseBodyDocumentFromSummary,
   pipelineService,
   resolvePipelineCaseConversationSource,
@@ -172,6 +173,9 @@ const compileGraphSchema = z.object({
   entryNodeKey: z.string().trim().min(1).max(120),
   cycleContracts: z.array(graphCycleContractSchema).max(100).optional(),
 });
+const activateGraphVersionSchema = z.object({
+  expectedActiveVersionId: z.string().uuid().nullable(),
+}).strict();
 const listGraphVersionsQuerySchema = z.object({
   cursor: z.string().min(1).max(200).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
@@ -1119,7 +1123,10 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     }));
   });
 
-  router.post("/pipelines/:pipelineId/graph/versions/:versionId/activate", async (req, res) => {
+  router.post(
+    "/pipelines/:pipelineId/graph/versions/:versionId/activate",
+    validate(activateGraphVersionSchema),
+    async (req, res) => {
     const pipelineId = parseGraphPipelineId(req.params.pipelineId);
     const parsedVersionId = z.string().uuid().safeParse(req.params.versionId);
     if (!parsedVersionId.success) {
@@ -1133,9 +1140,11 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       companyId,
       pipelineId,
       versionId: parsedVersionId.data,
+      expectedActiveVersionId: req.body.expectedActiveVersionId,
       actor,
     }));
-  });
+    },
+  );
 
   // Setup-health warnings: surface any configuration that won't actually run
   // (paused teammate, missing instructions, no approver, broken hand-off links,
@@ -1392,6 +1401,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       return { pipelineId, fromStageId: from.id, toStageId: to.id, label: edge.label ?? null };
     });
     const result = await db.transaction(async (tx) => {
+      await assertPipelineGraphTopologyMutable(tx, pipelineId);
       await tx.delete(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, pipelineId));
       if (req.body.enforceTransitions !== undefined) {
         await tx.update(pipelines).set({ enforceTransitions: req.body.enforceTransitions, updatedAt: new Date() })

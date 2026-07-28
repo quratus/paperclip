@@ -177,6 +177,14 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       createdByType: "user",
       createdById: "board-user",
     })).rejects.toThrow();
+    await expect(db.insert(pipelineCases).values({
+      companyId: otherCompany!.id,
+      pipelineId: fixture.pipeline.id,
+      graphVersionId: created.version.id,
+      stageId: fixture.stages[0]!.id,
+      caseKey: "cross-company-case",
+      title: "Cross-company case",
+    })).rejects.toThrow();
 
     await db.delete(pipelineTransitions);
     await expect(service.createDraft({
@@ -227,6 +235,60 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     } finally {
       await db.execute(sql`DROP TRIGGER paperclip_test_reject_graph_activity ON activity_log`);
       await db.execute(sql`DROP FUNCTION paperclip_test_reject_graph_activity()`);
+    }
+  });
+
+  it("rolls activation back when its audit record cannot be written", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const actor = { type: "user" as const, userId: "board-user" };
+    const draft = await service.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor,
+    });
+    await db.execute(sql`
+      CREATE FUNCTION paperclip_test_reject_graph_activation_activity()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        IF NEW.action = 'pipeline.graph_version_activated' THEN
+          RAISE EXCEPTION 'forced graph activation activity failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $function$
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER paperclip_test_reject_graph_activation_activity
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW
+      EXECUTE FUNCTION paperclip_test_reject_graph_activation_activity()
+    `);
+
+    try {
+      await expect(service.activate({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        versionId: draft.version.id,
+        expectedActiveVersionId: null,
+        actor,
+      })).rejects.toThrow();
+      const persisted = await service.get({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        versionId: draft.version.id,
+      });
+      expect(persisted).toMatchObject({
+        status: "draft",
+        activatedAt: null,
+        activatedById: null,
+      });
+    } finally {
+      await db.execute(sql`DROP TRIGGER paperclip_test_reject_graph_activation_activity ON activity_log`);
+      await db.execute(sql`DROP FUNCTION paperclip_test_reject_graph_activation_activity()`);
     }
   });
 
@@ -286,6 +348,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,
       versionId: firstDraft.version.id,
+      expectedActiveVersionId: null,
       actor,
     });
     expect(firstActivation.changed).toBe(true);
@@ -300,6 +363,52 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       actor,
     });
     expect(firstCase.case.graphVersionId).toBe(firstDraft.version.id);
+    await expect(cases.createStage({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      key: "unversioned",
+      name: "Unversioned",
+      kind: "working",
+      position: 150,
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_topology_pinned" },
+    });
+    const [unversionedStage] = await db.insert(pipelineStages).values({
+      pipelineId: fixture.pipeline.id,
+      key: "unversioned",
+      name: "Unversioned",
+      kind: "working",
+      position: 150,
+    }).returning();
+    await expect(cases.transitionCase({
+      companyId: fixture.companyId,
+      caseId: firstCase.case.id,
+      toStageKey: "unversioned",
+      expectedVersion: firstCase.case.version,
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pinned_graph_transition_not_allowed" },
+    });
+    await db.delete(pipelineStages).where(eq(pipelineStages.id, unversionedStage!.id));
+
+    await db.delete(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, fixture.pipeline.id));
+    const completedFirstCase = await cases.transitionCase({
+      companyId: fixture.companyId,
+      caseId: firstCase.case.id,
+      toStageKey: "done",
+      expectedVersion: firstCase.case.version,
+      actor,
+    });
+    expect(completedFirstCase.case.terminalKind).toBe("done");
+    await db.insert(pipelineTransitions).values({
+      pipelineId: fixture.pipeline.id,
+      fromStageId: fixture.stages.find((stage) => stage.key === "work")!.id,
+      toStageId: fixture.stages.find((stage) => stage.key === "done")!.id,
+      label: "complete",
+    });
 
     await db.update(pipelineStages)
       .set({ name: "Implementation" })
@@ -310,10 +419,24 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       entryNodeKey: "work",
       actor,
     });
+    await expect(versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: secondDraft.version.id,
+      expectedActiveVersionId: null,
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "pipeline_graph_activation_conflict",
+        currentActiveVersionId: firstDraft.version.id,
+      },
+    });
     await versions.activate({
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,
       versionId: secondDraft.version.id,
+      expectedActiveVersionId: firstDraft.version.id,
       actor,
     });
 
@@ -336,6 +459,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,
       versionId: firstDraft.version.id,
+      expectedActiveVersionId: secondDraft.version.id,
       actor,
     })).rejects.toMatchObject({
       status: 422,
@@ -394,7 +518,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
 
     const activated = await http
       .post(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}/activate`)
-      .send({});
+      .send({ expectedActiveVersionId: null });
     expect(activated.status).toBe(200);
     expect(activated.body).toMatchObject({
       changed: true,
@@ -402,7 +526,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
     const activationReplay = await http
       .post(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}/activate`)
-      .send({});
+      .send({ expectedActiveVersionId: null });
     expect(activationReplay.status).toBe(200);
     expect(activationReplay.body.changed).toBe(false);
 
@@ -434,7 +558,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
 
     const invalidActivation = await http
       .post(`/api/pipelines/${fixture.pipeline.id}/graph/versions/not-a-uuid/activate`)
-      .send({});
+      .send({ expectedActiveVersionId: null });
     expect(invalidActivation.status).toBe(400);
     expect(invalidActivation.body.details).toMatchObject({ code: "validation" });
 

@@ -11,7 +11,7 @@ import {
   compilePipelineGraph,
   type PipelineGraphCycleContractInput,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 
 type PipelineGraphDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -215,6 +215,7 @@ export function pipelineGraphVersionService(db: Db) {
       companyId: string;
       pipelineId: string;
       versionId: string;
+      expectedActiveVersionId: string | null;
       actor: PipelineGraphVersionActor;
     }) {
       return db.transaction(async (tx) => {
@@ -236,6 +237,22 @@ export function pipelineGraphVersionService(db: Db) {
         if (selected.status !== "draft") {
           throw unprocessable("Retired graph versions cannot be reactivated", {
             code: "pipeline_graph_version_retired",
+          });
+        }
+        const currentActive = await tx
+          .select({ id: pipelineGraphVersions.id })
+          .from(pipelineGraphVersions)
+          .where(and(
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+            eq(pipelineGraphVersions.status, "active"),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if ((currentActive?.id ?? null) !== input.expectedActiveVersionId) {
+          throw conflict("Active graph version changed", {
+            code: "pipeline_graph_activation_conflict",
+            expectedActiveVersionId: input.expectedActiveVersionId,
+            currentActiveVersionId: currentActive?.id ?? null,
           });
         }
 
