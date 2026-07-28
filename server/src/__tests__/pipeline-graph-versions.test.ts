@@ -1528,6 +1528,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       reason: "create a pending graph wake",
       actor: { type: "user", userId: "board-user" },
     });
+    const [claimedWake] = await pipelineGraphOutboxService(db).claim({
+      companyId: fixture.companyId,
+      workerId: "cancel-race-dispatcher",
+      limit: 1,
+    });
+    expect(claimedWake).toMatchObject({ status: "claimed" });
     const [acceptedHeartbeatRun] = await db.insert(heartbeatRuns).values({
       companyId: fixture.companyId,
       agentId: targetAgent!.id,
@@ -1568,6 +1574,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       claimedBy: null,
       claimExpiresAt: null,
     });
+    await expect(pipelineGraphOutboxService(db).release({
+      companyId: fixture.companyId,
+      outboxId: claimedWake!.id,
+      claimToken: claimedWake!.claimToken!,
+      error: "late dispatcher failure",
+    })).resolves.toMatchObject({ status: "cancelled" });
 
     const replay = await runs.cancel({
       companyId: fixture.companyId,

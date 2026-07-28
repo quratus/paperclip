@@ -342,6 +342,15 @@ export function pipelineGraphOutboxService(db: Db) {
         ))
         .returning();
       if (!row) {
+        const existing = await db
+          .select()
+          .from(pipelineGraphWakeOutbox)
+          .where(and(
+            eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+            eq(pipelineGraphWakeOutbox.id, input.outboxId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (existing?.status === "cancelled") return existing;
         throw unprocessable("Graph wake claim cannot be released", {
           code: "graph_wake_claim_stale",
         });

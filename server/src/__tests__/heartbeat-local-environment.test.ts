@@ -303,13 +303,39 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
     expect(wakeups).toHaveLength(1);
     expect(wakeups[0]).toMatchObject({ runId: accepted!.id });
 
-    await pipelineGraphRunService(db).cancel({
+    const [strandedAcceptedRun] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: graphRun.run.id,
+        graphRunRevision: graphRun.run.revision,
+      },
+    }).returning();
+    await expect(pipelineGraphRunService(db, {
+      cancelHeartbeatRun: async () => {
+        throw new Error("simulated crash before process cancellation");
+      },
+    }).cancel({
       companyId,
       runId: graphRun.run.id,
       expectedRevision: 1,
       idempotencyKey: "heartbeat-idempotency:cancel",
       reason: "operator cancelled before another acceptance",
       actor: { type: "user", userId: "board-user" },
+    })).rejects.toThrow("simulated crash before process cancellation");
+    expect(await pipelineGraphRunService(db).get({
+      companyId,
+      runId: graphRun.run.id,
+    })).toMatchObject({ status: "cancelled", revision: 2 });
+    expect(await heartbeat.getRun(strandedAcceptedRun!.id)).toMatchObject({ status: "queued" });
+
+    await heartbeat.reapOrphanedRuns();
+    expect(await heartbeat.getRun(strandedAcceptedRun!.id)).toMatchObject({
+      status: "cancelled",
+      errorCode: "pipeline_graph_superseded",
     });
     const rejected = await heartbeat.wakeup(agentId, {
       ...wakeOptions,
