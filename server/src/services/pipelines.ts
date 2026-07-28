@@ -74,6 +74,9 @@ export async function assertPipelineGraphTopologyMutable(
   dbOrTx: PipelineDb,
   pipelineId: string,
 ) {
+  await dbOrTx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + pipelineId}, 0))`,
+  );
   const pinnedCase = await dbOrTx
     .select({ id: pipelineCases.id, graphVersionId: pipelineCases.graphVersionId })
     .from(pipelineCases)
@@ -3937,19 +3940,22 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     },
 
     async createTransition(input: { companyId: string; pipelineId: string; fromStageId: string; toStageId: string; label?: string | null }) {
-      await getPipelineOrThrow(db, input.companyId, input.pipelineId);
-      await getStageOrThrow(db, input.pipelineId, input.fromStageId);
-      await getStageOrThrow(db, input.pipelineId, input.toStageId);
-      const [transition] = await db
-        .insert(pipelineTransitions)
-        .values({
-          pipelineId: input.pipelineId,
-          fromStageId: input.fromStageId,
-          toStageId: input.toStageId,
-          label: input.label ?? null,
-        })
-        .returning();
-      return transition!;
+      return db.transaction(async (tx) => {
+        await assertPipelineGraphTopologyMutable(tx, input.pipelineId);
+        await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
+        await getStageOrThrow(tx, input.pipelineId, input.fromStageId);
+        await getStageOrThrow(tx, input.pipelineId, input.toStageId);
+        const [transition] = await tx
+          .insert(pipelineTransitions)
+          .values({
+            pipelineId: input.pipelineId,
+            fromStageId: input.fromStageId,
+            toStageId: input.toStageId,
+            label: input.label ?? null,
+          })
+          .returning();
+        return transition!;
+      });
     },
 
     async ingestCase(input: {
