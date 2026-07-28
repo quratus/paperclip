@@ -1105,19 +1105,28 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(firstClaim).toHaveLength(1);
     expect(firstClaim[0]).toMatchObject({ status: "claimed", attemptCount: 1 });
     const receipt = { heartbeatRunId: randomUUID(), accepted: true };
+    await expect(dispatcher.acknowledge({
+      companyId: randomUUID(),
+      outboxId: firstClaim[0]!.id,
+      claimToken: firstClaim[0]!.claimToken!,
+      receipt,
+    })).rejects.toMatchObject({ status: 404 });
     const acknowledged = await dispatcher.acknowledge({
+      companyId: fixture.companyId,
       outboxId: firstClaim[0]!.id,
       claimToken: firstClaim[0]!.claimToken!,
       receipt,
     });
     expect(acknowledged).toMatchObject({ status: "dispatched", dispatchReceipt: receipt });
     const replay = await dispatcher.acknowledge({
+      companyId: fixture.companyId,
       outboxId: firstClaim[0]!.id,
       claimToken: firstClaim[0]!.claimToken!,
       receipt,
     });
     expect(replay.dispatchReceipt).toEqual(receipt);
     await expect(dispatcher.acknowledge({
+      companyId: fixture.companyId,
       outboxId: firstClaim[0]!.id,
       claimToken: randomUUID(),
       receipt: { accepted: false },
@@ -1144,6 +1153,16 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(reclaimed[0]!.id).toBe(expiring[0]!.id);
     expect(reclaimed[0]!.claimToken).not.toBe(expiring[0]!.claimToken);
     await expect(dispatcher.release({
+      companyId: randomUUID(),
+      outboxId: reclaimed[0]!.id,
+      claimToken: reclaimed[0]!.claimToken!,
+      error: "wrong company",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "graph_wake_claim_stale" },
+    });
+    await expect(dispatcher.release({
+      companyId: fixture.companyId,
       outboxId: expiring[0]!.id,
       claimToken: expiring[0]!.claimToken!,
       error: "stale worker",
@@ -1153,6 +1172,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
 
     await dispatcher.release({
+      companyId: fixture.companyId,
       outboxId: reclaimed[0]!.id,
       claimToken: reclaimed[0]!.claimToken!,
       error: "test releases reclaimed crash-replay lease",

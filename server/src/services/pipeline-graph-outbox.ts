@@ -71,6 +71,7 @@ export function pipelineGraphOutboxService(db: Db) {
     },
 
     async acknowledge(input: {
+      companyId: string;
       outboxId: string;
       claimToken: string;
       receipt: Record<string, unknown>;
@@ -89,6 +90,7 @@ export function pipelineGraphOutboxService(db: Db) {
           updatedAt: now,
         })
         .where(and(
+          eq(pipelineGraphWakeOutbox.companyId, input.companyId),
           eq(pipelineGraphWakeOutbox.id, input.outboxId),
           eq(pipelineGraphWakeOutbox.status, "claimed"),
           eq(pipelineGraphWakeOutbox.claimToken, input.claimToken),
@@ -99,7 +101,10 @@ export function pipelineGraphOutboxService(db: Db) {
       const existing = await db
         .select()
         .from(pipelineGraphWakeOutbox)
-        .where(eq(pipelineGraphWakeOutbox.id, input.outboxId))
+        .where(and(
+          eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+          eq(pipelineGraphWakeOutbox.id, input.outboxId),
+        ))
         .then((rows) => rows[0] ?? null);
       if (!existing) throw notFound("Graph wake outbox item not found");
       if (existing.status === "dispatched" && existing.claimToken === null) {
@@ -143,6 +148,7 @@ export function pipelineGraphOutboxService(db: Db) {
         const targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId : null;
         if (payload.dispatchEnabled !== true || !targetAgentId) {
           await this.release({
+            companyId: input.companyId,
             outboxId: row.id,
             claimToken: row.claimToken!,
             error: "Graph wake dispatch requires dispatchEnabled=true and payload.targetAgentId",
@@ -177,6 +183,7 @@ export function pipelineGraphOutboxService(db: Db) {
           });
           if (!run) throw new Error("Heartbeat wake was not accepted");
           await this.acknowledge({
+            companyId: input.companyId,
             outboxId: row.id,
             claimToken: row.claimToken!,
             receipt: {
@@ -189,6 +196,7 @@ export function pipelineGraphOutboxService(db: Db) {
           dispatched += 1;
         } catch (error) {
           await this.release({
+            companyId: input.companyId,
             outboxId: row.id,
             claimToken: row.claimToken!,
             error: error instanceof Error ? error.message : "Graph wake dispatch failed",
@@ -202,6 +210,7 @@ export function pipelineGraphOutboxService(db: Db) {
     },
 
     async release(input: {
+      companyId: string;
       outboxId: string;
       claimToken: string;
       error: string;
@@ -223,6 +232,7 @@ export function pipelineGraphOutboxService(db: Db) {
           updatedAt: now,
         })
         .where(and(
+          eq(pipelineGraphWakeOutbox.companyId, input.companyId),
           eq(pipelineGraphWakeOutbox.id, input.outboxId),
           eq(pipelineGraphWakeOutbox.status, "claimed"),
           eq(pipelineGraphWakeOutbox.claimToken, input.claimToken),
