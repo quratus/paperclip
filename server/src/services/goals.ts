@@ -1,6 +1,7 @@
 import { and, asc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { goals } from "@paperclipai/db";
+import { conflict } from "../errors.js";
 
 type GoalReader = Pick<Db, "select">;
 
@@ -55,12 +56,22 @@ export function goalService(db: Db) {
 
     getDefaultCompanyGoal: (companyId: string) => getDefaultCompanyGoal(db, companyId),
 
-    create: (companyId: string, data: Omit<typeof goals.$inferInsert, "companyId">) =>
-      db
+    create: async (companyId: string, data: Omit<typeof goals.$inferInsert, "companyId">) => {
+      const created = await db
         .insert(goals)
         .values({ ...data, companyId })
+        .onConflictDoNothing({ target: goals.id })
         .returning()
-        .then((rows) => rows[0]),
+        .then((rows) => rows[0] ?? null);
+      if (created) return created;
+      const existing = data.id
+        ? await db.select().from(goals)
+          .where(and(eq(goals.id, data.id), eq(goals.companyId, companyId)))
+          .then((rows) => rows[0] ?? null)
+        : null;
+      if (existing) return existing;
+      throw conflict("Goal id already exists");
+    },
 
     update: (id: string, data: Partial<typeof goals.$inferInsert>) =>
       db
