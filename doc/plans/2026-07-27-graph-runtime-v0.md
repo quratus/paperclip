@@ -1,8 +1,8 @@
 # Graph Runtime v0
 
-Status: Slice 0 implemented and under final review; Slice 1 compiler prototype complete  
-Date: 2026-07-27  
-Target: `quratus/paperclip` (`myfork`)  
+Status: Slice 0 deployed; Slice 1 implemented and under independent review
+Date: 2026-07-28
+Target: `quratus/paperclip` (`myfork`)
 Product surfaces: standalone Paperclip and Paperclip embedded in Meteor
 
 ## Purpose
@@ -110,7 +110,8 @@ change execution behavior in this slice.
 
 1. **Shared graph definition contract and compiler**
    - Define normalized node, edge, cycle-contract, definition, diagnostic, and compile-result types.
-   - Canonicalize deterministically and calculate a SHA-256 definition hash.
+   - Canonicalize deterministically in the shared compiler and calculate a
+     SHA-256 definition hash at the persistence boundary.
    - Reject duplicate keys, unknown endpoints, missing entry, unreachable nodes, nonterminal dead ends, ambiguous outcome edges, and cycles without contracts.
    - Validate cycle limits and exit edges.
    - Tests cover ordering-invariant hashes and every rejection class.
@@ -128,7 +129,7 @@ change execution behavior in this slice.
 
 4. **Persist draft contract**
    - `POST /api/pipelines/:pipelineId/graph/versions`.
-   - Same compile input plus optional idempotency key.
+   - Same compile input; the canonical definition hash is the idempotency key.
    - Compile the current pipeline inside a transaction.
    - Reuse an identical hash idempotently; otherwise allocate the next version under a pipeline-scoped lock.
    - Expose list/get endpoints with company access, pagination, permission checks,
@@ -142,6 +143,16 @@ change execution behavior in this slice.
 - Pipeline service tests for idempotent compile, concurrent version allocation, company isolation, and immutable reads.
 - Route tests for authorization, invalid definitions, compile result, and activity entry.
 - Package/server typechecks.
+
+### Slice 1 implementation evidence
+
+- Additive migration and database typecheck/migration-safety checks pass.
+- Shared compiler plus embedded-Postgres service/API suite: 10 focused tests pass.
+- Concurrent identical writes coalesce to one immutable version.
+- Composite company/pipeline foreign key rejects cross-tenant persistence at the
+  database boundary.
+- Full server typecheck adds no new error; three existing
+  `blockedByApprovalId` errors remain in `server/src/services/issues.ts`.
 
 ## Slice 2 — Activate and enforce pinned transitions
 

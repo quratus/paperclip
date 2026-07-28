@@ -51,7 +51,7 @@ export {
   routineRuns,
   routineEvolutionProposals,
 } from "./routines.js";
-export { pipelines, pipelineStages, pipelineTransitions } from "./pipelines.js";
+export { pipelineGraphVersions, pipelines, pipelineStages, pipelineTransitions } from "./pipelines.js";
 export {
   cases,
   caseAttachments,
