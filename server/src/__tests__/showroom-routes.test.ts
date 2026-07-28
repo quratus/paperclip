@@ -30,9 +30,14 @@ const showroom = {
 function app() {
   const db = {
     select: () => ({ from: () => ({ where: () => ({ then: (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([showroom])) }) }) }),
+    insert: () => ({ values: () => ({ returning: () => Promise.resolve([{ id: "showroom-1", expiresAt: showroom.expiresAt }]) }) }),
   };
   const server = express();
   server.use(express.json());
+  server.use((req, _res, next) => {
+    (req as typeof req & { actor: Record<string, unknown> }).actor = { type: "board", userId: "user-1", source: "local_implicit" };
+    next();
+  });
   server.use("/api", showroomRoutes(db as never, mockStorage as never));
   server.use((error: { status?: number; message?: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(error.status ?? 500).json({ error: { message: error.message } });
@@ -78,6 +83,17 @@ describe("showroom feedback routing", () => {
       expect.objectContaining({ authorType: "system" }),
     );
     expect(mockIssues.create).not.toHaveBeenCalled();
+  });
+
+  it("mints an expiring public review link for an authenticated company user", async () => {
+    const response = await request(app())
+      .post("/api/companies/company-1/showrooms")
+      .set("host", "paperclip.test")
+      .send({ title: "Costa review", targetUrl: "https://review.example.test/app", expiresInHours: 24 });
+
+    expect(response.status).toBe(201);
+    expect(response.body.url).toMatch(/^http:\/\/paperclip\.test\/showroom\/pcp_showroom_/);
+    expect(response.body.expiresAt).toBeTruthy();
   });
 
   it("creates a human-triage issue when no same-company source work is available", async () => {
