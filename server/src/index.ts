@@ -44,6 +44,7 @@ import {
   environmentCustomImageService,
   heartbeatService,
   instanceSettingsService,
+  pipelineGraphOutboxService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCloudUpstreamRunsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
@@ -854,6 +855,7 @@ export async function startServer(): Promise<StartedServer> {
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
+    const graphWakeOutbox = pipelineGraphOutboxService(db as any);
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -872,6 +874,27 @@ export async function startServer(): Promise<StartedServer> {
       "worktree run-execution cutoff state",
     );
     const heartbeatSchedulingSuppression = await heartbeat.resolveSchedulingSuppression();
+    const dispatchGraphWakeOutbox = async () => {
+      if (!config.pipelineGraphWakeDispatchEnabled) return { claimed: 0, dispatched: 0, retried: 0 };
+      const activeCompanies = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.status, "active"));
+      const totals = { claimed: 0, dispatched: 0, retried: 0 };
+      for (const company of activeCompanies) {
+        const result = await graphWakeOutbox.dispatchPending({
+          companyId: company.id,
+          workerId: `server:${process.pid}`,
+          enabled: true,
+          limit: config.pipelineGraphWakeDispatchBatchSize,
+          wakeup: heartbeat.wakeup,
+        });
+        totals.claimed += result.claimed;
+        totals.dispatched += result.dispatched;
+        totals.retried += result.retried;
+      }
+      return totals;
+    };
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
@@ -958,6 +981,11 @@ export async function startServer(): Promise<StartedServer> {
         const swept = await heartbeat.sweepStaleIssueLocks();
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+        }
+
+        const graphWakes = await dispatchGraphWakeOutbox();
+        if (graphWakes.claimed > 0 || graphWakes.dispatched > 0 || graphWakes.retried > 0) {
+          logger.warn({ ...graphWakes }, "startup graph wake outbox dispatch changed wake state");
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
@@ -1090,6 +1118,12 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const graphWakes = await dispatchGraphWakeOutbox();
+              if (graphWakes.claimed > 0 || graphWakes.dispatched > 0 || graphWakes.retried > 0) {
+                logger.warn({ ...graphWakes }, "periodic graph wake outbox dispatch changed wake state");
               }
             })
             .then(async () => {

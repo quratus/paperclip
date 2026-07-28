@@ -15,10 +15,12 @@ function stableStringify(value: unknown): string {
 export function pipelineGraphOutboxService(db: Db) {
   return {
     async claim(input: {
+      companyId: string;
       workerId: string;
       limit?: number;
       leaseMs?: number;
       now?: Date;
+      dispatchableOnly?: boolean;
     }) {
       const limit = Math.min(Math.max(input.limit ?? 10, 1), 100);
       const leaseMs = Math.min(Math.max(input.leaseMs ?? 30_000, 1_000), 300_000);
@@ -30,14 +32,20 @@ export function pipelineGraphOutboxService(db: Db) {
         const rows = await tx
           .select({ id: pipelineGraphWakeOutbox.id })
           .from(pipelineGraphWakeOutbox)
-          .where(or(
-            and(
-              eq(pipelineGraphWakeOutbox.status, "pending"),
-              lte(pipelineGraphWakeOutbox.availableAt, now),
-            ),
-            and(
-              eq(pipelineGraphWakeOutbox.status, "claimed"),
-              lte(pipelineGraphWakeOutbox.claimExpiresAt, now),
+          .where(and(
+            eq(pipelineGraphWakeOutbox.companyId, input.companyId),
+            input.dispatchableOnly
+              ? sql`${pipelineGraphWakeOutbox.payload} ->> 'dispatchEnabled' = 'true'`
+              : undefined,
+            or(
+              and(
+                eq(pipelineGraphWakeOutbox.status, "pending"),
+                lte(pipelineGraphWakeOutbox.availableAt, now),
+              ),
+              and(
+                eq(pipelineGraphWakeOutbox.status, "claimed"),
+                lte(pipelineGraphWakeOutbox.claimExpiresAt, now),
+              ),
             ),
           ))
           .orderBy(asc(pipelineGraphWakeOutbox.availableAt), asc(pipelineGraphWakeOutbox.createdAt))
@@ -104,6 +112,93 @@ export function pipelineGraphOutboxService(db: Db) {
         code: "graph_wake_claim_stale",
         status: existing.status,
       });
+    },
+
+    async dispatchPending(input: {
+      companyId: string;
+      workerId: string;
+      enabled?: boolean;
+      limit?: number;
+      leaseMs?: number;
+      now?: Date;
+      retryDelayMs?: number;
+      wakeup: (agentId: string, opts: {
+        source: "automation";
+        triggerDetail: "system";
+        reason: string;
+        payload: Record<string, unknown>;
+        contextSnapshot: Record<string, unknown>;
+        idempotencyKey: string;
+        requestedByActorType: "system";
+        requestedByActorId: string;
+      }) => Promise<{ id: string; wakeupRequestId?: string | null } | null>;
+    }) {
+      if (!input.enabled) return { claimed: 0, dispatched: 0, retried: 0 };
+      const rows = await this.claim({ ...input, dispatchableOnly: true });
+      let dispatched = 0;
+      let retried = 0;
+      const retryDelayMs = Math.max(input.retryDelayMs ?? 5_000, 0);
+      for (const row of rows) {
+        const payload = row.payload ?? {};
+        const targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId : null;
+        if (payload.dispatchEnabled !== true || !targetAgentId) {
+          await this.release({
+            outboxId: row.id,
+            claimToken: row.claimToken!,
+            error: "Graph wake dispatch requires dispatchEnabled=true and payload.targetAgentId",
+            terminal: true,
+            now: input.now,
+          });
+          continue;
+        }
+        try {
+          const run = await input.wakeup(targetAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "pipeline_graph_wake",
+            idempotencyKey: row.idempotencyKey,
+            requestedByActorType: "system",
+            requestedByActorId: "pipeline_graph_outbox",
+            payload: {
+              ...payload,
+              graphRunId: row.runId,
+              graphEventId: row.eventId,
+              pipelineCaseId: row.caseId,
+              targetNodeKey: row.targetNodeKey,
+            },
+            contextSnapshot: {
+              pipelineGraphWake: true,
+              graphRunId: row.runId,
+              graphEventId: row.eventId,
+              pipelineCaseId: row.caseId,
+              targetNodeKey: row.targetNodeKey,
+              responsibilityOwner: payload.responsibilityOwner ?? row.targetNodeKey,
+            },
+          });
+          if (!run) throw new Error("Heartbeat wake was not accepted");
+          await this.acknowledge({
+            outboxId: row.id,
+            claimToken: row.claimToken!,
+            receipt: {
+              accepted: true,
+              heartbeatRunId: run.id,
+              wakeupRequestId: run.wakeupRequestId ?? null,
+            },
+            now: input.now,
+          });
+          dispatched += 1;
+        } catch (error) {
+          await this.release({
+            outboxId: row.id,
+            claimToken: row.claimToken!,
+            error: error instanceof Error ? error.message : "Graph wake dispatch failed",
+            retryAt: new Date((input.now ?? new Date()).getTime() + retryDelayMs),
+            now: input.now,
+          });
+          retried += 1;
+        }
+      }
+      return { claimed: rows.length, dispatched, retried };
     },
 
     async release(input: {
