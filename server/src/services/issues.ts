@@ -7040,6 +7040,30 @@ export function issueService(db: Db) {
         assigneeAgentId: string | null;
         assigneeUserId: string | null;
       }> = [];
+      async function firstAssignableAgentId(companyId: string, candidates: Array<string | null | undefined>) {
+        for (const candidate of candidates) {
+          if (!candidate) continue;
+          try {
+            await assertAssignableAgent(db, companyId, candidate, { kind: "work" });
+            return candidate;
+          } catch (error) {
+            if (!(error instanceof HttpError) || ![404, 409, 422].includes(error.status)) throw error;
+          }
+        }
+        return null;
+      }
+      async function firstAssignableUserId(companyId: string, candidates: Array<string | null | undefined>) {
+        for (const candidate of candidates) {
+          if (!candidate) continue;
+          try {
+            await assertAssignableUser(companyId, candidate);
+            return candidate;
+          } catch (error) {
+            if (!(error instanceof HttpError) || error.status !== 404) throw error;
+          }
+        }
+        return null;
+      }
 
       for (const issue of linkedIssues) {
         if (issue.status !== "blocked") continue;
@@ -7049,16 +7073,21 @@ export function issueService(db: Db) {
         ]);
         if (hasIssueBlocker || hasOtherApprovalBlocker || isTypedExternalBlocker(issue.blockedByExternal)) continue;
 
-        const nextAssigneeAgentId =
-          issue.assigneeAgentId ?? approval?.requestedByAgentId ?? issue.createdByAgentId ?? actor.agentId ?? null;
+        const nextAssigneeAgentId = await firstAssignableAgentId(issue.companyId, [
+          issue.assigneeAgentId,
+          approval?.requestedByAgentId,
+          issue.createdByAgentId,
+          actor.agentId,
+        ]);
         const nextAssigneeUserId = nextAssigneeAgentId
           ? null
-          : issue.assigneeUserId ??
-            issue.responsibleUserId ??
-            approval?.requestedByUserId ??
-            issue.createdByUserId ??
-            actor.userId ??
-            null;
+          : await firstAssignableUserId(issue.companyId, [
+            issue.assigneeUserId,
+            issue.responsibleUserId,
+            approval?.requestedByUserId,
+            issue.createdByUserId,
+            actor.userId,
+          ]);
         if (!nextAssigneeAgentId && !nextAssigneeUserId) continue;
 
         const [updated] = await db

@@ -6,6 +6,7 @@ import {
   activityLog,
   agents,
   approvals,
+  companyMemberships,
   companies,
   createDb,
   documentRevisions,
@@ -32,6 +33,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { approvalService } from "../services/approvals.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
@@ -829,7 +831,6 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       runtimeConfig: {},
       permissions: {},
     });
-
     const matchedIssueId = randomUUID();
     const otherIssueId = randomUUID();
 
@@ -3430,6 +3431,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(instanceSettings);
     await db.delete(companies);
   });
@@ -3447,6 +3449,15 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       requireBoardApprovalForNewAgents: false,
     });
     return companyId;
+  }
+
+  async function seedActiveUser(companyId: string, userId: string) {
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+    });
   }
 
   it("rejects service updates that leave an issue blocked without a typed blocker", async () => {
@@ -3490,6 +3501,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("links pending approval blockers and consumes decided approval blockers", async () => {
     const companyId = await seedCompany();
+    await seedActiveUser(companyId, "approval-requester");
     const approvalId = randomUUID();
     await db.insert(approvals).values({
       id: approvalId,
@@ -3552,6 +3564,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("consumes rejected approval blockers with the decision note", async () => {
     const companyId = await seedCompany();
+    await seedActiveUser(companyId, "approval-requester");
     const approvalId = randomUUID();
     await db.insert(approvals).values({
       id: approvalId,
@@ -3583,6 +3596,55 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       comment.body.includes("Current owner: user approval-requester.") &&
       comment.body.includes("Next action: Address the decision note"),
     )).toBe(true);
+  });
+
+  it("rejects cross-company approval requesters and never redirects work to a legacy one", async () => {
+    const companyId = await seedCompany();
+    await seedActiveUser(companyId, "board-user");
+    const otherCompanyId = await seedCompany();
+    const foreignAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: otherCompanyId,
+      name: "Foreign requester",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      permissions: {},
+    });
+    await expect(approvalService(db).create(companyId, {
+      type: "request_board_approval",
+      requestedByAgentId: foreignAgentId,
+      status: "pending",
+      payload: {},
+    })).rejects.toMatchObject({ status: 422 });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      requestedByAgentId: foreignAgentId,
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Foreign requester must not receive work",
+      status: "todo",
+      priority: "medium",
+      createdByUserId: "origin-user",
+    });
+    await svc.update(issue.id, { status: "blocked", blockedByApprovalId: approvalId });
+    await db.update(approvals).set({ status: "approved", decidedAt: new Date() }).where(eq(approvals.id, approvalId));
+
+    await svc.consumeApprovalBlocker(approvalId, "approved", null, { userId: "board-user" });
+    const released = await svc.getById(issue.id);
+
+    expect(released).toMatchObject({
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user",
+    });
   });
 
   async function seedSharedWorkspaceDependency() {
