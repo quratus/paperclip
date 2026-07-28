@@ -142,7 +142,7 @@ export function showroomRoutes(db: Db, storage: StorageService) {
       inviteType: SHOWROOM_INVITE_TYPE,
       tokenHash: hashToken(token),
       expiresAt,
-      invitedByUserId: req.actor?.type === "user" ? req.actor.userId ?? null : null,
+      invitedByUserId: req.actor.userId ?? null,
       defaultsPayload: { title: input.title, targetUrl: input.targetUrl, projectId: input.projectId ?? null },
     }).returning({ id: invites.id, expiresAt: invites.expiresAt });
     const baseUrl = requestBaseUrl(req);
@@ -186,10 +186,7 @@ export function showroomRoutes(db: Db, storage: StorageService) {
         issue = await issues.update(routedIssue.id, { status: "todo" }) ?? routedIssue;
         reopened = issue.status === "todo";
       }
-      const comment = await issues.addComment(issue.id, body, {}, {
-        authorType: "system",
-        metadata: { source: "showroom_feedback", sourceIssueId: originId },
-      });
+      const comment = await issues.addComment(issue.id, body, {}, { authorType: "system" });
       issueCommentId = comment.id;
     } else {
       issue = await issues.create(showroom.companyId!, {
