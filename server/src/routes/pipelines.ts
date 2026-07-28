@@ -81,6 +81,10 @@ import {
   pipelineCaseOutputsService,
   summarizePipelineCaseOutputsForContext,
 } from "../services/pipeline-case-outputs.js";
+import {
+  decodePipelineGraphVersionCursor,
+  pipelineGraphVersionService,
+} from "../services/pipeline-graph-versions.js";
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
 const STAGE_INSTRUCTIONS_PREFIX = "stage-instructions:";
@@ -155,6 +159,22 @@ const replaceTransitionsSchema = z.object({
     label: z.string().max(200).nullable().optional(),
   })).max(500),
   enforceTransitions: z.boolean().optional(),
+});
+const graphCycleContractSchema = z.object({
+  key: z.string().trim().min(1).max(120),
+  nodeKeys: z.array(z.string().trim().min(1).max(120)).min(1).max(100),
+  maxIterations: z.number().int().min(1).max(100),
+  noProgressLimit: z.number().int().min(1).max(100).nullable().optional(),
+  progressField: z.string().trim().min(1).max(200).nullable().optional(),
+  exitNodeKeys: z.array(z.string().trim().min(1).max(120)).min(1).max(100),
+});
+const compileGraphSchema = z.object({
+  entryNodeKey: z.string().trim().min(1).max(120),
+  cycleContracts: z.array(graphCycleContractSchema).max(100).optional(),
+});
+const listGraphVersionsQuerySchema = z.object({
+  cursor: z.string().trim().min(1).max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 const batchIngestSchema = z.object({ items: z.array(ingestCaseSchema).max(200) });
 const breakdownCaseSchema = z.object({
@@ -813,6 +833,7 @@ async function assertIssueLinkMutationAllowed(
 export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineService>[1] = {}) {
   const router = Router();
   const svc = pipelineService(db, options);
+  const graphVersions = pipelineGraphVersionService(db);
   const outputsSvc = pipelineCaseOutputsService(db);
   const access = accessService(db);
   const issuesSvc = issueService(db);
@@ -1009,6 +1030,101 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       },
     ]));
     res.json({ ...pipeline, stages: stages.map((stage) => withDerivedStageAutomation(stage, routineById)), transitions, documentKeys });
+  });
+
+  router.post(
+    "/pipelines/:pipelineId/graph/compile-preview",
+    validate(compileGraphSchema),
+    async (req, res) => {
+      const pipelineId = req.params.pipelineId as string;
+      const companyId = await assertPipelineAccess(db, req, pipelineId);
+      res.json(await graphVersions.compilePreview({
+        companyId,
+        pipelineId,
+        entryNodeKey: req.body.entryNodeKey,
+        cycleContracts: req.body.cycleContracts,
+      }));
+    },
+  );
+
+  router.post(
+    "/pipelines/:pipelineId/graph/versions",
+    validate(compileGraphSchema),
+    async (req, res) => {
+      const pipelineId = req.params.pipelineId as string;
+      const companyId = await assertPipelineAccess(db, req, pipelineId);
+      await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      const result = await graphVersions.createDraft({
+        companyId,
+        pipelineId,
+        entryNodeKey: req.body.entryNodeKey,
+        cycleContracts: req.body.cycleContracts,
+        actor,
+      });
+      if (result.created) {
+        await logActivity(db, {
+          companyId,
+          actorType: actor.type,
+          actorId: actor.type === "user" ? actor.userId : actor.agentId,
+          agentId: actor.type === "agent" ? actor.agentId : null,
+          runId: actor.type === "agent" ? actor.runId : null,
+          action: "pipeline.graph_version_created",
+          entityType: "pipeline",
+          entityId: pipelineId,
+          details: {
+            graphVersionId: result.version.id,
+            version: result.version.version,
+            definitionHash: result.version.definitionHash,
+          },
+        });
+      }
+      res
+        .status(result.created ? 201 : 200)
+        .location(`/api/pipelines/${pipelineId}/graph/versions/${result.version.id}`)
+        .json(result);
+    },
+  );
+
+  router.get("/pipelines/:pipelineId/graph/versions", async (req, res) => {
+    const pipelineId = req.params.pipelineId as string;
+    const companyId = await assertPipelineAccess(db, req, pipelineId);
+    const query = listGraphVersionsQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      throw badRequest("Invalid graph version query", {
+        code: "validation",
+        issues: query.error.issues,
+      });
+    }
+    let beforeVersion: number | undefined;
+    if (query.data.cursor) {
+      const decodedCursor = decodePipelineGraphVersionCursor(query.data.cursor);
+      if (decodedCursor === null) {
+        throw badRequest("Invalid graph version cursor", { code: "invalid_cursor" });
+      }
+      beforeVersion = decodedCursor;
+    }
+    res.json(await graphVersions.list({
+      companyId,
+      pipelineId,
+      beforeVersion,
+      limit: query.data.limit,
+    }));
+  });
+
+  router.get("/pipelines/:pipelineId/graph/versions/:versionId", async (req, res) => {
+    const pipelineId = req.params.pipelineId as string;
+    const parsedVersionId = z.string().uuid().safeParse(req.params.versionId);
+    if (!parsedVersionId.success) {
+      throw badRequest("Invalid graph version id", { code: "validation" });
+    }
+    const companyId = await assertPipelineAccess(db, req, pipelineId);
+    res.json(await graphVersions.get({
+      companyId,
+      pipelineId,
+      versionId: parsedVersionId.data,
+    }));
   });
 
   // Setup-health warnings: surface any configuration that won't actually run
