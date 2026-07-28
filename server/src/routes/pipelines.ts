@@ -18,6 +18,7 @@ import {
   pipelineCaseIssueLinks,
   pipelineCases,
   pipelineDocuments,
+  pipelineGraphRuns,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -86,6 +87,7 @@ import {
   decodePipelineGraphVersionCursor,
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
+import { pipelineGraphRunService } from "../services/pipeline-graph-runs.js";
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
 const STAGE_INSTRUCTIONS_PREFIX = "stage-instructions:";
@@ -173,6 +175,15 @@ const compileGraphSchema = z.object({
   entryNodeKey: z.string().trim().min(1).max(120),
   cycleContracts: z.array(graphCycleContractSchema).max(100).optional(),
 });
+const startGraphRunSchema = z.object({
+  idempotencyKey: z.string().trim().min(1).max(512),
+  checkpoint: jsonObjectSchema.optional(),
+}).strict();
+const checkpointGraphRunSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  idempotencyKey: z.string().trim().min(1).max(512),
+  checkpoint: jsonObjectSchema,
+}).strict();
 const activateGraphVersionSchema = z.object({
   expectedActiveVersionId: z.string().uuid().nullable(),
 }).strict();
@@ -847,6 +858,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   const router = Router();
   const svc = pipelineService(db, options);
   const graphVersions = pipelineGraphVersionService(db);
+  const graphRuns = pipelineGraphRunService(db);
   const outputsSvc = pipelineCaseOutputsService(db);
   const access = accessService(db);
   const issuesSvc = issueService(db);
@@ -1611,6 +1623,75 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const result = await svc.ingestCase({ companyId, pipelineId, ...req.body, actor });
     res.status(result.created ? 201 : 200).json(result);
   });
+
+  router.post("/cases/:caseId/graph-runs", validate(startGraphRunSchema), async (req, res) => {
+    const parsedCaseId = z.string().uuid().safeParse(req.params.caseId);
+    if (!parsedCaseId.success) throw badRequest("Invalid pipeline case id", { code: "validation" });
+    const caseId = parsedCaseId.data;
+    const companyId = await assertCaseAccess(db, req, caseId);
+    const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
+    await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    const actor = actorForMutation(req);
+    if (actor.type === "system") throw forbidden("A user or agent actor is required");
+    const result = await graphRuns.start({
+      companyId,
+      caseId,
+      idempotencyKey: req.body.idempotencyKey,
+      checkpoint: req.body.checkpoint,
+      actor,
+    });
+    res.status(result.created ? 201 : 200).json(result);
+  });
+
+  async function graphRunAccess(req: Request, runId: string) {
+    const row = await db
+      .select({ companyId: pipelineGraphRuns.companyId, pipelineId: pipelineGraphRuns.pipelineId })
+      .from(pipelineGraphRuns)
+      .where(eq(pipelineGraphRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) throw notFound("Graph run not found");
+    assertPipelineCompanyAccess(req, row.companyId);
+    return row;
+  }
+
+  router.get("/graph-runs/:runId", async (req, res) => {
+    const runId = z.string().uuid().safeParse(req.params.runId);
+    if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+    const scope = await graphRunAccess(req, runId.data);
+    res.json(await graphRuns.get({ companyId: scope.companyId, runId: runId.data }));
+  });
+
+  router.get("/graph-runs/:runId/events", async (req, res) => {
+    const runId = z.string().uuid().safeParse(req.params.runId);
+    if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+    const scope = await graphRunAccess(req, runId.data);
+    res.json(await graphRuns.listEvents({ companyId: scope.companyId, runId: runId.data }));
+  });
+
+  router.post(
+    "/graph-runs/:runId/checkpoints",
+    validate(checkpointGraphRunSchema),
+    async (req, res) => {
+      const runId = z.string().uuid().safeParse(req.params.runId);
+      if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+      const scope = await graphRunAccess(req, runId.data);
+      await assertPipelineWriteAccess(req, {
+        access,
+        companyId: scope.companyId,
+        pipelineId: scope.pipelineId,
+      });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      res.json(await graphRuns.checkpoint({
+        companyId: scope.companyId,
+        runId: runId.data,
+        expectedRevision: req.body.expectedRevision,
+        idempotencyKey: req.body.idempotencyKey,
+        checkpoint: req.body.checkpoint,
+        actor,
+      }));
+    },
+  );
 
   router.post("/pipelines/:pipelineId/cases/batch", validate(batchIngestSchema), async (req, res) => {
     const pipelineId = req.params.pipelineId as string;
