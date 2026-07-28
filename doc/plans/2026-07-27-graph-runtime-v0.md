@@ -147,7 +147,7 @@ change execution behavior in this slice.
 ### Slice 1 implementation evidence
 
 - Additive migration and database typecheck/migration-safety checks pass.
-- Shared compiler plus embedded-Postgres service/API suite: 8 focused tests pass.
+- Shared compiler plus embedded-Postgres service/API suite: 10 focused tests pass.
 - Concurrent identical writes coalesce to one immutable version.
 - Composite company/pipeline foreign key rejects cross-tenant persistence at the
   database boundary.

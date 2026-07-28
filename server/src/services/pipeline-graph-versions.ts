@@ -12,12 +12,13 @@ import {
   type PipelineGraphCycleContractInput,
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
+import { logActivity } from "./activity-log.js";
 
 type PipelineGraphDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export type PipelineGraphVersionActor =
   | { type: "user"; userId: string }
-  | { type: "agent"; agentId: string };
+  | { type: "agent"; agentId: string; runId: string };
 
 export type PipelineGraphCompileInput = {
   companyId: string;
@@ -29,8 +30,9 @@ export type PipelineGraphCompileInput = {
 export function decodePipelineGraphVersionCursor(cursor: string) {
   try {
     const decoded = Buffer.from(cursor, "base64url").toString("utf8");
+    if (!/^[1-9]\d{0,9}$/.test(decoded)) return null;
     const version = Number(decoded);
-    return Number.isInteger(version) && version > 0 ? version : null;
+    return Number.isInteger(version) && version <= 2_147_483_647 ? version : null;
   } catch {
     return null;
   }
@@ -143,10 +145,25 @@ export function pipelineGraphVersionService(db: Db) {
             schemaVersion: compiled.definition.schemaVersion,
             definition: compiled.definition,
             status: "draft",
-            createdByUserId: input.actor.type === "user" ? input.actor.userId : null,
-            createdByAgentId: input.actor.type === "agent" ? input.actor.agentId : null,
+            createdByType: input.actor.type,
+            createdById: input.actor.type === "user" ? input.actor.userId : input.actor.agentId,
           })
           .returning();
+        await logActivity(tx as unknown as Db, {
+          companyId: input.companyId,
+          actorType: input.actor.type,
+          actorId: input.actor.type === "user" ? input.actor.userId : input.actor.agentId,
+          agentId: input.actor.type === "agent" ? input.actor.agentId : null,
+          runId: input.actor.type === "agent" ? input.actor.runId : null,
+          action: "pipeline.graph_version_created",
+          entityType: "pipeline",
+          entityId: input.pipelineId,
+          details: {
+            graphVersionId: created!.id,
+            version: created!.version,
+            definitionHash: created!.definitionHash,
+          },
+        });
         return { created: true as const, version: created! };
       });
     },

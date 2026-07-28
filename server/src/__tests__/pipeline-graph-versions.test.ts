@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agents,
   companies,
   createDb,
+  heartbeatRuns,
   pipelineGraphVersions,
   pipelineStages,
   pipelineTransitions,
@@ -37,10 +39,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(pipelineGraphVersions);
     await db.delete(pipelineTransitions);
     await db.delete(pipelineStages);
     await db.delete(pipelines);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -167,7 +171,8 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       schemaVersion: created.version.schemaVersion,
       definition: created.version.definition,
       status: "draft",
-      createdByUserId: "board-user",
+      createdByType: "user",
+      createdById: "board-user",
     })).rejects.toThrow();
 
     await db.delete(pipelineTransitions);
@@ -181,6 +186,85 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       details: {
         code: "pipeline_graph_invalid",
       },
+    });
+  });
+
+  it("rolls graph persistence back when its audit record cannot be written", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    await db.execute(sql`
+      CREATE FUNCTION paperclip_test_reject_graph_activity()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        IF NEW.action = 'pipeline.graph_version_created' THEN
+          RAISE EXCEPTION 'forced graph activity failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $function$
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER paperclip_test_reject_graph_activity
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW
+      EXECUTE FUNCTION paperclip_test_reject_graph_activity()
+    `);
+
+    try {
+      await expect(service.createDraft({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        entryNodeKey: "work",
+        actor: { type: "user", userId: "board-user" },
+      })).rejects.toThrow();
+      const persisted = await db.select().from(pipelineGraphVersions);
+      expect(persisted).toHaveLength(0);
+    } finally {
+      await db.execute(sql`DROP TRIGGER paperclip_test_reject_graph_activity ON activity_log`);
+      await db.execute(sql`DROP FUNCTION paperclip_test_reject_graph_activity()`);
+    }
+  });
+
+  it("preserves immutable actor provenance after an authoring agent is deleted", async () => {
+    const fixture = await seedLinearPipeline();
+    const [agent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Graph Author",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: agent!.id,
+      invocationSource: "manual",
+      status: "running",
+    });
+    const service = pipelineGraphVersionService(db);
+    const created = await service.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "agent", agentId: agent!.id, runId },
+    });
+
+    await db.delete(activityLog).where(eq(activityLog.runId, runId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.delete(agents).where(eq(agents.id, agent!.id));
+    const persisted = await service.get({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: created.version.id,
+    });
+    expect(persisted).toMatchObject({
+      createdByType: "agent",
+      createdById: agent!.id,
     });
   });
 
@@ -224,6 +308,18 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(listed.status).toBe(200);
     expect(listed.body.versions).toHaveLength(1);
     expect(listed.body.nextCursor).toBeNull();
+
+    const oversizedCursor = Buffer.from("2147483648", "utf8").toString("base64url");
+    const invalidCursor = await http
+      .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions?cursor=${oversizedCursor}`);
+    expect(invalidCursor.status).toBe(400);
+    expect(invalidCursor.body.details).toMatchObject({ code: "invalid_cursor" });
+
+    const invalidPipeline = await http
+      .post("/api/pipelines/not-a-uuid/graph/compile-preview")
+      .send({ entryNodeKey: "work" });
+    expect(invalidPipeline.status).toBe(400);
+    expect(invalidPipeline.body.details).toMatchObject({ code: "validation" });
 
     const fetched = await http
       .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions/${first.body.version.id}`);

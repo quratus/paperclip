@@ -82,8 +82,8 @@ export const pipelineGraphVersions = pgTable(
     schemaVersion: integer("schema_version").notNull(),
     definition: jsonb("definition").$type<PipelineGraphDefinitionV1>().notNull(),
     status: text("status").notNull().default("draft"),
-    createdByUserId: text("created_by_user_id"),
-    createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    createdByType: text("created_by_type").notNull(),
+    createdById: text("created_by_id").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -112,9 +112,9 @@ export const pipelineGraphVersions = pgTable(
       "pipeline_graph_versions_status_check",
       sql`${table.status} in ('draft', 'retired')`,
     ),
-    creatorCheck: check(
-      "pipeline_graph_versions_creator_check",
-      sql`num_nonnulls(${table.createdByUserId}, ${table.createdByAgentId}) = 1`,
+    createdByTypeCheck: check(
+      "pipeline_graph_versions_created_by_type_check",
+      sql`${table.createdByType} in ('user', 'agent')`,
     ),
   }),
 );

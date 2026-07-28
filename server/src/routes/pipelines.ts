@@ -176,6 +176,15 @@ const listGraphVersionsQuerySchema = z.object({
   cursor: z.string().trim().min(1).max(200).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
+const graphPipelineIdSchema = z.string().uuid();
+
+function parseGraphPipelineId(value: unknown) {
+  const parsed = graphPipelineIdSchema.safeParse(value);
+  if (!parsed.success) {
+    throw badRequest("Invalid pipeline id", { code: "validation" });
+  }
+  return parsed.data;
+}
 const batchIngestSchema = z.object({ items: z.array(ingestCaseSchema).max(200) });
 const breakdownCaseSchema = z.object({
   items: z.array(z.object({
@@ -1036,7 +1045,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     "/pipelines/:pipelineId/graph/compile-preview",
     validate(compileGraphSchema),
     async (req, res) => {
-      const pipelineId = req.params.pipelineId as string;
+      const pipelineId = parseGraphPipelineId(req.params.pipelineId);
       const companyId = await assertPipelineAccess(db, req, pipelineId);
       res.json(await graphVersions.compilePreview({
         companyId,
@@ -1051,7 +1060,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     "/pipelines/:pipelineId/graph/versions",
     validate(compileGraphSchema),
     async (req, res) => {
-      const pipelineId = req.params.pipelineId as string;
+      const pipelineId = parseGraphPipelineId(req.params.pipelineId);
       const companyId = await assertPipelineAccess(db, req, pipelineId);
       await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
       const actor = actorForMutation(req);
@@ -1063,23 +1072,6 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         cycleContracts: req.body.cycleContracts,
         actor,
       });
-      if (result.created) {
-        await logActivity(db, {
-          companyId,
-          actorType: actor.type,
-          actorId: actor.type === "user" ? actor.userId : actor.agentId,
-          agentId: actor.type === "agent" ? actor.agentId : null,
-          runId: actor.type === "agent" ? actor.runId : null,
-          action: "pipeline.graph_version_created",
-          entityType: "pipeline",
-          entityId: pipelineId,
-          details: {
-            graphVersionId: result.version.id,
-            version: result.version.version,
-            definitionHash: result.version.definitionHash,
-          },
-        });
-      }
       res
         .status(result.created ? 201 : 200)
         .location(`/api/pipelines/${pipelineId}/graph/versions/${result.version.id}`)
@@ -1088,7 +1080,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   );
 
   router.get("/pipelines/:pipelineId/graph/versions", async (req, res) => {
-    const pipelineId = req.params.pipelineId as string;
+    const pipelineId = parseGraphPipelineId(req.params.pipelineId);
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     const query = listGraphVersionsQuerySchema.safeParse(req.query);
     if (!query.success) {
@@ -1114,7 +1106,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   });
 
   router.get("/pipelines/:pipelineId/graph/versions/:versionId", async (req, res) => {
-    const pipelineId = req.params.pipelineId as string;
+    const pipelineId = parseGraphPipelineId(req.params.pipelineId);
     const parsedVersionId = z.string().uuid().safeParse(req.params.versionId);
     if (!parsedVersionId.success) {
       throw badRequest("Invalid graph version id", { code: "validation" });
