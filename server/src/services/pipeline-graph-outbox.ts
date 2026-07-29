@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, pipelineGraphRuns, pipelineGraphWakeOutbox } from "@paperclipai/db";
+import {
+  agents,
+  issues,
+  pipelineCaseIssueLinks,
+  pipelineGraphRuns,
+  pipelineGraphWakeOutbox,
+} from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
 function stableStringify(value: unknown): string {
@@ -206,6 +212,23 @@ export function pipelineGraphOutboxService(db: Db) {
           });
           continue;
         }
+        const linkedIssue = await db
+          .select({ id: issues.id })
+          .from(pipelineCaseIssueLinks)
+          .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
+          .where(and(
+            eq(pipelineCaseIssueLinks.companyId, input.companyId),
+            eq(pipelineCaseIssueLinks.caseId, row.caseId),
+            inArray(pipelineCaseIssueLinks.role, ["work", "origin"]),
+            isNull(pipelineCaseIssueLinks.retiredAt),
+            eq(issues.companyId, input.companyId),
+          ))
+          .orderBy(
+            sql`case when ${pipelineCaseIssueLinks.role} = 'work' then 0 else 1 end`,
+            desc(pipelineCaseIssueLinks.createdAt),
+          )
+          .limit(1)
+          .then((issueRows) => issueRows[0] ?? null);
         try {
           const run = await input.wakeup(targetAgentId, {
             source: "automation",
@@ -220,6 +243,7 @@ export function pipelineGraphOutboxService(db: Db) {
               graphEventId: row.eventId,
               pipelineCaseId: row.caseId,
               targetNodeKey: row.targetNodeKey,
+              ...(linkedIssue ? { issueId: linkedIssue.id, taskId: linkedIssue.id } : {}),
             },
             contextSnapshot: {
               pipelineGraphWake: true,
@@ -229,6 +253,9 @@ export function pipelineGraphOutboxService(db: Db) {
               pipelineCaseId: row.caseId,
               targetNodeKey: row.targetNodeKey,
               responsibilityOwner: payload.responsibilityOwner ?? row.targetNodeKey,
+              ...(linkedIssue
+                ? { issueId: linkedIssue.id, taskId: linkedIssue.id }
+                : {}),
             },
           });
           if (!run) throw new Error("Heartbeat wake was not accepted");
@@ -240,6 +267,7 @@ export function pipelineGraphOutboxService(db: Db) {
               accepted: true,
               heartbeatRunId: run.id,
               wakeupRequestId: run.wakeupRequestId ?? null,
+              issueId: linkedIssue?.id ?? null,
             },
             now: input.now,
           });

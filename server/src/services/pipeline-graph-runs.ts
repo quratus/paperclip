@@ -130,6 +130,27 @@ function evolveCycleState(input: {
   return { state, interruption };
 }
 
+function graphWakeRouting(nodeKey: string, config: Record<string, unknown>) {
+  const responsibilityOwner =
+    typeof config.responsibilityOwner === "string" && config.responsibilityOwner.trim()
+      ? config.responsibilityOwner.trim()
+      : nodeKey;
+  const targetAgentId =
+    typeof config.targetAgentId === "string" && config.targetAgentId.trim()
+      ? config.targetAgentId.trim()
+      : null;
+  const responsibilityInstruction =
+    typeof config.responsibilityInstruction === "string" && config.responsibilityInstruction.trim()
+      ? config.responsibilityInstruction.trim()
+      : null;
+  return {
+    responsibilityOwner,
+    dispatchEnabled: config.dispatchEnabled === true,
+    ...(targetAgentId ? { targetAgentId } : {}),
+    ...(responsibilityInstruction ? { responsibilityInstruction } : {}),
+  };
+}
+
 export function pipelineGraphRunService(
   db: Db,
   deps: {
@@ -757,6 +778,7 @@ export function pipelineGraphRunService(
           })
           .returning();
         if (!terminalStatus) {
+          const wakeRouting = graphWakeRouting(targetNode.key, targetNode.config);
           await tx.insert(pipelineGraphWakeOutbox).values({
             companyId: input.companyId,
             runId: run.id,
@@ -768,8 +790,7 @@ export function pipelineGraphRunService(
               runRevision: updated!.revision,
               graphVersionId: run.graphVersionId,
               targetNodeKey: targetNode.key,
-              responsibilityOwner: targetNode.config.responsibilityOwner ?? targetNode.key,
-              dispatchEnabled: false,
+              ...wakeRouting,
             },
           });
         }
@@ -879,6 +900,21 @@ export function pipelineGraphRunService(
           },
         }).returning();
         if (!input.paused) {
+          const graphVersion = await tx
+            .select({ definition: pipelineGraphVersions.definition })
+            .from(pipelineGraphVersions)
+            .where(and(
+              eq(pipelineGraphVersions.companyId, input.companyId),
+              eq(pipelineGraphVersions.id, run.graphVersionId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          const currentNode = graphVersion?.definition.nodes.find(
+            (node) => node.key === run.currentNodeKey,
+          );
+          const wakeRouting = graphWakeRouting(
+            run.currentNodeKey,
+            currentNode?.config ?? {},
+          );
           const [wakeEvent] = await tx.insert(pipelineGraphRunEvents).values({
             companyId: input.companyId,
             runId: run.id,
@@ -907,9 +943,8 @@ export function pipelineGraphRunService(
               runRevision: updated!.revision,
               graphVersionId: run.graphVersionId,
               targetNodeKey: run.currentNodeKey,
-              responsibilityOwner: run.currentNodeKey,
+              ...wakeRouting,
               reason: "run_resumed",
-              dispatchEnabled: false,
             },
           });
         }
