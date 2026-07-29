@@ -37,6 +37,7 @@ import {
   updateProjectWorkspaceSchema,
   // Company
   createCompanySchema,
+  createShowroomSchema,
   updateCompanySchema,
   updateCompanyBrandingSchema,
   companyArtifactsQuerySchema,
@@ -195,6 +196,7 @@ import {
   updateToolProfileWithEntriesSchema,
   createToolTrustRuleFromActionRequestSchema,
   revokeToolTrustRuleSchema,
+  showroomFeedbackSchema,
   unbindToolProfileBindingSchema,
   importMcpJsonSchema,
   toolPolicyTestRequestSchema,
@@ -1134,6 +1136,34 @@ registry.registerPath({
   tags: ["companies"],
   summary: "Company stats",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+// ─── Showrooms ──────────────────────────────────────────────────────────────
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/showrooms",
+  tags: ["showrooms"],
+  summary: "Create a Showroom review link",
+  body: createShowroomSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/showrooms/{token}",
+  tags: ["showrooms"],
+  summary: "Get public Showroom review details",
+  responses: { 200: r.ok(), 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/showrooms/{token}/feedback",
+  tags: ["showrooms"],
+  summary: "Submit public Showroom feedback",
+  body: showroomFeedbackSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 404: r.notFound, 429: r.tooManyRequests },
 });
 
 registry.registerPath({
