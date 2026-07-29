@@ -1,4 +1,5 @@
 import { Navigate, Outlet, Route, Routes, useLocation, useParams } from "@/lib/router";
+import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { useTranslation } from "@/i18n";
 import { Layout } from "./components/Layout";
@@ -81,6 +82,8 @@ import { AuthPage } from "./pages/Auth";
 import { BoardClaimPage } from "./pages/BoardClaim";
 import { CliAuthPage } from "./pages/CliAuth";
 import { InviteLandingPage } from "./pages/InviteLanding";
+import { ShowroomPage } from "./pages/Showroom";
+import { Showrooms } from "./pages/Showrooms";
 import { JoinRequestQueue } from "./pages/JoinRequestQueue";
 import { NotFoundPage } from "./pages/NotFound";
 import { useCompany } from "./context/CompanyContext";
@@ -167,6 +170,7 @@ function boardRoutes() {
       <Route path="agents/:agentId/:tab" element={<AgentDetail />} />
       <Route path="agents/:agentId/runs/:runId" element={<AgentDetail />} />
       <Route path="projects" element={<Projects />} />
+      <Route path="showrooms" element={<Showrooms />} />
       <Route path="projects/:projectId" element={<ProjectDetail />} />
       <Route path="projects/:projectId/overview" element={<ProjectDetail />} />
       <Route path="projects/:projectId/issues" element={<ProjectDetail />} />
@@ -497,11 +501,13 @@ function NoCompaniesStartPage() {
 export function App() {
   return (
     <>
+      <ShowroomContextPublisher />
       <Routes>
         <Route path="auth" element={<AuthPage />} />
         <Route path="board-claim/:token" element={<BoardClaimPage />} />
         <Route path="cli-auth/:id" element={<CliAuthPage />} />
         <Route path="invite/:token" element={<InviteLandingPage />} />
+        <Route path="showroom/:token" element={<ShowroomPage />} />
         <Route path="tests/perf/long-thread" element={<IssueChatLongThreadPerf />} />
         <Route path="ux-lab/cloud-upstream" element={<CloudUpstreamUxLab />} />
         <Route path="ux-lab/bootstrap-setup" element={<BootstrapSetupUxLab />} />
@@ -547,6 +553,7 @@ export function App() {
           <Route path="agents/:agentId/:tab" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/runs/:runId" element={<UnprefixedBoardRedirect />} />
           <Route path="projects" element={<UnprefixedBoardRedirect />} />
+          <Route path="showrooms" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId/overview" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId/issues" element={<UnprefixedBoardRedirect />} />
@@ -570,4 +577,30 @@ export function App() {
       <OnboardingWizardVariant />
     </>
   );
+}
+
+/**
+ * When Paperclip itself is loaded inside a public Showroom frame, publish only
+ * navigational context. The parent uses it to route a review note back to the
+ * exact work item; no credentials, issue contents, or board data leave here.
+ */
+function ShowroomContextPublisher() {
+  const location = useLocation();
+
+  useEffect(() => {
+    if (window.parent === window) return;
+    const match = location.pathname.match(/\/issues\/([0-9a-f]{8}-[0-9a-f-]{27,})$/i);
+    const segments = location.pathname.split("/").filter(Boolean);
+    const screen = segments.at(-2) === "issues" ? "Issue" : (segments.at(-1) ?? "Paperclip");
+    window.parent.postMessage({
+      type: "paperclip:showroom-context",
+      context: {
+        route: `${location.pathname}${location.search}${location.hash}`,
+        screen,
+        sourceIssueId: match?.[1],
+      },
+    }, "*");
+  }, [location.hash, location.pathname, location.search]);
+
+  return null;
 }

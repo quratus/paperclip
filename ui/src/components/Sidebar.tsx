@@ -249,6 +249,7 @@ export function Sidebar() {
           {streamlined ? (
             <>
               <SidebarNavItem to="/projects" label="Projects" icon={FolderOpen} />
+              <SidebarNavItem to="/showrooms" label="Showrooms" icon={AppWindow} />
               <SidebarStarredProjects />
             </>
           ) : null}
