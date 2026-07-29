@@ -1,14 +1,13 @@
 name: Refresh Lockfile
 
 on:
-  push:
-    branches:
-      - master
+  schedule:
+    - cron: "17 3 * * 1-5"
   workflow_dispatch:
 
 concurrency:
   group: refresh-lockfile-master
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   refresh:
@@ -87,10 +86,3 @@ jobs:
             echo "PR already exists: $pr_url"
           fi
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
-
-      - name: Enable auto-merge for lockfile PR
-        if: steps.upsert-pr.outputs.pr_url != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr merge --auto --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}"

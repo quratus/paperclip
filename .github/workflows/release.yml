@@ -1,11 +1,16 @@
 name: Release
 
 on:
-  push:
-    branches:
-      - master
   workflow_dispatch:
     inputs:
+      channel:
+        description: Publish target. Canary is explicit; stable is the default release path.
+        required: true
+        type: choice
+        options:
+          - stable
+          - canary
+        default: stable
       source_ref:
         description: Commit SHA, branch, or tag to publish as stable
         required: true
@@ -22,18 +27,18 @@ on:
         default: false
 
 concurrency:
-  group: release-${{ github.event_name }}-${{ github.ref }}
+  group: release-${{ inputs.channel }}-${{ inputs.source_ref }}
   cancel-in-progress: false
 
 jobs:
   verify_canary:
-    if: github.event_name == 'push'
+    if: inputs.channel == 'canary'
     uses: ./.github/workflows/release-verify.yml
     with:
-      ref: ${{ github.sha }}
+      ref: ${{ inputs.source_ref }}
 
   publish_canary:
-    if: github.event_name == 'push'
+    if: inputs.channel == 'canary'
     needs: verify_canary
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -88,13 +93,13 @@ jobs:
           git push origin "refs/tags/${tag}"
 
   verify_stable:
-    if: github.event_name == 'workflow_dispatch'
+    if: inputs.channel == 'stable'
     uses: ./.github/workflows/release-verify.yml
     with:
       ref: ${{ inputs.source_ref }}
 
   preview_stable:
-    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    if: inputs.channel == 'stable' && inputs.dry_run
     needs: verify_stable
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -136,7 +141,7 @@ jobs:
           ./scripts/release.sh "${args[@]}"
 
   publish_stable:
-    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+    if: inputs.channel == 'stable' && !inputs.dry_run
     needs: verify_stable
     runs-on: ubuntu-latest
     timeout-minutes: 45

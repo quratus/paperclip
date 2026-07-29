@@ -10,18 +10,29 @@ function readWorkflow(name) {
   return readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8");
 }
 
-test("release workflow delegates stable and canary verification to the reusable workflow", () => {
+test("release workflow delegates only explicitly dispatched stable and canary releases to the reusable workflow", () => {
   const releaseWorkflow = readWorkflow("release.yml");
 
   assert.match(
     releaseWorkflow,
-    /verify_canary:\n\s+if: github\.event_name == 'push'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/,
+    /verify_canary:\n\s+if: inputs\.channel == 'canary'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ inputs\.source_ref \}\}/,
   );
   assert.match(
     releaseWorkflow,
-    /verify_stable:\n\s+if: github\.event_name == 'workflow_dispatch'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ inputs\.source_ref \}\}/,
+    /verify_stable:\n\s+if: inputs\.channel == 'stable'\n\s+uses: \.\/\.github\/workflows\/release-verify\.yml\n\s+with:\n\s+ref: \$\{\{ inputs\.source_ref \}\}/,
   );
+  assert.doesNotMatch(releaseWorkflow, /\n\s+push:\n/);
   assert.doesNotMatch(releaseWorkflow, /verify_(?:canary|stable):[\s\S]*?pnpm test:run(?:\n|$)/);
+});
+
+test("container and lockfile automation do not run or merge on every master push", () => {
+  const dockerWorkflow = readWorkflow("docker.yml");
+  const lockfileWorkflow = readWorkflow("refresh-lockfile.yml");
+
+  assert.match(dockerWorkflow, /tags:\n\s+- "v\*"/);
+  assert.doesNotMatch(dockerWorkflow, /branches:\n\s+- "master"/);
+  assert.match(lockfileWorkflow, /schedule:/);
+  assert.doesNotMatch(lockfileWorkflow, /gh pr merge --auto/);
 });
 
 test("release verify workflow covers the same split test surface as stable PR verification", () => {
