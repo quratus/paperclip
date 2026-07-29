@@ -15205,13 +15205,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =
         issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+      const isPipelineGraphRecovery = runContext.pipelineGraphWake === true;
+      const pipelineGraphWakePayload =
+        isPipelineGraphRecovery && run.wakeupRequestId
+          ? await tx
+            .select({ payload: agentWakeupRequests.payload })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.id, run.wakeupRequestId),
+            ))
+            .limit(1)
+            .then((rows) => parseObject(rows[0]?.payload))
+          : {};
       const now = new Date();
       const recoveryContextSnapshot = withRecoveryModelProfileHint({
+        ...(isPipelineGraphRecovery ? runContext : {}),
         issueId: issue.id,
         taskId: issue.id,
-        wakeReason: recoveryReason,
+        wakeReason: isPipelineGraphRecovery
+          ? readNonEmptyString(runContext.wakeReason) ?? "pipeline_graph_wake"
+          : recoveryReason,
         retryReason,
-        source: recoverySource,
+        source: isPipelineGraphRecovery
+          ? readNonEmptyString(runContext.source) ?? "pipeline_graph_wake_recovery"
+          : recoverySource,
         retryOfRunId: run.id,
       }, "normal_model");
       const responsibleUserId = await resolveResponsibleUserIdForRunSeed({
@@ -15244,8 +15262,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           reason: recoveryReason,
           payload: withRecoveryModelProfileHint({
+            ...(isPipelineGraphRecovery ? pipelineGraphWakePayload : {}),
             issueId: issue.id,
+            taskId: issue.id,
             retryOfRunId: run.id,
+            retryReason,
           }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",

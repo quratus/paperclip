@@ -3853,6 +3853,86 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("preserves a graph responsibility contract across queued-run recovery", async () => {
+    const graphRunId = randomUUID();
+    const pipelineCaseId = randomUUID();
+    const graphEventId = randomUUID();
+    const responsibilityInstruction = "Implement only the linked issue, then transition ready_for_review.";
+    const { companyId, agentId, runId, wakeupRequestId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      runStatus: "queued",
+      includeIssue: true,
+    });
+    const graphContext = {
+      issueId,
+      taskId: issueId,
+      graphRunId,
+      graphRunRevision: 2,
+      pipelineCaseId,
+      graphEventId,
+      pipelineGraphWake: true,
+      targetNodeKey: "implement",
+      responsibilityOwner: "implementer",
+      wakeReason: "pipeline_graph_wake",
+      source: "issue.status_change",
+    };
+    const graphPayload = {
+      ...graphContext,
+      dispatchEnabled: true,
+      targetAgentId: agentId,
+      responsibilityInstruction,
+    };
+    await db.update(heartbeatRuns).set({ contextSnapshot: graphContext }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({ payload: graphPayload }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({ status: "todo", checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { source: "unrelated_active_work" },
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.cancelRun(runId);
+
+    const recoveryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryRun).toBeTruthy();
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      ...graphContext,
+      retryReason: "assignment_recovery",
+      retryOfRunId: runId,
+    });
+
+    const recoveryWake = recoveryRun?.wakeupRequestId
+      ? await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, recoveryRun.wakeupRequestId))
+        .then((rows) => rows[0] ?? null)
+      : null;
+    expect(recoveryWake?.payload).toMatchObject({
+      ...graphPayload,
+      retryReason: "assignment_recovery",
+      retryOfRunId: runId,
+      responsibilityInstruction,
+    });
+  });
+
   it("records operator interrupt cancellation metadata without changing terminal status", async () => {
     const { runId, issueId } = await seedRunFixture({
       agentStatus: "running",
