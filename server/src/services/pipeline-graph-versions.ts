@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, lt, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   pipelineGraphAdoptions,
   pipelineGraphVersions,
   pipelines,
@@ -72,6 +73,37 @@ async function assertPipeline(
     .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
     .then((rows) => rows[0] ?? null);
   if (!pipeline) throw notFound("Pipeline not found");
+}
+
+async function assertDefinitionTargets(
+  dbOrTx: PipelineGraphDb,
+  companyId: string,
+  definition: PipelineGraphDefinitionInput,
+) {
+  const targetAgentIds = [...new Set(definition.nodes.flatMap((node) => {
+    const targetAgentId = node.config?.targetAgentId;
+    if (targetAgentId === undefined) return [];
+    if (typeof targetAgentId !== "string" || targetAgentId.length === 0) {
+      throw unprocessable("Pipeline graph target agent is invalid", {
+        code: "pipeline_graph_target_agent_invalid",
+        nodeKey: node.key,
+      });
+    }
+    return [targetAgentId];
+  }))];
+  if (targetAgentIds.length === 0) return;
+  const companyAgents = await dbOrTx
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), inArray(agents.id, targetAgentIds)));
+  const found = new Set(companyAgents.map((agent) => agent.id));
+  const missingAgentIds = targetAgentIds.filter((agentId) => !found.has(agentId));
+  if (missingAgentIds.length > 0) {
+    throw unprocessable("Pipeline graph target agent is outside the target company", {
+      code: "pipeline_graph_target_agent_company_mismatch",
+      targetAgentIds: missingAgentIds,
+    });
+  }
 }
 
 async function compileCurrentPipeline(
@@ -347,6 +379,7 @@ export function pipelineGraphVersionService(db: Db) {
           sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
         );
         await assertPipeline(tx, input.companyId, input.pipelineId);
+        await assertDefinitionTargets(tx, input.companyId, input.definition);
 
         const replay = await tx
           .select()

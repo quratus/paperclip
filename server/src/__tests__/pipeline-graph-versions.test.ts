@@ -177,6 +177,38 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     const fixture = await seedLinearPipeline();
     const service = pipelineGraphVersionService(db);
     const actor = { type: "user" as const, userId: "board-user" };
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Other Graph Co",
+      issuePrefix: `O${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: otherCompany!.id,
+      name: "Other Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    await expect(service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: {
+        ...linearDefinition,
+        nodes: linearDefinition.nodes.map((node) => node.key === "work"
+          ? { ...node, config: { dispatchEnabled: true, targetAgentId: otherAgent!.id } }
+          : node),
+      },
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "cross-company-target",
+      actor,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "pipeline_graph_target_agent_company_mismatch" },
+    });
+    expect(await db.select().from(pipelineGraphVersions)).toHaveLength(0);
+
     const first = await service.adoptDefinition({
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,
@@ -792,6 +824,114 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .send({ expectedActiveVersionId: null });
     expect(activationReplay.status).toBe(200);
     expect(activationReplay.body.changed).toBe(false);
+
+    const adoptionBody = {
+      definition: first.body.version.definition,
+      expectedActiveVersionId: first.body.version.id,
+      expectedActiveDefinitionHash: first.body.version.definitionHash,
+      idempotencyKey: "route-adopt",
+    };
+    const adoption = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send(adoptionBody);
+    expect(adoption.status).toBe(200);
+    expect(adoption.body).toMatchObject({
+      changed: false,
+      replayed: false,
+      wakeBehavior: "none",
+      version: {
+        id: first.body.version.id,
+        definitionHash: first.body.version.definitionHash,
+        status: "active",
+      },
+    });
+    const adoptionReplay = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send(adoptionBody);
+    expect(adoptionReplay.status).toBe(200);
+    expect(adoptionReplay.body).toMatchObject({
+      adoptionId: adoption.body.adoptionId,
+      replayed: true,
+    });
+
+    const staleAdoption = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({
+        ...adoptionBody,
+        expectedActiveVersionId: null,
+        expectedActiveDefinitionHash: null,
+        idempotencyKey: "route-stale",
+      });
+    expect(staleAdoption.status).toBe(409);
+    expect(staleAdoption.body.details).toMatchObject({ code: "pipeline_graph_adoption_conflict" });
+
+    const invalidAdoption = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({ ...adoptionBody, unsupported: true });
+    expect(invalidAdoption.status).toBe(400);
+
+    const driftedDefinition = {
+      ...first.body.version.definition,
+      nodes: first.body.version.definition.nodes.map((node: { key: string; name: string }) =>
+        node.key === "work" ? { ...node, name: "Changed work" } : node),
+    };
+    const idempotencyConflict = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({ ...adoptionBody, definition: driftedDefinition });
+    expect(idempotencyConflict.status).toBe(409);
+    expect(idempotencyConflict.body.details).toMatchObject({
+      code: "pipeline_graph_adoption_idempotency_conflict",
+    });
+
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Route Other Co",
+      issuePrefix: `R${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: otherCompany!.id,
+      name: "Route Other Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    const crossTenantTarget = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({
+        ...adoptionBody,
+        idempotencyKey: "route-cross-tenant",
+        definition: {
+          ...first.body.version.definition,
+          nodes: first.body.version.definition.nodes.map((node: { key: string }) =>
+            node.key === "work"
+              ? { ...node, config: { dispatchEnabled: true, targetAgentId: otherAgent!.id } }
+              : node),
+        },
+      });
+    expect(crossTenantTarget.status).toBe(422);
+    expect(crossTenantTarget.body.details).toMatchObject({
+      code: "pipeline_graph_target_agent_company_mismatch",
+    });
+
+    const deniedApp = express();
+    deniedApp.use(express.json());
+    deniedApp.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "outsider",
+        source: "session",
+        companyIds: [],
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    deniedApp.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    deniedApp.use(errorHandler);
+    const denied = await request(deniedApp)
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send(adoptionBody);
+    expect(denied.status).toBe(404);
 
     const listed = await http
       .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions?limit=1`);
