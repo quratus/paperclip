@@ -1396,6 +1396,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     nextSocket.on("error", () => undefined);
     let connectionBuffer = "";
     let authenticated = false;
+    let inputWriteChain = Promise.resolve();
     // Connections own the session (and receive buffered process output) only
     // after presenting the bridge token; idle unauthenticated peers are dropped.
     const authTimer = setTimeout(() => {
@@ -1433,7 +1434,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
           socket = nextSocket;
           flushPendingRemoteEvents();
         }
-        void (async () => {
+        inputWriteChain = inputWriteChain.then(async () => {
           if (message.type === "stdin" && typeof message.data === "string") {
             stdinSeq += 1;
             const name = `${String(stdinSeq).padStart(12, "0")}.json`;
@@ -1443,7 +1444,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
             const name = `${String(stdinSeq).padStart(12, "0")}.json`;
             await client.writeTextFile(path.posix.join(stdinDir, name), jsonLine({ type: "stdinEnd" }));
           }
-        })().catch((error) => {
+        }).catch((error) => {
           nextSocket.write(jsonLine({ type: "error", message: error instanceof Error ? error.message : String(error) }));
           nextSocket.destroy();
         });
