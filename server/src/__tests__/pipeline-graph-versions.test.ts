@@ -28,7 +28,11 @@ import {
   decodePipelineGraphVersionCursor,
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
-import { pipelineGraphRunService } from "../services/pipeline-graph-runs.js";
+import {
+  decodePipelineGraphRunCursor,
+  graphReconciliationIssueStateHash,
+  pipelineGraphRunService,
+} from "../services/pipeline-graph-runs.js";
 import { pipelineGraphOutboxService } from "../services/pipeline-graph-outbox.js";
 import { pipelineService } from "../services/pipelines.js";
 import {
@@ -106,6 +110,63 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       label: "complete",
     });
     return { company: company!, companyId: resolvedCompanyId, pipeline: pipeline!, stages };
+  }
+
+  async function seedReviewedPipeline() {
+    const [company] = await db.insert(companies).values({
+      name: "Reviewed Graph Co",
+      issuePrefix: `R${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId: company!.id,
+      key: `reviewed-${randomUUID().slice(0, 8)}`,
+      name: "Reviewed graph pipeline",
+    }).returning();
+    const stages = await db.insert(pipelineStages).values([
+      {
+        pipelineId: pipeline!.id,
+        key: "work",
+        name: "Work",
+        kind: "working",
+        position: 100,
+      },
+      {
+        pipelineId: pipeline!.id,
+        key: "review",
+        name: "Review",
+        kind: "review",
+        position: 200,
+        config: {
+          requireApproval: true,
+          approver: { kind: "any_human" },
+          approveToStageKey: "done",
+          rejectToStageKey: "work",
+        },
+      },
+      {
+        pipelineId: pipeline!.id,
+        key: "done",
+        name: "Done",
+        kind: "done",
+        position: 300,
+      },
+    ]).returning();
+    const byKey = new Map(stages.map((stage) => [stage.key, stage]));
+    await db.insert(pipelineTransitions).values([
+      {
+        pipelineId: pipeline!.id,
+        fromStageId: byKey.get("work")!.id,
+        toStageId: byKey.get("review")!.id,
+        label: "complete",
+      },
+      {
+        pipelineId: pipeline!.id,
+        fromStageId: byKey.get("review")!.id,
+        toStageId: byKey.get("done")!.id,
+        label: "approve",
+      },
+    ]);
+    return { company: company!, companyId: company!.id, pipeline: pipeline!, stages };
   }
 
   const linearDefinition = {
@@ -1272,6 +1333,146 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .where(eq(pipelineCaseEvents.caseId, ingested.case.id)))
       .map((event) => event.type)).toContain("transitioned");
     expect(await db.select().from(pipelineGraphWakeOutbox)).toHaveLength(0);
+  });
+
+  it("lists active runs and atomically catches a completed linked issue across review without an intermediate wake", async () => {
+    const fixture = await seedReviewedPipeline();
+    const actor = { type: "user" as const, userId: "board-user" };
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor,
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor,
+    });
+    const cases = await Promise.all(["catch-up-a", "catch-up-b"].map((caseKey) =>
+      pipelineService(db).ingestCase({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        caseKey,
+        title: caseKey,
+        actor,
+      })));
+    const runs = pipelineGraphRunService(db);
+    const started = await Promise.all(cases.map((ingested, index) => runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: `reviewed-graph:start:${index}`,
+      actor,
+    })));
+
+    const firstPage = await runs.listForPipeline({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      statuses: ["running"],
+      limit: 1,
+      cursor: null,
+    });
+    expect(firstPage.items).toHaveLength(1);
+    expect(firstPage.nextCursor).not.toBeNull();
+    const secondPage = await runs.listForPipeline({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      statuses: ["running"],
+      limit: 1,
+      cursor: decodePipelineGraphRunCursor(firstPage.nextCursor!),
+    });
+    expect(secondPage.items).toHaveLength(1);
+    expect(secondPage.items[0]!.id).not.toBe(firstPage.items[0]!.id);
+    expect(secondPage.nextCursor).toBeNull();
+
+    const [linkedIssue] = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      title: "Already completed and independently approved",
+      status: "done",
+      executionState: {
+        status: "completed",
+        lastDecisionOutcome: "approved",
+      },
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId: fixture.companyId,
+      caseId: cases[0]!.case.id,
+      issueId: linkedIssue!.id,
+      role: "work",
+    });
+    const issueStateHash = graphReconciliationIssueStateHash(linkedIssue!);
+    const input = {
+      companyId: fixture.companyId,
+      runId: started[0]!.run.id,
+      expectedRevision: 1,
+      expectedCaseVersion: 1,
+      linkedIssueId: linkedIssue!.id,
+      expectedIssueStateHash: issueStateHash,
+      idempotencyKey: "reviewed-graph:catch-up",
+      outcomes: ["complete", "approve"],
+      checkpoint: {
+        controllerBuild: "test-build",
+        evidence: "linked_issue_completed_and_approved",
+      },
+      reason: "Reconcile the pinned graph with the completed linked work issue",
+      actor,
+    };
+    await expect(runs.catchUp({
+      ...input,
+      idempotencyKey: "reviewed-graph:stale-revision",
+      expectedRevision: 2,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_run_revision_conflict" },
+    });
+    await expect(runs.catchUp({
+      ...input,
+      idempotencyKey: "reviewed-graph:stale-issue",
+      expectedIssueStateHash: "0".repeat(64),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "graph_reconciliation_issue_conflict" },
+    });
+
+    const [left, right] = await Promise.all([runs.catchUp(input), runs.catchUp(input)]);
+    const changed = [left, right].find((result) => result.changed);
+    const replay = [left, right].find((result) => !result.changed);
+    expect(changed).toMatchObject({
+      changed: true,
+      wakeBehavior: "none",
+      traversedOutcomes: ["complete", "approve"],
+      run: {
+        graphVersionId: draft.version.id,
+        status: "succeeded",
+        currentNodeKey: "done",
+        revision: 3,
+      },
+    });
+    expect(replay).toMatchObject({
+      changed: false,
+      wakeBehavior: "none",
+      run: { status: "succeeded", currentNodeKey: "done", revision: 3 },
+    });
+    const [pipelineCase] = await db.select().from(pipelineCases)
+      .where(eq(pipelineCases.id, cases[0]!.case.id));
+    expect(pipelineCase).toMatchObject({
+      terminalKind: "done",
+      version: 3,
+    });
+    expect((await runs.listEvents({
+      companyId: fixture.companyId,
+      runId: started[0]!.run.id,
+    })).map((event) => event.type)).toEqual([
+      "run_started",
+      "transition_committed",
+      "transition_committed",
+      "run_succeeded",
+    ]);
+    expect(await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started[0]!.run.id))).toHaveLength(0);
   });
 
   it("carries explicit node responsibility into transition and resume wakes", async () => {

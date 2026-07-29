@@ -87,7 +87,10 @@ import {
   decodePipelineGraphVersionCursor,
   pipelineGraphVersionService,
 } from "../services/pipeline-graph-versions.js";
-import { pipelineGraphRunService } from "../services/pipeline-graph-runs.js";
+import {
+  decodePipelineGraphRunCursor,
+  pipelineGraphRunService,
+} from "../services/pipeline-graph-runs.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
@@ -196,6 +199,16 @@ const transitionGraphRunSchema = z.object({
 const graphRunLifecycleSchema = z.object({
   expectedRevision: z.number().int().positive(),
   idempotencyKey: z.string().trim().min(1).max(512),
+  reason: z.string().trim().min(1).max(2_000),
+}).strict();
+const catchUpGraphRunSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  expectedCaseVersion: z.number().int().positive(),
+  linkedIssueId: z.string().uuid(),
+  expectedIssueStateHash: z.string().regex(/^[0-9a-f]{64}$/),
+  idempotencyKey: z.string().trim().min(1).max(512),
+  outcomes: z.array(z.string().trim().min(1).max(120)).min(1).max(10),
+  checkpoint: jsonObjectSchema,
   reason: z.string().trim().min(1).max(2_000),
 }).strict();
 const activateGraphVersionSchema = z.object({
@@ -1739,6 +1752,35 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
     res.json(await graphRuns.get({ companyId: scope.companyId, runId: runId.data }));
   });
 
+  router.get("/pipelines/:pipelineId/graph-runs", async (req, res) => {
+    const pipelineId = z.string().uuid().safeParse(req.params.pipelineId);
+    if (!pipelineId.success) throw badRequest("Invalid pipeline id", { code: "validation" });
+    const companyId = await assertPipelineAccess(db, req, pipelineId.data);
+    const statusSchema = z.enum(["running", "paused", "succeeded", "failed", "cancelled"]);
+    const rawStatuses = typeof req.query.status === "string"
+      ? req.query.status.split(",").filter(Boolean)
+      : ["running", "paused"];
+    const statuses = z.array(statusSchema).min(1).max(5).safeParse(rawStatuses);
+    if (!statuses.success) throw badRequest("Invalid graph run status filter", { code: "validation" });
+    const limit = z.coerce.number().int().min(1).max(100).default(50).safeParse(req.query.limit ?? 50);
+    if (!limit.success) throw badRequest("Invalid graph run limit", { code: "validation" });
+    let cursor = null;
+    if (typeof req.query.cursor === "string") {
+      try {
+        cursor = decodePipelineGraphRunCursor(req.query.cursor);
+      } catch {
+        throw badRequest("Invalid graph run cursor", { code: "validation" });
+      }
+    }
+    res.json(await graphRuns.listForPipeline({
+      companyId,
+      pipelineId: pipelineId.data,
+      statuses: statuses.data,
+      limit: limit.data,
+      cursor,
+    }));
+  });
+
   router.get("/graph-runs/:runId/diagnostics", async (req, res) => {
     const runId = z.string().uuid().safeParse(req.params.runId);
     if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
@@ -1813,6 +1855,41 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
         outcome: req.body.outcome,
         checkpoint: req.body.checkpoint,
         leaseToken: req.body.leaseToken,
+        reason: req.body.reason,
+        actor,
+      }));
+    },
+  );
+
+  router.post(
+    "/graph-runs/:runId/catch-up",
+    validate(catchUpGraphRunSchema),
+    async (req, res) => {
+      const runId = z.string().uuid().safeParse(req.params.runId);
+      if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+      if (req.actor.type === "agent") {
+        throw forbidden("Graph catch-up requires a human operator", {
+          code: "graph_catch_up_operator_required",
+        });
+      }
+      const scope = await graphRunAccess(req, runId.data);
+      await assertPipelineWriteAccess(req, {
+        access,
+        companyId: scope.companyId,
+        pipelineId: scope.pipelineId,
+      });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user actor is required");
+      res.json(await graphRuns.catchUp({
+        companyId: scope.companyId,
+        runId: runId.data,
+        expectedRevision: req.body.expectedRevision,
+        expectedCaseVersion: req.body.expectedCaseVersion,
+        linkedIssueId: req.body.linkedIssueId,
+        expectedIssueStateHash: req.body.expectedIssueStateHash,
+        idempotencyKey: req.body.idempotencyKey,
+        outcomes: req.body.outcomes,
+        checkpoint: req.body.checkpoint,
         reason: req.body.reason,
         actor,
       }));
