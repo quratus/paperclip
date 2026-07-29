@@ -7,6 +7,7 @@ import {
   activityLog,
   budgetPolicies,
   companies,
+  companyMemberships,
   createDb,
 } from "@paperclipai/db";
 import {
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
     await db.delete(budgetPolicies);
     await db.delete(approvals);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -57,6 +59,13 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       name: "Paperclip",
       issuePrefix: issuePrefix(companyId),
       requireBoardApprovalForNewAgents: true,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "owner",
     });
     return companyId;
   }

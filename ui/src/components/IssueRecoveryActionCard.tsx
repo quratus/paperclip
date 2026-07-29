@@ -115,6 +115,7 @@ export interface IssueRecoveryActionCardProps {
 }
 
 const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
+  admission_redirect: "Responsibility Redirect",
   missing_disposition: "Missing Disposition",
   stranded_assigned_issue: "Stranded Task",
   workspace_validation: "Workspace Validation",
@@ -124,6 +125,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
+  admission_redirect: "This task needs a valid owner before meaningful work can continue.",
   missing_disposition: "This task's run finished, but no next step was chosen.",
   stranded_assigned_issue:
     "Paperclip retried this task's last run and it still has no live execution path.",
