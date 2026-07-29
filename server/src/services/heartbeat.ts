@@ -10883,7 +10883,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
         ).returning({ id: issues.id });
-      if (issueLock.length === 0) {
+      if (issueLock.length === 0 && !allowsIssueInteractionWake(claimedContext)) {
         await cancelQueuedRunForStaleIssue(claimed, claimedIssueId, { stale: true, errorCode: "issue_execution_lock_changed", reason: "Cancelled because issue execution ownership changed before lock acquisition; the current owner remains responsible", details: { issueId: claimedIssueId, expectedAssigneeAgentId: claimed.agentId } });
         return null;
       }
