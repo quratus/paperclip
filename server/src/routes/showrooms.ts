@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Router } from "express";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, invites } from "@paperclipai/db";
 import { createShowroomSchema, showroomFeedbackSchema } from "@paperclipai/shared";
@@ -140,7 +140,7 @@ export function showroomRoutes(db: Db, storage: StorageService) {
     const [triageAgent] = await db
       .select({ id: agents.id })
       .from(agents)
-      .where(and(eq(agents.companyId, companyId), eq(agents.role, "ceo")))
+      .where(and(eq(agents.companyId, companyId), eq(agents.role, "ceo"), ne(agents.status, "terminated")))
       .limit(1);
     if (!triageAgent) throw unprocessable("A Showroom requires an active CEO to triage feedback");
     const token = createShowroomToken();
