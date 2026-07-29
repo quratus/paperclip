@@ -774,15 +774,19 @@ describe.sequential("issue comment reopen routes", () => {
   // themselves with comment + reopen=true still reopens as today (AC-3).
   it("still reopens a done issue via PATCH when a different agent reassigns to self with reopen=true", async () => {
     const otherAgentId = "33333333-3333-4333-8333-333333333333";
+    const issue = {
+      ...makeIssue("done"),
+      executionPolicy: { workClass: "docs_ops" },
+    };
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
       allowed: true,
       action: input.action,
       reason: "allow_explicit_grant",
       explanation: "Allowed by test grant.",
     }));
-    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue("done"),
+      ...issue,
       ...patch,
     }));
 
@@ -1719,6 +1723,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
       "run-1",
       "Cancelled because its issue was cancelled",
+      { suppressImmediateRecovery: true },
     );
     expect(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]).toBeLessThan(
       mockIssueService.update.mock.invocationCallOrder[0],
