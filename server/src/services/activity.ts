@@ -376,7 +376,11 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(activityLog.createdAt)),
 
-    runsForIssue: async (companyId: string, issueId: string) => {
+    runsForIssue: async (
+      companyId: string,
+      issueId: string,
+      options: { includeResult?: boolean; limit?: number } = {},
+    ) => {
       scheduleRunLivenessBackfill(companyId, issueId);
       const runs = await db
         .select({
@@ -391,7 +395,7 @@ export function activityService(db: Db) {
           responsibleUserId: heartbeatRuns.responsibleUserId,
           errorCode: heartbeatRuns.errorCode,
           usageJson: summarizedUsageJson,
-          resultJson: summarizedResultJson,
+          resultJson: options.includeResult ? heartbeatRuns.resultJson : summarizedResultJson,
           logBytes: heartbeatRuns.logBytes,
           retryOfRunId: heartbeatRuns.retryOfRunId,
           scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
@@ -427,7 +431,8 @@ export function activityService(db: Db) {
             ),
           ),
         )
-        .orderBy(desc(heartbeatRuns.createdAt));
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(options.limit ?? 25);
 
       if (runs.length === 0) return runs;
       const runIds = runs.map((run) => run.runId);
