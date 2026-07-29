@@ -3009,7 +3009,11 @@ registry.registerPath({
   path: "/api/issues/{id}/runs",
   tags: ["activity"],
   summary: "List runs for an issue",
-  request: { params: z.object({ id: z.string() }) },
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({ limit: z.coerce.number().int().min(1).max(100).optional().describe("Maximum runs; defaults to 25"),
+      includeResult: z.enum(["true", "false"]).optional().describe("Opt in to full result payloads") }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -3509,7 +3513,11 @@ registry.registerPath({
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
   summary: "List heartbeat runs for a company",
-  request: { params: z.object({ companyId: z.string() }) },
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ agentId: z.string().optional(), summary: z.enum(["true", "false", "1", "0"]).optional(),
+      limit: z.coerce.number().int().min(1).max(100).optional().describe("Maximum runs; defaults to 50") }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 

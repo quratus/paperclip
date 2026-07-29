@@ -10865,7 +10865,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
+      const issueLock = await db
         .update(issues)
         .set({
           executionRunId: claimed.id,
@@ -10882,7 +10882,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.assigneeAgentId, claimed.agentId),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
-        );
+        ).returning({ id: issues.id });
+      if (issueLock.length === 0 && !allowsIssueInteractionWake(claimedContext)) {
+        await cancelQueuedRunForStaleIssue(claimed, claimedIssueId, { stale: true, errorCode: "issue_execution_lock_changed", reason: "Cancelled because issue execution ownership changed before lock acquisition; the current owner remains responsible", details: { issueId: claimedIssueId, expectedAssigneeAgentId: claimed.agentId } });
+        return null;
+      }
     }
 
     return claimed;

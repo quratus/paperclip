@@ -2585,6 +2585,7 @@ const issueListSelect = {
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
+  blockedByApprovalId: issues.blockedByApprovalId,
   blockedByExternal: issues.blockedByExternal,
   sourceTrust: issues.sourceTrust,
   startedAt: issues.startedAt,
@@ -4583,8 +4584,10 @@ export function issueService(db: Db) {
       : input.issueId
         ? await issueHasExistingIssueBlockers(input.companyId, input.issueId, dbOrTx)
         : false;
-    const hasApprovalBlocker = input.blockedByApprovalId
-      ? (await assertApprovalCanBlock(input.companyId, input.blockedByApprovalId, dbOrTx), true)
+    const hasApprovalBlocker = input.blockedByApprovalId !== undefined
+      ? input.blockedByApprovalId
+        ? (await assertApprovalCanBlock(input.companyId, input.blockedByApprovalId, dbOrTx), true)
+        : false
       : input.issueId
         ? await issueHasActiveApprovalBlocker(input.companyId, input.issueId, dbOrTx)
         : false;
@@ -6332,7 +6335,7 @@ export function issueService(db: Db) {
         blockedByExternal: issueData.blockedByExternal,
       });
       if (blockedByApprovalId) await assertApprovalCanBlock(companyId, blockedByApprovalId);
-      issueData.blockedByApprovalId = blockedByApprovalId ?? null;
+      (issueData as Partial<typeof issues.$inferInsert>).blockedByApprovalId = blockedByApprovalId ?? null;
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -6787,7 +6790,7 @@ export function issueService(db: Db) {
         dbOrTx,
       });
       if (blockedByApprovalId) await assertApprovalCanBlock(existing.companyId, blockedByApprovalId, dbOrTx);
-      if (blockedByApprovalId !== undefined) issueData.blockedByApprovalId = blockedByApprovalId;
+      if (blockedByApprovalId !== undefined) patch.blockedByApprovalId = blockedByApprovalId;
       if (patch.status === "in_progress") {
         const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
           ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
@@ -7015,12 +7018,54 @@ export function issueService(db: Db) {
           companyId: issues.companyId,
           identifier: issues.identifier,
           status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          createdByAgentId: issues.createdByAgentId,
+          createdByUserId: issues.createdByUserId,
+          responsibleUserId: issues.responsibleUserId,
           blockedByExternal: issues.blockedByExternal,
           blockedByApprovalId: issues.blockedByApprovalId,
         })
         .from(issues)
         .where(eq(issues.blockedByApprovalId, approvalId));
-      const consumed: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }> = [];
+      const [approval] = await db
+        .select({
+          requestedByAgentId: approvals.requestedByAgentId,
+          requestedByUserId: approvals.requestedByUserId,
+        })
+        .from(approvals)
+        .where(eq(approvals.id, approvalId));
+      const consumed: Array<{
+        id: string;
+        identifier: string | null;
+        status: string;
+        assigneeAgentId: string | null;
+        assigneeUserId: string | null;
+      }> = [];
+      async function firstAssignableAgentId(companyId: string, candidates: Array<string | null | undefined>) {
+        for (const candidate of candidates) {
+          if (!candidate) continue;
+          try {
+            await assertAssignableAgent(db, companyId, candidate, { kind: "work" });
+            return candidate;
+          } catch (error) {
+            if (!(error instanceof HttpError) || ![404, 409, 422].includes(error.status)) throw error;
+          }
+        }
+        return null;
+      }
+      async function firstAssignableUserId(companyId: string, candidates: Array<string | null | undefined>) {
+        for (const candidate of candidates) {
+          if (!candidate) continue;
+          try {
+            await assertAssignableUser(companyId, candidate);
+            return candidate;
+          } catch (error) {
+            if (!(error instanceof HttpError) || error.status !== 404) throw error;
+          }
+        }
+        return null;
+      }
 
       for (const issue of linkedIssues) {
         if (issue.status !== "blocked") continue;
@@ -7030,10 +7075,29 @@ export function issueService(db: Db) {
         ]);
         if (hasIssueBlocker || hasOtherApprovalBlocker || isTypedExternalBlocker(issue.blockedByExternal)) continue;
 
+        const nextAssigneeAgentId = await firstAssignableAgentId(issue.companyId, [
+          issue.assigneeAgentId,
+          approval?.requestedByAgentId,
+          issue.createdByAgentId,
+          actor.agentId,
+        ]);
+        const nextAssigneeUserId = nextAssigneeAgentId
+          ? null
+          : await firstAssignableUserId(issue.companyId, [
+            issue.assigneeUserId,
+            issue.responsibleUserId,
+            approval?.requestedByUserId,
+            issue.createdByUserId,
+            actor.userId,
+          ]);
+        if (!nextAssigneeAgentId && !nextAssigneeUserId) continue;
+
         const [updated] = await db
           .update(issues)
           .set({
             status: "todo",
+            assigneeAgentId: nextAssigneeAgentId,
+            assigneeUserId: nextAssigneeUserId,
             blockedByApprovalId: null,
             checkoutRunId: null,
             executionRunId: null,
@@ -7046,6 +7110,12 @@ export function issueService(db: Db) {
         if (!updated) continue;
 
         const readableOutcome = outcome === "approved" ? "approved" : "rejected";
+        const owner = updated.assigneeAgentId
+          ? `agent ${updated.assigneeAgentId}`
+          : `user ${updated.assigneeUserId}`;
+        const nextAction = outcome === "approved"
+          ? "Continue the approved work from todo."
+          : "Address the decision note, revise the work, and request approval again if needed.";
         await db.insert(issueComments).values({
           companyId: issue.companyId,
           issueId: issue.id,
@@ -7053,10 +7123,10 @@ export function issueService(db: Db) {
           createdByRunId: actor.runId ?? null,
           body: [
             `Approval blocker consumed: approval ${approvalId} was ${readableOutcome}.`,
+            ...(decisionNote ? ["", `Decision note: ${decisionNote}`] : []),
             "",
-            outcome === "rejected" && decisionNote
-              ? `Decision note: ${decisionNote}`
-              : "The issue is back in todo for the assignee to continue.",
+            `Current owner: ${owner}.`,
+            `Next action: ${nextAction}`,
           ].join("\n"),
           metadata: {
             version: 1,
@@ -7074,6 +7144,7 @@ export function issueService(db: Db) {
           identifier: updated.identifier,
           status: updated.status,
           assigneeAgentId: updated.assigneeAgentId,
+          assigneeUserId: updated.assigneeUserId,
         });
       }
 

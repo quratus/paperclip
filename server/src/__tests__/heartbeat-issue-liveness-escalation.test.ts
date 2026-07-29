@@ -92,22 +92,28 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
-    runningProcesses.clear();
     let idlePolls = 0;
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
+      const [runs, wakeups] = await Promise.all([
+        db.select({ status: heartbeatRuns.status }).from(heartbeatRuns),
+        db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests),
+      ]);
       const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
+      const hasPendingWakeup = wakeups.some((wakeup) =>
+        wakeup.status === "queued" || wakeup.status === "claimed" || wakeup.status === "deferred_issue_execution"
+      );
+      if (!hasActiveRun && !hasPendingWakeup) {
         idlePolls += 1;
-        if (idlePolls >= 3) break;
+        if (idlePolls >= 20) break;
       } else {
         idlePolls = 0;
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const runIds = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    const heartbeat = heartbeatService(db);
+    await Promise.all(runIds.map(({ id }) => heartbeat.waitForRunExecutionDrain(id, { timeoutMs: 10_000 })));
+    runningProcesses.clear();
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(costEvents);
@@ -120,7 +126,11 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
-    await db.delete(heartbeatRuns);
+    await db.transaction(async (tx) => {
+      await tx.delete(activityLog);
+      await tx.delete(heartbeatRunEvents);
+      await tx.delete(heartbeatRuns);
+    });
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(budgetPolicies);

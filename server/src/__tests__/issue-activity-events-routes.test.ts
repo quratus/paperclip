@@ -39,6 +39,7 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
       feedbackDataSharingPreference: "prompt",
     },
   })),
+  getExperimental: vi.fn(async () => ({})),
   listCompanyIds: vi.fn(async () => ["company-1"]),
 }));
 const mockRoutineService = vi.hoisted(() => ({
@@ -46,6 +47,16 @@ const mockRoutineService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/issue-admission-redirect.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/issue-admission-redirect.js")>(
+      "../services/issue-admission-redirect.js",
+    );
+    return {
+      ...actual,
+      handBackCompletedAdmissionRedirectInTransaction: vi.fn(async () => null),
+    };
+  });
+
   vi.doMock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
@@ -167,6 +178,7 @@ describe("issue activity event routes", () => {
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/feedback.js");
     vi.doUnmock("../services/heartbeat.js");
+    vi.doUnmock("../services/issue-admission-redirect.js");
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/instance-settings.js");
     vi.doUnmock("../services/issues.js");
@@ -473,11 +485,14 @@ describe("issue activity event routes", () => {
       updatedAt: new Date(),
     }));
 
-    const res = await request(await createApp())
+    const dbMock = {
+      transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
+    };
+    const res = await request(await createApp(dbMock))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ executionPolicy: nextPolicy });
 
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     await vi.waitFor(() => {
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),

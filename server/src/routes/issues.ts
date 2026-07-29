@@ -9528,7 +9528,9 @@ export function issueRoutes(
     // checking it out to add the Product Truth Contract) — don't demand the contract
     // already exist to start that work. The real admission gate is the backlog->todo
     // status transition and cross-status reassignment, both enforced in PATCH above.
-    if (issue.status !== "backlog") {
+    const checkoutHasForeignRunLock = [issue.checkoutRunId, issue.executionRunId]
+      .some((runId) => runId && runId !== checkoutRunId);
+    if (issue.status !== "backlog" && !checkoutHasForeignRunLock) {
       const disposition = evaluateIssueAdmission({
         issue,
         source: "checkout",
