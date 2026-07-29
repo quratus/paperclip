@@ -152,6 +152,13 @@ describeEmbeddedPostgres("built-in agents", () => {
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: options.requireApproval ?? true,
     });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "owner",
+    });
     return companyId;
   }
 
