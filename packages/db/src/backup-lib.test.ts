@@ -412,6 +412,87 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
+    "restores referenced composite unique indexes before dependent foreign keys",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_composite_unique_index_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-composite-unique-index-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."restore_pipeline_parents" (
+            "id" uuid PRIMARY KEY,
+            "company_id" uuid NOT NULL,
+            "name" text NOT NULL
+          );
+          CREATE UNIQUE INDEX "restore_pipeline_parents_company_id_uq"
+            ON "public"."restore_pipeline_parents" ("company_id", "id");
+          CREATE TABLE "public"."restore_pipeline_children" (
+            "id" uuid PRIMARY KEY,
+            "company_id" uuid NOT NULL,
+            "pipeline_id" uuid NOT NULL,
+            "note" text NOT NULL,
+            CONSTRAINT "restore_pipeline_children_company_pipeline_fk"
+              FOREIGN KEY ("company_id", "pipeline_id")
+              REFERENCES "public"."restore_pipeline_parents" ("company_id", "id")
+              ON DELETE CASCADE
+          );
+          INSERT INTO "public"."restore_pipeline_parents" ("company_id", "id", "name")
+          VALUES (
+            '11111111-1111-4111-8111-111111111111',
+            '22222222-2222-4222-8222-222222222222',
+            'parent'
+          );
+          INSERT INTO "public"."restore_pipeline_children" ("id", "company_id", "pipeline_id", "note")
+          VALUES (
+            '33333333-3333-4333-8333-333333333333',
+            '11111111-1111-4111-8111-111111111111',
+            '22222222-2222-4222-8222-222222222222',
+            'child'
+          );
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-composite-unique-index-test",
+          backupEngine: "javascript",
+        });
+
+        const backupSql = gunzipSync(await fs.promises.readFile(result.backupFile)).toString("utf8");
+        expect(backupSql.indexOf("CREATE UNIQUE INDEX restore_pipeline_parents_company_id_uq")).toBeGreaterThan(-1);
+        expect(backupSql.indexOf("CREATE UNIQUE INDEX restore_pipeline_parents_company_id_uq")).toBeLessThan(
+          backupSql.indexOf('ADD CONSTRAINT "restore_pipeline_children_company_pipeline_fk"'),
+        );
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const rows = await restoreSql.unsafe<{ note: string; name: string }[]>(`
+          SELECT child."note", parent."name"
+          FROM "public"."restore_pipeline_children" child
+          JOIN "public"."restore_pipeline_parents" parent
+            ON parent."company_id" = child."company_id"
+           AND parent."id" = child."pipeline_id"
+        `);
+        expect(rows).toEqual([{ note: "child", name: "parent" }]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
     "restores fallback COPY data when child tables are dumped before parent tables",
     async () => {
       const sourceConnectionString = await createTempDatabase();

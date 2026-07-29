@@ -803,7 +803,38 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // Foreign keys (after all tables and referenced unique constraints are created)
+    const allIndexes = await sql<{ schema_name: string; tablename: string; indexname: string; indexdef: string; is_unique: boolean }[]>`
+      SELECT
+        tn.nspname AS schema_name,
+        tbl.relname AS tablename,
+        idx.relname AS indexname,
+        pg_get_indexdef(idx.oid) AS indexdef,
+        i.indisunique AS is_unique
+      FROM pg_index i
+      JOIN pg_class idx ON idx.oid = i.indexrelid
+      JOIN pg_class tbl ON tbl.oid = i.indrelid
+      JOIN pg_namespace tn ON tn.oid = tbl.relnamespace
+      WHERE ${sql.unsafe(nonSystemSchemaPredicate("tn.nspname"))}
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_constraint c
+          WHERE c.conindid = idx.oid
+            AND c.contype IN ('p', 'u', 'x')
+        )
+      ORDER BY tn.nspname, tbl.relname, idx.relname
+    `;
+    const indexes = allIndexes.filter((entry) => includedTableNames.has(tableKey(entry.schema_name, entry.tablename)));
+    const uniqueIndexes = indexes.filter((entry) => entry.is_unique);
+    const nonUniqueIndexes = indexes.filter((entry) => !entry.is_unique);
+
+    if (uniqueIndexes.length > 0) {
+      emit("-- Unique indexes");
+      for (const idx of uniqueIndexes) {
+        emitStatement(`${idx.indexdef};`);
+      }
+      emit("");
+    }
+
+    // Foreign keys (after all tables and referenced unique constraints/indexes are created)
     const allForeignKeys = await sql<{
       constraint_name: string;
       source_schema: string;
@@ -855,23 +886,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // Indexes (non-primary, non-unique-constraint)
-    const allIndexes = await sql<{ schema_name: string; tablename: string; indexdef: string }[]>`
-      SELECT schemaname AS schema_name, tablename, indexdef
-      FROM pg_indexes
-      WHERE ${sql.unsafe(nonSystemSchemaPredicate("schemaname"))}
-        AND indexname NOT IN (
-          SELECT conname FROM pg_constraint c
-          JOIN pg_namespace n ON n.oid = c.connamespace
-          WHERE n.nspname = pg_indexes.schemaname
-        )
-      ORDER BY schemaname, tablename, indexname
-    `;
-    const indexes = allIndexes.filter((entry) => includedTableNames.has(tableKey(entry.schema_name, entry.tablename)));
-
-    if (indexes.length > 0) {
+    if (nonUniqueIndexes.length > 0) {
       emit("-- Indexes");
-      for (const idx of indexes) {
+      for (const idx of nonUniqueIndexes) {
         emitStatement(`${idx.indexdef};`);
       }
       emit("");
