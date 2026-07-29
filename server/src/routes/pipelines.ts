@@ -201,6 +201,28 @@ const graphRunLifecycleSchema = z.object({
 const activateGraphVersionSchema = z.object({
   expectedActiveVersionId: z.string().uuid().nullable(),
 }).strict();
+const adoptGraphDefinitionSchema = z.object({
+  definition: z.object({
+    schemaVersion: z.literal(1),
+    entryNodeKey: z.string().trim().min(1).max(120),
+    nodes: z.array(z.object({
+      key: z.string().trim().min(1).max(120),
+      name: z.string().trim().min(1).max(200),
+      kind: z.enum(["working", "review", "done", "cancelled"]),
+      position: z.number().int(),
+      config: jsonObjectSchema.optional(),
+    }).strict()).min(1).max(500),
+    edges: z.array(z.object({
+      fromNodeKey: z.string().trim().min(1).max(120),
+      toNodeKey: z.string().trim().min(1).max(120),
+      outcome: z.string().trim().min(1).max(120).nullable().optional(),
+    }).strict()).max(2_000),
+    cycleContracts: z.array(graphCycleContractSchema.strict()).max(100).optional(),
+  }).strict(),
+  expectedActiveVersionId: z.string().uuid().nullable(),
+  expectedActiveDefinitionHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  idempotencyKey: z.string().trim().min(1).max(512),
+}).strict();
 const listGraphVersionsQuerySchema = z.object({
   cursor: z.string().min(1).max(200).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
@@ -1125,6 +1147,29 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
         .status(result.created ? 201 : 200)
         .location(`/api/pipelines/${pipelineId}/graph/versions/${result.version.id}`)
         .json(result);
+    },
+  );
+
+  router.post(
+    "/pipelines/:pipelineId/graph/adoptions",
+    validate(adoptGraphDefinitionSchema),
+    async (req, res) => {
+      const pipelineId = parseGraphPipelineId(req.params.pipelineId);
+      const companyId = await assertPipelineAccess(db, req, pipelineId);
+      await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      const { schemaVersion: _schemaVersion, ...definition } = req.body.definition;
+      const result = await graphVersions.adoptDefinition({
+        companyId,
+        pipelineId,
+        definition,
+        expectedActiveVersionId: req.body.expectedActiveVersionId,
+        expectedActiveDefinitionHash: req.body.expectedActiveDefinitionHash,
+        idempotencyKey: req.body.idempotencyKey,
+        actor,
+      });
+      res.json(result);
     },
   );
 

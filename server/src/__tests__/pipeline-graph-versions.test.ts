@@ -13,6 +13,7 @@ import {
   pipelineCases,
   pipelineCaseIssueLinks,
   pipelineCaseEvents,
+  pipelineGraphAdoptions,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
   pipelineGraphWakeOutbox,
@@ -56,6 +57,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     await db.delete(pipelineCaseIssueLinks);
     await db.delete(issues);
     await db.delete(pipelineCases);
+    await db.delete(pipelineGraphAdoptions);
     await db.delete(pipelineGraphVersions);
     await db.delete(pipelineTransitions);
     await db.delete(pipelineStages);
@@ -105,6 +107,275 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
     return { company: company!, companyId: resolvedCompanyId, pipeline: pipeline!, stages };
   }
+
+  const linearDefinition = {
+    entryNodeKey: "work",
+    nodes: [
+      { key: "work", name: "Work", kind: "working" as const, position: 100 },
+      { key: "done", name: "Done", kind: "done" as const, position: 200 },
+    ],
+    edges: [{ fromNodeKey: "work", toNodeKey: "done", outcome: "complete" }],
+  };
+
+  const reviewedDefinition = {
+    entryNodeKey: "work",
+    nodes: [
+      { key: "work", name: "Work", kind: "working" as const, position: 100 },
+      { key: "review", name: "Review", kind: "review" as const, position: 200 },
+      { key: "done", name: "Done", kind: "done" as const, position: 300 },
+    ],
+    edges: [
+      { fromNodeKey: "work", toNodeKey: "review", outcome: "complete" },
+      { fromNodeKey: "review", toNodeKey: "done", outcome: "approve" },
+    ],
+  };
+
+  it("atomically adopts an immutable definition with durable replay and no execution wake", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const input = {
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-linear-v1",
+      actor: { type: "user" as const, userId: "board-user" },
+    };
+
+    const adopted = await service.adoptDefinition(input);
+    expect(adopted).toMatchObject({
+      changed: true,
+      restored: false,
+      replayed: false,
+      wakeBehavior: "none",
+      version: { status: "active", version: 1 },
+    });
+
+    const replayed = await service.adoptDefinition(input);
+    expect(replayed).toMatchObject({
+      adoptionId: adopted.adoptionId,
+      changed: true,
+      restored: false,
+      replayed: true,
+      wakeBehavior: "none",
+      version: { id: adopted.version.id },
+    });
+
+    expect(await db.select().from(pipelineGraphAdoptions)).toHaveLength(1);
+    expect(
+      await db.select().from(activityLog)
+        .where(eq(activityLog.action, "pipeline.graph_definition_adopted")),
+    ).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+    expect(await db.select().from(pipelineGraphRuns)).toHaveLength(0);
+    expect(await db.select().from(pipelineGraphRunEvents)).toHaveLength(0);
+    expect(await db.select().from(pipelineGraphWakeOutbox)).toHaveLength(0);
+  });
+
+  it("fences stale callers and rejects idempotency drift without partial graph changes", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const actor = { type: "user" as const, userId: "board-user" };
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Other Graph Co",
+      issuePrefix: `O${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: otherCompany!.id,
+      name: "Other Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    const [terminatedAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Terminated Agent",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    for (const [targetAgentId, code] of [
+      ["not-a-uuid", "pipeline_graph_target_agent_invalid"],
+      [terminatedAgent!.id, "pipeline_graph_target_agent_ineligible"],
+    ] as const) {
+      await expect(service.adoptDefinition({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        definition: {
+          ...linearDefinition,
+          nodes: linearDefinition.nodes.map((node) => node.key === "work"
+            ? { ...node, config: { dispatchEnabled: true, targetAgentId } }
+            : node),
+        },
+        expectedActiveVersionId: null,
+        expectedActiveDefinitionHash: null,
+        idempotencyKey: `invalid-target:${targetAgentId}`,
+        actor,
+      })).rejects.toMatchObject({ status: 422, details: { code } });
+    }
+    await expect(service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: {
+        ...linearDefinition,
+        nodes: linearDefinition.nodes.map((node) => node.key === "work"
+          ? { ...node, config: { dispatchEnabled: true, targetAgentId: otherAgent!.id } }
+          : node),
+      },
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "cross-company-target",
+      actor,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "pipeline_graph_target_agent_company_mismatch" },
+    });
+    expect(await db.select().from(pipelineGraphVersions)).toHaveLength(0);
+
+    const first = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-first",
+      actor,
+    });
+
+    await expect(service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: reviewedDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "stale-plan",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_adoption_conflict" },
+    });
+    await expect(service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: reviewedDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-first",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_adoption_idempotency_conflict" },
+    });
+
+    const versions = await db.select().from(pipelineGraphVersions);
+    expect(versions).toHaveLength(1);
+    expect(versions[0]).toMatchObject({ id: first.version.id, status: "active" });
+    expect(await db.select().from(pipelineGraphAdoptions)).toHaveLength(1);
+  });
+
+  it("restores an earlier immutable version and records no-op adoptions", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const actor = { type: "user" as const, userId: "board-user" };
+    const first = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-a",
+      actor,
+    });
+    const noOp = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: first.version.id,
+      expectedActiveDefinitionHash: first.version.definitionHash,
+      idempotencyKey: "confirm-a",
+      actor,
+    });
+    expect(noOp).toMatchObject({
+      changed: false,
+      restored: false,
+      version: { id: first.version.id },
+    });
+
+    const second = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: reviewedDefinition,
+      expectedActiveVersionId: first.version.id,
+      expectedActiveDefinitionHash: first.version.definitionHash,
+      idempotencyKey: "adopt-b",
+      actor,
+    });
+    const restored = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: second.version.id,
+      expectedActiveDefinitionHash: second.version.definitionHash,
+      idempotencyKey: "restore-a",
+      actor,
+    });
+    expect(restored).toMatchObject({
+      changed: true,
+      restored: true,
+      version: { id: first.version.id, status: "active" },
+    });
+    expect(
+      (await db.select().from(pipelineGraphVersions))
+        .filter((version) => version.status === "active"),
+    ).toHaveLength(1);
+  });
+
+  it("rolls adoption back when its audit receipt cannot be completed", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    await db.execute(sql`
+      CREATE FUNCTION paperclip_test_reject_graph_adoption_activity()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        IF NEW.action = 'pipeline.graph_definition_adopted' THEN
+          RAISE EXCEPTION 'forced graph adoption activity failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $function$
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER paperclip_test_reject_graph_adoption_activity
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW
+      EXECUTE FUNCTION paperclip_test_reject_graph_adoption_activity()
+    `);
+
+    try {
+      await expect(service.adoptDefinition({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        definition: linearDefinition,
+        expectedActiveVersionId: null,
+        expectedActiveDefinitionHash: null,
+        idempotencyKey: "audit-failure",
+        actor: { type: "user", userId: "board-user" },
+      })).rejects.toThrow();
+      expect(await db.select().from(pipelineGraphAdoptions)).toHaveLength(0);
+      expect(await db.select().from(pipelineGraphVersions)).toHaveLength(0);
+    } finally {
+      await db.execute(sql`DROP TRIGGER paperclip_test_reject_graph_adoption_activity ON activity_log`);
+      await db.execute(sql`DROP FUNCTION paperclip_test_reject_graph_adoption_activity()`);
+    }
+  });
 
   it("persists one immutable draft for concurrent identical requests", async () => {
     const fixture = await seedLinearPipeline();
@@ -582,6 +853,114 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .send({ expectedActiveVersionId: null });
     expect(activationReplay.status).toBe(200);
     expect(activationReplay.body.changed).toBe(false);
+
+    const adoptionBody = {
+      definition: first.body.version.definition,
+      expectedActiveVersionId: first.body.version.id,
+      expectedActiveDefinitionHash: first.body.version.definitionHash,
+      idempotencyKey: "route-adopt",
+    };
+    const adoption = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send(adoptionBody);
+    expect(adoption.status).toBe(200);
+    expect(adoption.body).toMatchObject({
+      changed: false,
+      replayed: false,
+      wakeBehavior: "none",
+      version: {
+        id: first.body.version.id,
+        definitionHash: first.body.version.definitionHash,
+        status: "active",
+      },
+    });
+    const adoptionReplay = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send(adoptionBody);
+    expect(adoptionReplay.status).toBe(200);
+    expect(adoptionReplay.body).toMatchObject({
+      adoptionId: adoption.body.adoptionId,
+      replayed: true,
+    });
+
+    const staleAdoption = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({
+        ...adoptionBody,
+        expectedActiveVersionId: null,
+        expectedActiveDefinitionHash: null,
+        idempotencyKey: "route-stale",
+      });
+    expect(staleAdoption.status).toBe(409);
+    expect(staleAdoption.body.details).toMatchObject({ code: "pipeline_graph_adoption_conflict" });
+
+    const invalidAdoption = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({ ...adoptionBody, unsupported: true });
+    expect(invalidAdoption.status).toBe(400);
+
+    const driftedDefinition = {
+      ...first.body.version.definition,
+      nodes: first.body.version.definition.nodes.map((node: { key: string; name: string }) =>
+        node.key === "work" ? { ...node, name: "Changed work" } : node),
+    };
+    const idempotencyConflict = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({ ...adoptionBody, definition: driftedDefinition });
+    expect(idempotencyConflict.status).toBe(409);
+    expect(idempotencyConflict.body.details).toMatchObject({
+      code: "pipeline_graph_adoption_idempotency_conflict",
+    });
+
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Route Other Co",
+      issuePrefix: `R${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: otherCompany!.id,
+      name: "Route Other Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    const crossTenantTarget = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({
+        ...adoptionBody,
+        idempotencyKey: "route-cross-tenant",
+        definition: {
+          ...first.body.version.definition,
+          nodes: first.body.version.definition.nodes.map((node: { key: string }) =>
+            node.key === "work"
+              ? { ...node, config: { dispatchEnabled: true, targetAgentId: otherAgent!.id } }
+              : node),
+        },
+      });
+    expect(crossTenantTarget.status).toBe(422);
+    expect(crossTenantTarget.body.details).toMatchObject({
+      code: "pipeline_graph_target_agent_company_mismatch",
+    });
+
+    const deniedApp = express();
+    deniedApp.use(express.json());
+    deniedApp.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "outsider",
+        source: "session",
+        companyIds: [],
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    deniedApp.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    deniedApp.use(errorHandler);
+    const denied = await request(deniedApp)
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send(adoptionBody);
+    expect(denied.status).toBe(404);
 
     const listed = await http
       .get(`/api/pipelines/${fixture.pipeline.id}/graph/versions?limit=1`);

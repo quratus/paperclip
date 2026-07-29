@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, lt, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
+  pipelineGraphAdoptions,
   pipelineGraphVersions,
   pipelines,
   pipelineStages,
@@ -10,6 +12,7 @@ import {
 import {
   compilePipelineGraph,
   type PipelineGraphCycleContractInput,
+  type PipelineGraphDefinitionInput,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
@@ -47,6 +50,18 @@ function definitionHash(canonicalJson: string) {
   return createHash("sha256").update(canonicalJson).digest("hex");
 }
 
+function adoptionRequestHash(input: {
+  canonicalJson: string;
+  expectedActiveVersionId: string | null;
+  expectedActiveDefinitionHash: string | null;
+}) {
+  return definitionHash(JSON.stringify({
+    definition: JSON.parse(input.canonicalJson),
+    expectedActiveVersionId: input.expectedActiveVersionId,
+    expectedActiveDefinitionHash: input.expectedActiveDefinitionHash,
+  }));
+}
+
 async function assertPipeline(
   dbOrTx: PipelineGraphDb,
   companyId: string,
@@ -58,6 +73,51 @@ async function assertPipeline(
     .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
     .then((rows) => rows[0] ?? null);
   if (!pipeline) throw notFound("Pipeline not found");
+}
+
+async function assertDefinitionTargets(
+  dbOrTx: PipelineGraphDb,
+  companyId: string,
+  definition: PipelineGraphDefinitionInput,
+) {
+  const targetAgentIds = [...new Set(definition.nodes.flatMap((node) => {
+    const targetAgentId = node.config?.targetAgentId;
+    if (targetAgentId === undefined) return [];
+    if (
+      typeof targetAgentId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetAgentId)
+    ) {
+      throw unprocessable("Pipeline graph target agent is invalid", {
+        code: "pipeline_graph_target_agent_invalid",
+        nodeKey: node.key,
+      });
+    }
+    return [targetAgentId];
+  }))];
+  if (targetAgentIds.length === 0) return;
+  const companyAgents = await dbOrTx
+    .select({ id: agents.id, status: agents.status })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), inArray(agents.id, targetAgentIds)))
+    .for("update");
+  const found = new Set(companyAgents.map((agent) => agent.id));
+  const missingAgentIds = targetAgentIds.filter((agentId) => !found.has(agentId));
+  if (missingAgentIds.length > 0) {
+    throw unprocessable("Pipeline graph target agent is outside the target company", {
+      code: "pipeline_graph_target_agent_company_mismatch",
+      targetAgentIds: missingAgentIds,
+    });
+  }
+  const eligibleStatuses = new Set(["active", "idle", "running", "error", "at_capacity"]);
+  const ineligible = companyAgents
+    .filter((agent) => !eligibleStatuses.has(agent.status))
+    .map((agent) => ({ id: agent.id, status: agent.status }));
+  if (ineligible.length > 0) {
+    throw unprocessable("Pipeline graph target agent is not eligible for dispatch", {
+      code: "pipeline_graph_target_agent_ineligible",
+      agents: ineligible,
+    });
+  }
 }
 
 async function compileCurrentPipeline(
@@ -302,6 +362,231 @@ export function pipelineGraphVersionService(db: Db) {
           },
         });
         return { changed: true as const, version: activated };
+      });
+    },
+
+    async adoptDefinition(input: {
+      companyId: string;
+      pipelineId: string;
+      definition: PipelineGraphDefinitionInput;
+      expectedActiveVersionId: string | null;
+      expectedActiveDefinitionHash: string | null;
+      idempotencyKey: string;
+      actor: PipelineGraphVersionActor;
+    }) {
+      const compiled = compilePipelineGraph(input.definition);
+      if (!compiled.ok) {
+        throw unprocessable("Pipeline graph is invalid", {
+          code: "pipeline_graph_invalid",
+          diagnostics: compiled.diagnostics,
+        });
+      }
+      const desiredDefinitionHash = definitionHash(compiled.canonicalJson);
+      const requestHash = adoptionRequestHash({
+        canonicalJson: compiled.canonicalJson,
+        expectedActiveVersionId: input.expectedActiveVersionId,
+        expectedActiveDefinitionHash: input.expectedActiveDefinitionHash,
+      });
+
+      return db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
+        );
+        await assertPipeline(tx, input.companyId, input.pipelineId);
+        await assertDefinitionTargets(tx, input.companyId, input.definition);
+
+        const replay = await tx
+          .select()
+          .from(pipelineGraphAdoptions)
+          .where(and(
+            eq(pipelineGraphAdoptions.companyId, input.companyId),
+            eq(pipelineGraphAdoptions.pipelineId, input.pipelineId),
+            eq(pipelineGraphAdoptions.idempotencyKey, input.idempotencyKey),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (replay) {
+          if (replay.requestHash !== requestHash) {
+            throw conflict("Idempotency key was already used for a different graph adoption", {
+              code: "pipeline_graph_adoption_idempotency_conflict",
+              adoptionId: replay.id,
+            });
+          }
+          const version = await tx
+            .select()
+            .from(pipelineGraphVersions)
+            .where(and(
+              eq(pipelineGraphVersions.companyId, input.companyId),
+              eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+              eq(pipelineGraphVersions.id, replay.resultVersionId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (!version) throw notFound("Adopted pipeline graph version not found");
+          return {
+            adoptionId: replay.id,
+            changed: replay.changed,
+            restored: replay.restored,
+            replayed: true as const,
+            wakeBehavior: "none" as const,
+            version,
+          };
+        }
+
+        const currentActive = await tx
+          .select()
+          .from(pipelineGraphVersions)
+          .where(and(
+            eq(pipelineGraphVersions.companyId, input.companyId),
+            eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+            eq(pipelineGraphVersions.status, "active"),
+          ))
+          .then((rows) => rows[0] ?? null);
+        const currentActiveVersionId = currentActive?.id ?? null;
+        const currentActiveDefinitionHash = currentActive?.definitionHash ?? null;
+        if (
+          currentActiveVersionId !== input.expectedActiveVersionId ||
+          currentActiveDefinitionHash !== input.expectedActiveDefinitionHash
+        ) {
+          throw conflict("Active graph version changed", {
+            code: "pipeline_graph_adoption_conflict",
+            expectedActiveVersionId: input.expectedActiveVersionId,
+            currentActiveVersionId,
+            expectedActiveDefinitionHash: input.expectedActiveDefinitionHash,
+            currentActiveDefinitionHash,
+          });
+        }
+
+        let changed = currentActiveDefinitionHash !== desiredDefinitionHash;
+        let restored = false;
+        let resultVersion = currentActive;
+        const actorId = input.actor.type === "user" ? input.actor.userId : input.actor.agentId;
+        const now = new Date();
+
+        if (changed) {
+          const existing = await tx
+            .select()
+            .from(pipelineGraphVersions)
+            .where(and(
+              eq(pipelineGraphVersions.companyId, input.companyId),
+              eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+              eq(pipelineGraphVersions.definitionHash, desiredDefinitionHash),
+            ))
+            .then((rows) => rows[0] ?? null);
+
+          await tx
+            .update(pipelineGraphVersions)
+            .set({ status: "retired", retiredAt: now, updatedAt: now })
+            .where(and(
+              eq(pipelineGraphVersions.companyId, input.companyId),
+              eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+              eq(pipelineGraphVersions.status, "active"),
+            ));
+
+          if (existing) {
+            restored = existing.status === "retired";
+            const [activated] = await tx
+              .update(pipelineGraphVersions)
+              .set({
+                status: "active",
+                activatedByType: input.actor.type,
+                activatedById: actorId,
+                activatedAt: now,
+                retiredAt: null,
+                updatedAt: now,
+              })
+              .where(and(
+                eq(pipelineGraphVersions.companyId, input.companyId),
+                eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+                eq(pipelineGraphVersions.id, existing.id),
+                eq(pipelineGraphVersions.status, existing.status),
+              ))
+              .returning();
+            resultVersion = activated ?? null;
+          } else {
+            const latest = await tx
+              .select({ version: pipelineGraphVersions.version })
+              .from(pipelineGraphVersions)
+              .where(and(
+                eq(pipelineGraphVersions.companyId, input.companyId),
+                eq(pipelineGraphVersions.pipelineId, input.pipelineId),
+              ))
+              .orderBy(desc(pipelineGraphVersions.version))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            const [created] = await tx
+              .insert(pipelineGraphVersions)
+              .values({
+                companyId: input.companyId,
+                pipelineId: input.pipelineId,
+                version: (latest?.version ?? 0) + 1,
+                definitionHash: desiredDefinitionHash,
+                schemaVersion: compiled.definition.schemaVersion,
+                definition: compiled.definition,
+                status: "active",
+                createdByType: input.actor.type,
+                createdById: actorId,
+                activatedByType: input.actor.type,
+                activatedById: actorId,
+                activatedAt: now,
+              })
+              .returning();
+            resultVersion = created ?? null;
+          }
+          if (!resultVersion) {
+            throw conflict("Graph version changed during adoption", {
+              code: "pipeline_graph_adoption_race",
+            });
+          }
+        }
+
+        if (!resultVersion) {
+          throw conflict("No active graph version matched the adoption fence", {
+            code: "pipeline_graph_adoption_missing_active",
+          });
+        }
+
+        const [adoption] = await tx
+          .insert(pipelineGraphAdoptions)
+          .values({
+            companyId: input.companyId,
+            pipelineId: input.pipelineId,
+            idempotencyKey: input.idempotencyKey,
+            requestHash,
+            expectedActiveVersionId: input.expectedActiveVersionId,
+            expectedActiveDefinitionHash: input.expectedActiveDefinitionHash,
+            resultVersionId: resultVersion.id,
+            resultDefinitionHash: resultVersion.definitionHash,
+            changed,
+            restored,
+          })
+          .returning();
+        await logActivity(tx as unknown as Db, {
+          companyId: input.companyId,
+          actorType: input.actor.type,
+          actorId,
+          agentId: input.actor.type === "agent" ? input.actor.agentId : null,
+          runId: input.actor.type === "agent" ? input.actor.runId : null,
+          action: "pipeline.graph_definition_adopted",
+          entityType: "pipeline",
+          entityId: input.pipelineId,
+          details: {
+            adoptionId: adoption!.id,
+            idempotencyKey: input.idempotencyKey,
+            graphVersionId: resultVersion.id,
+            version: resultVersion.version,
+            definitionHash: resultVersion.definitionHash,
+            changed,
+            restored,
+            wakeBehavior: "none",
+          },
+        });
+        return {
+          adoptionId: adoption!.id,
+          changed,
+          restored,
+          replayed: false as const,
+          wakeBehavior: "none" as const,
+          version: resultVersion,
+        };
       });
     },
   };
