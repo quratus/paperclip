@@ -167,3 +167,48 @@ describe("approvalService.findOpenHireApprovalForAgent", () => {
     expect(result).toBeNull();
   });
 });
+
+describe("approvalService requester validation", () => {
+  function createRequesterDb(memberships: Array<{ id: string }>) {
+    const where = vi.fn(async () => memberships);
+    const from = vi.fn(() => ({ where }));
+    const select = vi.fn(() => ({ from }));
+    const returning = vi.fn(async () => [{ id: "approval-created" }]);
+    const values = vi.fn(() => ({ returning }));
+    const insert = vi.fn(() => ({ values }));
+    return { db: { select, insert }, insert, values };
+  }
+
+  it("rejects a user requester without active same-company membership before insert", async () => {
+    const dbStub = createRequesterDb([]);
+
+    await expect(approvalService(dbStub.db as any).create("company-1", {
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: null,
+      requestedByUserId: "foreign-or-inactive-user",
+    } as any)).rejects.toMatchObject({
+      status: 404,
+      message: "Requester user not found",
+    });
+    expect(dbStub.insert).not.toHaveBeenCalled();
+  });
+
+  it("accepts an active same-company user requester", async () => {
+    const dbStub = createRequesterDb([{ id: "membership-1" }]);
+
+    await approvalService(dbStub.db as any).create("company-1", {
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: null,
+      requestedByUserId: "active-user",
+    } as any);
+
+    expect(dbStub.values).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: "company-1",
+      requestedByUserId: "active-user",
+    }));
+  });
+});
