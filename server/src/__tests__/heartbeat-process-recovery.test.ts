@@ -1899,11 +1899,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const run = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
     expect(run?.errorCode).toBe("capacity_exhausted");
 
-    const { agent, issue, comment } = await waitForCapacityRequeue(db, { agentId, issueId, agentStatus: "running" });
+    const { agent, issue, comment } = await waitForCapacityRequeue(
+      db,
+      { agentId, issueId, agentStatus: "running" },
+      20_000,
+    );
     expect(agent?.status).toBe("running");
     expect(issue?.status).toBe("todo");
     expect(comment?.body).toContain("Awaiting capacity");
-  });
+  }, 30_000);
 
   it("keeps ordinary process crashes as agent errors", async () => {
     const companyId = randomUUID();

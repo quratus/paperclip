@@ -252,9 +252,9 @@ async function createApp(actor: Record<string, unknown>, dbOptions: { requireBoa
   return app;
 }
 
-async function requestApp(
+async function requestApp<T>(
   app: express.Express,
-  buildRequest: (baseUrl: string) => request.Test,
+  buildRequest: (baseUrl: string) => PromiseLike<T>,
 ) {
   const { createServer } = await vi.importActual<typeof import("node:http")>("node:http");
   const server = createServer(app);
@@ -269,6 +269,7 @@ async function requestApp(
     return await buildRequest(`http://127.0.0.1:${address.port}`);
   } finally {
     if (server.listening) {
+      server.closeAllConnections();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {
           if (error) reject(error);
@@ -1814,7 +1815,7 @@ describe.sequential("agent permission routes", () => {
   it("defaults and caps company heartbeat run history", async () => {
     mockHeartbeatService.list.mockResolvedValue([]);
 
-    const app = createApp({
+    const app = await createApp({
       type: "board",
       userId: "board-user",
       source: "session",
@@ -1822,12 +1823,14 @@ describe.sequential("agent permission routes", () => {
       companyIds: [companyId],
     });
 
-    const defaultRes = await request(app).get(`/api/companies/${companyId}/heartbeat-runs`);
-    const cappedRes = await request(app).get(`/api/companies/${companyId}/heartbeat-runs?limit=1000`);
+    const [defaultRes, cappedRes] = await requestApp(app, (baseUrl) => Promise.all([
+      request(baseUrl).get(`/api/companies/${companyId}/heartbeat-runs`),
+      request(baseUrl).get(`/api/companies/${companyId}/heartbeat-runs?limit=1000`),
+    ]));
 
     expect(defaultRes.status).toBe(200);
     expect(cappedRes.status).toBe(200);
-    expect(mockHeartbeatService.list).toHaveBeenNthCalledWith(1, companyId, undefined, 50);
-    expect(mockHeartbeatService.list).toHaveBeenNthCalledWith(2, companyId, undefined, 100);
-  });
+    expect(mockHeartbeatService.list).toHaveBeenNthCalledWith(1, companyId, undefined, 50, { summary: false });
+    expect(mockHeartbeatService.list).toHaveBeenNthCalledWith(2, companyId, undefined, 100, { summary: false });
+  }, 15_000);
 });

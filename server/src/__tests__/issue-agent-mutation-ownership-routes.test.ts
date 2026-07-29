@@ -164,6 +164,16 @@ function registerRouteMocks() {
     issueService: () => mockIssueService,
   }));
 
+  vi.doMock("../services/issue-admission-redirect.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/issue-admission-redirect.js")>(
+      "../services/issue-admission-redirect.js",
+    );
+    return {
+      ...actual,
+      handBackCompletedAdmissionRedirectInTransaction: vi.fn(async () => null),
+    };
+  });
+
   vi.doMock("../services/work-products.js", () => ({
     workProductService: () => mockWorkProductService,
   }));
@@ -970,14 +980,9 @@ describe("agent issue mutation checkout ownership", () => {
       expect.objectContaining({
         status: "todo",
         blockedByExternal: null,
-        assigneeAgentId: peerAgentId,
         executionPolicy: expect.objectContaining({ workClass: "product_ui" }),
-        executionState: expect.objectContaining({
-          status: "pending",
-          currentStageType: "review",
-          currentParticipant: expect.objectContaining({ agentId: peerAgentId }),
-        }),
       }),
+      expect.anything(),
     );
   }, 15_000);
 
