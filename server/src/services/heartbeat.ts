@@ -8545,6 +8545,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (run.errorCode === "capacity_exhausted") {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "not_applicable",
+        issueCommentSatisfiedByCommentId: null,
+        issueCommentRetryQueuedAt: null,
+      });
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
     if (!issueId) {
       if (run.issueCommentStatus !== "not_applicable") {
         await patchRunIssueCommentStatus(run.id, {
@@ -11174,10 +11182,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runningCount = await countRunningRunsForAgent(agentId);
     const nextStatus =
-      options?.capacityExhausted || outcome === "capacity_exhausted"
-        ? "at_capacity"
-        : runningCount > 0
-          ? "running"
+      runningCount > 0
+        ? "running"
+        : options?.capacityExhausted || outcome === "capacity_exhausted"
+          ? "at_capacity"
         : outcome === "succeeded" || outcome === "interrupted" || outcome === "cancelled" || (outcome === "failed" && options?.keepIdleOnFailure)
           ? "idle"
           : "error";
