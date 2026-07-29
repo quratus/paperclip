@@ -376,11 +376,7 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(activityLog.createdAt)),
 
-    runsForIssue: async (
-      companyId: string,
-      issueId: string,
-      options: { includeResult?: boolean; limit?: number } = {},
-    ) => {
+    runsForIssue: async (companyId: string, issueId: string, options: { includeResult?: boolean; limit?: number } = {}) => {
       scheduleRunLivenessBackfill(companyId, issueId);
       const runs = await db
         .select({
