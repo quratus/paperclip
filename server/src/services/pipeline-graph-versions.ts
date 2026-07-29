@@ -83,7 +83,10 @@ async function assertDefinitionTargets(
   const targetAgentIds = [...new Set(definition.nodes.flatMap((node) => {
     const targetAgentId = node.config?.targetAgentId;
     if (targetAgentId === undefined) return [];
-    if (typeof targetAgentId !== "string" || targetAgentId.length === 0) {
+    if (
+      typeof targetAgentId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetAgentId)
+    ) {
       throw unprocessable("Pipeline graph target agent is invalid", {
         code: "pipeline_graph_target_agent_invalid",
         nodeKey: node.key,
@@ -93,15 +96,26 @@ async function assertDefinitionTargets(
   }))];
   if (targetAgentIds.length === 0) return;
   const companyAgents = await dbOrTx
-    .select({ id: agents.id })
+    .select({ id: agents.id, status: agents.status })
     .from(agents)
-    .where(and(eq(agents.companyId, companyId), inArray(agents.id, targetAgentIds)));
+    .where(and(eq(agents.companyId, companyId), inArray(agents.id, targetAgentIds)))
+    .for("update");
   const found = new Set(companyAgents.map((agent) => agent.id));
   const missingAgentIds = targetAgentIds.filter((agentId) => !found.has(agentId));
   if (missingAgentIds.length > 0) {
     throw unprocessable("Pipeline graph target agent is outside the target company", {
       code: "pipeline_graph_target_agent_company_mismatch",
       targetAgentIds: missingAgentIds,
+    });
+  }
+  const eligibleStatuses = new Set(["active", "idle", "running", "error", "at_capacity"]);
+  const ineligible = companyAgents
+    .filter((agent) => !eligibleStatuses.has(agent.status))
+    .map((agent) => ({ id: agent.id, status: agent.status }));
+  if (ineligible.length > 0) {
+    throw unprocessable("Pipeline graph target agent is not eligible for dispatch", {
+      code: "pipeline_graph_target_agent_ineligible",
+      agents: ineligible,
     });
   }
 }

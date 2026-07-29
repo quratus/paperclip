@@ -190,6 +190,35 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       runtimeConfig: {},
       permissions: {},
     }).returning();
+    const [terminatedAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Terminated Agent",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    for (const [targetAgentId, code] of [
+      ["not-a-uuid", "pipeline_graph_target_agent_invalid"],
+      [terminatedAgent!.id, "pipeline_graph_target_agent_ineligible"],
+    ] as const) {
+      await expect(service.adoptDefinition({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        definition: {
+          ...linearDefinition,
+          nodes: linearDefinition.nodes.map((node) => node.key === "work"
+            ? { ...node, config: { dispatchEnabled: true, targetAgentId } }
+            : node),
+        },
+        expectedActiveVersionId: null,
+        expectedActiveDefinitionHash: null,
+        idempotencyKey: `invalid-target:${targetAgentId}`,
+        actor,
+      })).rejects.toMatchObject({ status: 422, details: { code } });
+    }
     await expect(service.adoptDefinition({
       companyId: fixture.companyId,
       pipelineId: fixture.pipeline.id,
