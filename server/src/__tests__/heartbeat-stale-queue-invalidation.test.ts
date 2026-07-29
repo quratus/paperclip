@@ -87,6 +87,8 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
   for (let attempt = 0; attempt < 10; attempt += 1) {
     try {
       await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS paperclip_test_reassign_after_claim ON "heartbeat_runs";
+        DROP FUNCTION IF EXISTS paperclip_test_reassign_after_claim();
         TRUNCATE TABLE
           "company_skills",
           "issue_comments",
@@ -255,6 +257,74 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
     return { runId, wakeupRequestId };
   }
+
+  it("cancels a run reassigned after pre-claim validation but before execution-lock acquisition", async () => {
+    const { companyId, agentId: formerOwnerId } = await seedCompanyAndAgent({ agentName: "Former Owner" });
+    const currentOwnerId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: currentOwnerId,
+      companyId,
+      name: "Current Owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned between validation and lock",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: formerOwnerId,
+    });
+    const stale = await seedQueuedRun({
+      companyId,
+      agentId: formerOwnerId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+    await db.execute(sql.raw(`
+      CREATE FUNCTION paperclip_test_reassign_after_claim() RETURNS trigger AS $$
+      BEGIN
+        IF NEW."id" = '${stale.runId}' AND OLD."status" = 'queued' AND NEW."status" = 'running' THEN
+          UPDATE "issues" SET "assignee_agent_id" = '${currentOwnerId}' WHERE "id" = '${issueId}';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER paperclip_test_reassign_after_claim
+        AFTER UPDATE ON "heartbeat_runs"
+        FOR EACH ROW EXECUTE FUNCTION paperclip_test_reassign_after_claim();
+    `));
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForCondition(async () =>
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, stale.runId))
+        .then((rows) => rows[0]?.status === "cancelled"));
+
+    const [run, issue] = await Promise.all([
+      db.select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+      }).from(heartbeatRuns).where(eq(heartbeatRuns.id, stale.runId)).then((rows) => rows[0]),
+      db.select({
+        assigneeAgentId: issues.assigneeAgentId,
+        executionRunId: issues.executionRunId,
+      }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]),
+    ]);
+    expect(countExecuteCallsForRun(stale.runId)).toBe(0);
+    expect(run).toMatchObject({
+      status: "cancelled",
+      errorCode: "issue_execution_lock_changed",
+      resultJson: { stopReason: "issue_execution_lock_changed" },
+    });
+    expect(issue).toEqual({ assigneeAgentId: currentOwnerId, executionRunId: null });
+  });
 
   it("cancels a former owner's queued assignment run after reassignment before the current owner proceeds", async () => {
     const { companyId, agentId: formerOwnerId } = await seedCompanyAndAgent({ agentName: "Former Owner" });

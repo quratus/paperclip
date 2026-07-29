@@ -116,10 +116,7 @@ export function activityRoutes(db: Db) {
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const requestedLimit = Number(req.query.limit);
     const result = await svc.runsForIssue(issue.companyId, issue.id, {
-      includeResult: req.query.includeResult === "true",
-      limit: Number.isFinite(requestedLimit)
-        ? Math.max(1, Math.min(100, Math.floor(requestedLimit)))
-        : 25,
+      includeResult: req.query.includeResult === "true", limit: Number.isFinite(requestedLimit) ? Math.max(1, Math.min(100, Math.floor(requestedLimit))) : 25,
     });
     res.json(result);
   });
