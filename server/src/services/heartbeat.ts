@@ -15680,11 +15680,82 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const outcome = await db.transaction(async (tx) => {
+        if (isPipelineGraphWake) {
+          if (graphRunId) {
+            await tx.execute(
+              sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + graphRunId}, 0))`,
+            );
+          }
+          const graphRun = graphRunId
+            ? await tx
+              .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+              .from(pipelineGraphRuns)
+              .where(and(
+                eq(pipelineGraphRuns.companyId, agent.companyId),
+                eq(pipelineGraphRuns.id, graphRunId),
+              ))
+              .then((rows) => rows[0] ?? null)
+            : null;
+          if (
+            !graphRun ||
+            !["running", "paused"].includes(graphRun.status) ||
+            graphRunRevision === null ||
+            graphRun.revision !== graphRunRevision
+          ) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "pipeline_graph_wake_superseded",
+              payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+        }
+        if (opts.idempotencyKey) {
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${
+              `heartbeat-wakeup:${agent.companyId}:${agentId}:${opts.idempotencyKey}`
+            }, 0))`,
+          );
+          const existingWake = await tx
+            .select({ runId: agentWakeupRequests.runId })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              sql`${agentWakeupRequests.runId} is not null`,
+            ))
+            .orderBy(asc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existingWake?.runId) {
+            const existingRun = await tx
+              .select()
+              .from(heartbeatRuns)
+              .where(and(
+                eq(heartbeatRuns.companyId, agent.companyId),
+                eq(heartbeatRuns.agentId, agentId),
+                eq(heartbeatRuns.id, existingWake.runId),
+              ))
+              .then((rows) => rows[0] ?? null);
+            if (existingRun) {
+              return { kind: "idempotent_replay" as const, run: existingRun };
+            }
+          }
+        }
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
 
-        const issue = await tx
+        let issue = await tx
           .select({
             id: issues.id,
             companyId: issues.companyId,
@@ -15719,6 +15790,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
+        }
+        if (isPipelineGraphWake && issue.assigneeAgentId !== agent.id) {
+          issue = { ...issue, assigneeAgentId: agent.id };
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
@@ -16391,6 +16465,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
+        if (isPipelineGraphWake) {
+          await tx
+            .update(issues)
+            .set({
+              assigneeAgentId: agent.id,
+              assigneeUserId: null,
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(issues.companyId, agent.companyId),
+              eq(issues.id, issue.id),
+            ));
+        }
+
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
           .values({
@@ -16441,6 +16529,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "idempotent_replay") return outcome.run;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;

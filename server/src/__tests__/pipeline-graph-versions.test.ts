@@ -9,7 +9,9 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
   pipelineCases,
+  pipelineCaseIssueLinks,
   pipelineCaseEvents,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
@@ -51,6 +53,8 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     await db.delete(pipelineGraphWakeOutbox);
     await db.delete(pipelineGraphRunEvents);
     await db.delete(pipelineGraphRuns);
+    await db.delete(pipelineCaseIssueLinks);
+    await db.delete(issues);
     await db.delete(pipelineCases);
     await db.delete(pipelineGraphVersions);
     await db.delete(pipelineTransitions);
@@ -891,6 +895,117 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(await db.select().from(pipelineGraphWakeOutbox)).toHaveLength(0);
   });
 
+  it("carries explicit node responsibility into transition and resume wakes", async () => {
+    const fixture = await seedLinearPipeline();
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId: fixture.companyId,
+      name: "Allowlisted graph worker",
+      role: "engineer",
+    });
+    const [reviewStage] = await db.insert(pipelineStages).values({
+      pipelineId: fixture.pipeline.id,
+      key: "review",
+      name: "Review",
+      kind: "review",
+      position: 150,
+      config: {
+        responsibilityOwner: "independent_reviewer",
+        responsibilityInstruction: "Review the linked issue and commit an explicit graph outcome.",
+        dispatchEnabled: true,
+        targetAgentId,
+        requireApproval: true,
+        approveToStageKey: "done",
+        rejectToStageKey: "work",
+      },
+    }).returning();
+    await db.insert(pipelineTransitions).values([
+      {
+        pipelineId: fixture.pipeline.id,
+        fromStageId: fixture.stages.find((stage) => stage.key === "work")!.id,
+        toStageId: reviewStage!.id,
+        label: "review",
+      },
+      {
+        pipelineId: fixture.pipeline.id,
+        fromStageId: reviewStage!.id,
+        toStageId: fixture.stages.find((stage) => stage.key === "done")!.id,
+        label: "approve",
+      },
+    ]);
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "allowlisted-responsibility",
+      title: "Allowlisted responsibility",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const started = await runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "allowlisted:start",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await runs.transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "allowlisted:review",
+      outcome: "review",
+      checkpoint: { review_revision: 1 },
+      actor: { type: "user", userId: "board-user" },
+    });
+    await runs.setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 2,
+      idempotencyKey: "allowlisted:pause",
+      paused: true,
+      reason: "exercise resume routing",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await runs.setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 3,
+      idempotencyKey: "allowlisted:resume",
+      paused: false,
+      reason: "resume the same responsible reviewer",
+      actor: { type: "user", userId: "board-user" },
+    });
+
+    const wakeRows = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id));
+    expect(wakeRows).toHaveLength(2);
+    for (const wake of wakeRows) {
+      expect(wake).toMatchObject({
+        targetNodeKey: "review",
+        payload: {
+          responsibilityOwner: "independent_reviewer",
+          responsibilityInstruction: "Review the linked issue and commit an explicit graph outcome.",
+          dispatchEnabled: true,
+          targetAgentId,
+        },
+      });
+    }
+  });
+
   it("serializes graph start against the legacy case transition authority", async () => {
     const fixture = await seedLinearPipeline();
     const versions = pipelineGraphVersionService(db);
@@ -1369,6 +1484,18 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       role: "engineer",
     });
     const dispatchable = crossCompanyTarget!;
+    const [linkedWorkIssue] = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      title: "Graph-dispatched work",
+      status: "todo",
+      priority: "high",
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId: fixture.companyId,
+      caseId: dispatchable.caseId,
+      issueId: linkedWorkIssue!.id,
+      role: "work",
+    });
     await db.update(pipelineGraphWakeOutbox)
       .set({
         status: "pending",
@@ -1407,6 +1534,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
           graphEventId: dispatchable!.eventId,
           pipelineCaseId: dispatchable!.caseId,
           targetNodeKey: dispatchable!.targetNodeKey,
+          issueId: linkedWorkIssue!.id,
+          taskId: linkedWorkIssue!.id,
+        },
+        payload: {
+          issueId: linkedWorkIssue!.id,
+          taskId: linkedWorkIssue!.id,
         },
       },
     }]);
@@ -1418,6 +1551,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
         accepted: true,
         heartbeatRunId,
         wakeupRequestId,
+        issueId: linkedWorkIssue!.id,
       },
     });
 

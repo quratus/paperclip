@@ -46,6 +46,7 @@ if (!isSameFile && existsSync(CWD_ENV_PATH)) {
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
 const TAILSCALE_DETECT_TIMEOUT_MS = 3000;
+const PIPELINE_GRAPH_WAKE_DISPATCH_MAX_BATCH_SIZE = 2;
 
 type DatabaseMode = "embedded-postgres" | "postgres";
 
@@ -89,6 +90,16 @@ export interface Config {
   pipelineGraphWakeDispatchBatchSize: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
+}
+
+export function resolvePipelineGraphWakeDispatchBatchSize(value: string | undefined): number {
+  return Math.max(
+    1,
+    Math.min(
+      PIPELINE_GRAPH_WAKE_DISPATCH_MAX_BATCH_SIZE,
+      Number(value) || PIPELINE_GRAPH_WAKE_DISPATCH_MAX_BATCH_SIZE,
+    ),
+  );
 }
 
 function detectTailnetBindHost(): string | undefined {
@@ -334,9 +345,8 @@ export function loadConfig(): Config {
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     pipelineGraphWakeDispatchEnabled: process.env.PIPELINE_GRAPH_WAKE_DISPATCH_ENABLED === "true",
-    pipelineGraphWakeDispatchBatchSize: Math.max(
-      1,
-      Math.min(100, Number(process.env.PIPELINE_GRAPH_WAKE_DISPATCH_BATCH_SIZE) || 10),
+    pipelineGraphWakeDispatchBatchSize: resolvePipelineGraphWakeDispatchBatchSize(
+      process.env.PIPELINE_GRAPH_WAKE_DISPATCH_BATCH_SIZE,
     ),
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,

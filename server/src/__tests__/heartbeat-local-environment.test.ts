@@ -12,6 +12,7 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  issues,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -150,7 +151,6 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       runtimeConfig: {},
       permissions: {},
     });
-
     const heartbeat = heartbeatService(db);
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(queued).not.toBeNull();
@@ -209,6 +209,12 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       runtimeConfig: {},
       permissions: {},
     });
+    const [linkedIssue] = await db.insert(issues).values({
+      companyId,
+      title: "Graph responsibility target",
+      status: "todo",
+      priority: "high",
+    }).returning();
 
     const [pipeline] = await db.insert(pipelines).values({
       companyId,
@@ -276,10 +282,17 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
         pipelineGraphWake: true,
         graphRunId: graphRun.run.id,
         graphRunRevision: graphRun.run.revision,
+        issueId: linkedIssue!.id,
+        taskId: linkedIssue!.id,
       },
     };
     const accepted = await heartbeat.wakeup(agentId, wakeOptions);
     expect(accepted).not.toBeNull();
+    expect(await db.select().from(issues).where(eq(issues.id, linkedIssue!.id))
+      .then((rows) => rows[0])).toMatchObject({
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+    });
     expect((await waitForRunToFinish(heartbeat, accepted!.id))?.status).toBe("succeeded");
     await waitForRunLeasesToRelease(db, accepted!.id);
     await waitForAgentToBecomeIdle(db, agentId);
@@ -291,7 +304,9 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
-    expect(runs).toHaveLength(1);
+    expect(runs.filter((run) =>
+      (run.contextSnapshot as Record<string, unknown>).pipelineGraphWake === true
+    )).toHaveLength(1);
     const wakeups = await db
       .select()
       .from(agentWakeupRequests)
