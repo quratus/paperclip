@@ -49,7 +49,7 @@ export function Showrooms() {
     <main className="mx-auto max-w-2xl px-6 py-10">
       <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Showrooms</p>
       <h1 className="mt-2 text-3xl font-semibold tracking-tight">Create a review link</h1>
-      <p className="mt-3 max-w-xl text-sm leading-6 text-muted-foreground">Send a focused, expiring frame to a collaborator. Feedback routes to matching work when the loaded app publishes context; otherwise it enters human triage.</p>
+      <p className="mt-3 max-w-xl text-sm leading-6 text-muted-foreground">Send a focused, expiring frame to a collaborator. Every submission becomes a separate feedback intake for this company’s CEO; screen and source-work context are evidence for triage, never an automatic change to work.</p>
       <form className="mt-8 space-y-5 rounded-xl border border-border bg-card p-6" onSubmit={create}>
         <label className="block text-sm font-medium" htmlFor="showroom-title">Name</label>
         <Input id="showroom-title" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Costa — approval-flow review" required disabled={saving} />

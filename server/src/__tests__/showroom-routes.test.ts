@@ -4,9 +4,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { showroomRoutes } from "../routes/showrooms.js";
 
 const mockIssues = vi.hoisted(() => ({
-  getById: vi.fn(),
-  update: vi.fn(),
-  addComment: vi.fn(),
   create: vi.fn(),
   createAttachment: vi.fn(),
 }));
@@ -23,13 +20,13 @@ const now = new Date();
 const showroom = {
   id: "showroom-1",
   companyId: "company-1",
-  defaultsPayload: { title: "Costa review", targetUrl: "https://review.example.test/app", projectId: null },
+  defaultsPayload: { title: "Costa review", targetUrl: "https://review.example.test/app", projectId: null, triageAgentId: "charles-1" },
   expiresAt: new Date(now.getTime() + 60 * 60 * 1_000),
 };
 
 function app() {
   const db = {
-    select: () => ({ from: () => ({ where: () => ({ then: (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([showroom])) }) }) }),
+    select: () => ({ from: () => ({ where: () => ({ then: (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([showroom])), limit: () => Promise.resolve([{ id: "charles-1" }]) }) }) }),
     insert: () => ({ values: () => ({ returning: () => Promise.resolve([{ id: "showroom-1", expiresAt: showroom.expiresAt }]) }) }),
   };
   const server = express();
@@ -50,9 +47,7 @@ describe("showroom feedback routing", () => {
     Object.values(mockIssues).forEach((mock) => mock.mockReset());
     mockLogActivity.mockReset();
     mockStorage.putFile.mockReset();
-    mockIssues.getById.mockResolvedValue({ id: "issue-1", companyId: "company-1", identifier: "OPS-12", status: "done" });
-    mockIssues.update.mockResolvedValue({ id: "issue-1", companyId: "company-1", identifier: "OPS-12", status: "todo" });
-    mockIssues.addComment.mockResolvedValue({ id: "comment-1" });
+    mockIssues.create.mockResolvedValue({ id: "triage-1", identifier: "OPS-13" });
     mockStorage.putFile.mockResolvedValue({
       provider: "local",
       objectKey: "issues/issue-1/showroom-feedback/screenshot.png",
@@ -63,7 +58,7 @@ describe("showroom feedback routing", () => {
     });
   });
 
-  it("adds contextual feedback to matched work and reopens completed work", async () => {
+  it("creates a Charles-owned intake without changing suggested source work", async () => {
     const response = await request(app())
       .post(`/api/showrooms/${token}/feedback`)
       .send({
@@ -74,15 +69,12 @@ describe("showroom feedback routing", () => {
       });
 
     expect(response.status).toBe(201);
-    expect(response.body).toMatchObject({ identifier: "OPS-12", routed: true, reopened: true });
-    expect(mockIssues.update).toHaveBeenCalledWith("issue-1", { status: "todo" });
-    expect(mockIssues.addComment).toHaveBeenCalledWith(
-      "issue-1",
-      expect.stringContaining("- Section: Decision card"),
-      {},
-      expect.objectContaining({ authorType: "system" }),
-    );
-    expect(mockIssues.create).not.toHaveBeenCalled();
+    expect(response.body).toMatchObject({ identifier: "OPS-13" });
+    expect(mockIssues.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      assigneeAgentId: "charles-1",
+      status: "todo",
+      description: expect.stringContaining("- Suggested work item: 17ef2c4b-1ed2-4cf8-9f4d-d7bdb0d33b13"),
+    }));
   });
 
   it("mints an expiring public review link for an authenticated company user", async () => {
@@ -96,25 +88,16 @@ describe("showroom feedback routing", () => {
     expect(response.body.expiresAt).toBeTruthy();
   });
 
-  it("creates a human-triage issue when no same-company source work is available", async () => {
-    mockIssues.getById.mockResolvedValue({ id: "other-company-work", companyId: "company-2", status: "done" });
-    mockIssues.create.mockResolvedValue({ id: "triage-1", identifier: "OPS-13" });
-
+  it("mints a link bound to the company CEO for triage", async () => {
     const response = await request(app())
-      .post(`/api/showrooms/${token}/feedback`)
-      .send({
-        submissionId: "3219d411-d429-47dd-8dc9-5f3494044b21",
-        text: "The approval area is unclear.",
-        viewport: { width: 1440, height: 900 },
-        context: { sourceIssueId: "17ef2c4b-1ed2-4cf8-9f4d-d7bdb0d33b13" },
-      });
+      .post("/api/companies/company-1/showrooms")
+      .set("host", "paperclip.test")
+      .send({ title: "Costa review", targetUrl: "https://review.example.test/app", expiresInHours: 24 });
 
     expect(response.status).toBe(201);
-    expect(response.body).toMatchObject({ identifier: "OPS-13", routed: false, reopened: false });
-    expect(mockIssues.create).toHaveBeenCalledWith("company-1", expect.objectContaining({ status: "backlog" }));
   });
 
-  it("attaches an explicitly supplied screenshot to the routed feedback comment", async () => {
+  it("attaches an explicitly supplied screenshot to the intake issue", async () => {
     const response = await request(app())
       .post(`/api/showrooms/${token}/feedback`)
       .send({
@@ -128,8 +111,8 @@ describe("showroom feedback routing", () => {
     expect(response.status).toBe(201);
     expect(mockStorage.putFile).toHaveBeenCalledOnce();
     expect(mockIssues.createAttachment).toHaveBeenCalledWith(expect.objectContaining({
-      issueId: "issue-1",
-      issueCommentId: "comment-1",
+      issueId: "triage-1",
+      issueCommentId: null,
       contentType: "image/png",
     }));
   });

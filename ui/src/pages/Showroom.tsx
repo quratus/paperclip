@@ -119,10 +119,8 @@ export function ShowroomPage() {
         }),
       });
       if (!response.ok) throw new Error(readError(await response.json().catch(() => null)));
-      const created = await response.json() as { identifier: string; routed: boolean; reopened: boolean };
-      setNotice(created.routed
-        ? `Danke — dein Feedback wurde an ${created.identifier}${created.reopened ? " weitergegeben und die Arbeit wieder geöffnet." : " weitergegeben."}`
-        : `Danke — dein Feedback wurde als ${created.identifier} zur menschlichen Triage an das Team gesendet.`);
+      const created = await response.json() as { identifier: string };
+      setNotice(`Danke — dein Feedback wurde als ${created.identifier} zur Prüfung an das Team gesendet.`);
       setText("");
       setPanelOpen(false);
     } catch (reason) {
@@ -156,7 +154,7 @@ export function ShowroomPage() {
           <form onSubmit={submit} onMouseDown={(event) => event.stopPropagation()} className="w-full max-w-md rounded-xl border border-border bg-background p-5 shadow-sm" aria-label="Showroom feedback">
             <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Feedback</p>
             <h1 className="mt-2 text-xl font-bold">Was sollten wir verbessern?</h1>
-            <p className="mt-2 text-sm text-muted-foreground">Dein Hinweis geht direkt in die Feedback-Pipeline. Das Team sieht, auf welcher Ansicht du warst.</p>
+            <p className="mt-2 text-sm text-muted-foreground">Dein Hinweis wird zuerst geprüft. Das Team sieht, auf welcher Ansicht du warst, und entscheidet dann über die passende Arbeit.</p>
             <label className="mt-5 block text-sm font-medium" htmlFor="showroom-feedback">Dein Hinweis</label>
             <Textarea id="showroom-feedback" autoFocus value={text} onChange={(event) => setText(event.target.value)} placeholder="Zum Beispiel: Dieser Schritt ist nicht verständlich, weil …" className="mt-2" disabled={sending} />
             <label className="mt-3 block text-sm font-medium" htmlFor="showroom-reporter">Name (optional)</label>

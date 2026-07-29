@@ -2,9 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { Router } from "express";
 import { and, eq, gt, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { invites } from "@paperclipai/db";
+import { agents, invites } from "@paperclipai/db";
 import { createShowroomSchema, showroomFeedbackSchema } from "@paperclipai/shared";
-import { badRequest, notFound, tooManyRequests } from "../errors.js";
+import { badRequest, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
 import { issueService, logActivity } from "../services/index.js";
@@ -20,6 +20,7 @@ type ShowroomPayload = {
   title: string;
   targetUrl: string;
   projectId: string | null;
+  triageAgentId: string;
 };
 
 type ShowroomInvite = {
@@ -44,11 +45,12 @@ function requestBaseUrl(req: { header(name: string): string | undefined; protoco
 }
 
 function showroomPayload(value: Record<string, unknown> | null): ShowroomPayload | null {
-  if (!value || typeof value.title !== "string" || typeof value.targetUrl !== "string") return null;
+  if (!value || typeof value.title !== "string" || typeof value.targetUrl !== "string" || typeof value.triageAgentId !== "string") return null;
   return {
     title: value.title,
     targetUrl: value.targetUrl,
     projectId: typeof value.projectId === "string" ? value.projectId : null,
+    triageAgentId: value.triageAgentId,
   };
 }
 
@@ -135,6 +137,12 @@ export function showroomRoutes(db: Db, storage: StorageService) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const input = req.body;
+    const [triageAgent] = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), eq(agents.role, "ceo")))
+      .limit(1);
+    if (!triageAgent) throw unprocessable("A Showroom requires an active CEO to triage feedback");
     const token = createShowroomToken();
     const expiresAt = new Date(Date.now() + input.expiresInHours * 60 * 60 * 1_000);
     const [showroom] = await db.insert(invites).values({
@@ -143,7 +151,7 @@ export function showroomRoutes(db: Db, storage: StorageService) {
       tokenHash: hashToken(token),
       expiresAt,
       invitedByUserId: req.actor.userId ?? null,
-      defaultsPayload: { title: input.title, targetUrl: input.targetUrl, projectId: input.projectId ?? null },
+      defaultsPayload: { title: input.title, targetUrl: input.targetUrl, projectId: input.projectId ?? null, triageAgentId: triageAgent.id },
     }).returning({ id: invites.id, expiresAt: invites.expiresAt });
     const baseUrl = requestBaseUrl(req);
     res.status(201).location(`/api/showrooms/${token}`).json({
@@ -170,41 +178,26 @@ export function showroomRoutes(db: Db, storage: StorageService) {
     const cleanedText = redactSensitiveText(input.text).trim();
     const route = safeRoute(input.route);
     const originId = `${showroom.id}:${input.submissionId}`;
-    const context = input.context;
-    const candidate = context?.sourceIssueId ? await issues.getById(context.sourceIssueId) : null;
-    const routedIssue = candidate?.companyId === showroom.companyId ? candidate : null;
     const body = feedbackBody(input, payload, route, Boolean(screenshot));
-    let issue;
-    let routed = false;
-    let reopened = false;
-    let issueCommentId: string | null = null;
-
-    if (routedIssue) {
-      issue = routedIssue;
-      routed = true;
-      if (routedIssue.status === "done" || routedIssue.status === "cancelled") {
-        issue = await issues.update(routedIssue.id, { status: "todo" }) ?? routedIssue;
-        reopened = issue.status === "todo";
-      }
-      const comment = await issues.addComment(issue.id, body, {}, { authorType: "system" });
-      issueCommentId = comment.id;
-    } else {
-      issue = await issues.create(showroom.companyId!, {
-        title: `Showroom feedback: ${cleanedText.replace(/\s+/g, " ").slice(0, 96)}`,
-        description: body,
-        status: "backlog",
-        priority: "medium",
-        projectId: payload.projectId,
+    // A collaborator may suggest related work, but never gets authority to
+    // change it. Charles, the SQNCR CEO, receives a separate intake item and
+    // makes the explicit routing/reopen decision from the preserved context.
+    const issue = await issues.create(showroom.companyId!, {
+      title: `Showroom feedback: ${cleanedText.replace(/\s+/g, " ").slice(0, 96)}`,
+      description: body,
+      status: "todo",
+      priority: "medium",
+      projectId: payload.projectId,
+      assigneeAgentId: payload.triageAgentId,
+      originKind: "external:showroom:feedback",
+      externalSource: {
         originKind: "external:showroom:feedback",
-        externalSource: {
-          originKind: "external:showroom:feedback",
-          originId,
-          fingerprint: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
-          payloadFingerprint: null,
-          sourceRef: { namespace: "showroom", kind: "feedback", id: originId },
-        },
-      });
-    }
+        originId,
+        fingerprint: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+        payloadFingerprint: null,
+        sourceRef: { namespace: "showroom", kind: "feedback", id: originId },
+      },
+    });
 
     if (screenshot) {
       const stored = await storage.putFile({
@@ -222,7 +215,7 @@ export function showroomRoutes(db: Db, storage: StorageService) {
         byteSize: stored.byteSize,
         sha256: stored.sha256,
         originalFilename: stored.originalFilename,
-        issueCommentId,
+        issueCommentId: null,
       });
     }
 
@@ -230,13 +223,21 @@ export function showroomRoutes(db: Db, storage: StorageService) {
       companyId: showroom.companyId!,
       actorType: "system",
       actorId: `showroom:${showroom.id}`,
-      action: routed ? "showroom.feedback_routed" : "showroom.feedback_triage_created",
+      action: "showroom.feedback_intake_created",
       entityType: "issue",
       entityId: issue.id,
       issueId: issue.id,
-      details: { route, hasScreenshot: Boolean(screenshot), showroomTitle: payload.title, routed, reopened, screen: context?.screen ?? null, section: context?.section ?? null },
+      details: {
+        route,
+        hasScreenshot: Boolean(screenshot),
+        showroomTitle: payload.title,
+        triageAgentId: payload.triageAgentId,
+        screen: input.context?.screen ?? null,
+        section: input.context?.section ?? null,
+        suggestedSourceIssueId: input.context?.sourceIssueId ?? null,
+      },
     });
-    res.status(201).location(`/api/issues/${issue.id}`).json({ id: issue.id, identifier: issue.identifier, routed, reopened });
+    res.status(201).location(`/api/issues/${issue.id}`).json({ id: issue.id, identifier: issue.identifier });
   });
 
   return router;
