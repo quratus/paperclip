@@ -1898,6 +1898,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     const run = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
     expect(run?.errorCode).toBe("capacity_exhausted");
+    await heartbeat.waitForRunExecutionDrain(queuedRun?.id ?? "", { timeoutMs: 20_000 });
+    expect((await heartbeat.getRun(queuedRun?.id ?? ""))?.issueCommentStatus).toBe("not_applicable");
 
     const { agent, issue, comment } = await waitForCapacityRequeue(db, { agentId, issueId, agentStatus: "running" });
     expect(agent?.status).toBe("running");
