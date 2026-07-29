@@ -8828,6 +8828,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
+    const nonAdoptableRuns = snapshotRuns.filter((run) => {
+      if (!isTrackedLocalChildProcessAdapter(run.adapterType)) return true;
+      return !isProcessAlive(run.processPid) && !isProcessGroupAlive(run.processGroupId);
+    });
+
+    if (nonAdoptableRuns.length > 0) {
+      await writeHotRestartShutdownSnapshot({
+        intent: {
+          ...intentWithVersion,
+          drainRequired: true,
+        },
+        signal,
+        activeRuns: snapshotRuns,
+        capturedAt: now,
+      });
+
+      for (const nonAdoptableRun of nonAdoptableRuns) {
+        const current = activeRuns.find(({ run }) => run.id === nonAdoptableRun.runId)?.run;
+        if (!current) continue;
+        const adapterSupported = isTrackedLocalChildProcessAdapter(nonAdoptableRun.adapterType);
+        await appendRunEvent(current, await nextRunEventSeq(current.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: "Hot restart requires controlled drain because this adapter cannot be adopted",
+          payload: {
+            signal,
+            adapterType: nonAdoptableRun.adapterType,
+            fallbackReason: adapterSupported ? "process_identity_not_alive" : "adapter_not_adoptable",
+            previousServerPid: intent.previousServerPid,
+            previousServerVersion: intentWithVersion.previousServerVersion,
+            processPid: nonAdoptableRun.processPid,
+            processGroupId: nonAdoptableRun.processGroupId,
+          },
+        });
+      }
+
+      logger.warn(
+        {
+          signal,
+          previousServerPid: intent.previousServerPid,
+          activeRunIds: snapshotRuns.map((run) => run.runId),
+          nonAdoptableRunIds: nonAdoptableRuns.map((run) => run.runId),
+          nonAdoptableAdapterTypes: [...new Set(nonAdoptableRuns.map((run) => run.adapterType))],
+        },
+        "hot restart contains non-adoptable adapters; using controlled drain and retry",
+      );
+
+      return {
+        mode: "unsupported_adapter_drain" as const,
+        skipDrain: false as const,
+        activeRunIds: snapshotRuns.map((run) => run.runId),
+        nonAdoptableRunIds: nonAdoptableRuns.map((run) => run.runId),
+      };
+    }
 
     await writeHotRestartShutdownSnapshot({
       intent: intentWithVersion,
@@ -8906,6 +8961,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(inArray(heartbeatRuns.id, candidates.map((run) => run.runId)))
       : [];
     const currentByRunId = new Map(currentRows.map((row) => [row.run.id, row]));
+    const retryRows = candidates.length > 0
+      ? await db
+        .select({
+          id: heartbeatRuns.id,
+          retryOfRunId: heartbeatRuns.retryOfRunId,
+          status: heartbeatRuns.status,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.retryOfRunId, candidates.map((run) => run.runId)))
+      : [];
+    const retryBySourceRunId = new Map(
+      retryRows.flatMap((retry) => retry.retryOfRunId ? [[retry.retryOfRunId, retry]] : []),
+    );
 
     const reportRuns: HotRestartReportRun[] = [];
     const adoptedRunIds: string[] = [];
@@ -8943,6 +9011,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       if (run.status !== "running") {
+        if (intent.drainRequired && run.status === "interrupted") {
+          const retry = retryBySourceRunId.get(run.id);
+          if (!retry) {
+            classify(candidate, "lost", "drain_retry_missing", patch);
+            continue;
+          }
+          classify(candidate, "finalized_while_down", `run_status_interrupted_retry_${retry.status}`, patch);
+          continue;
+        }
         classify(candidate, "finalized_while_down", `run_status_${run.status}`, patch);
         continue;
       }

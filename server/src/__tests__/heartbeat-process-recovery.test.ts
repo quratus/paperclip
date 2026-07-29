@@ -1563,6 +1563,145 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("drains and requeues a mixed hot restart when one running adapter cannot be adopted", async () => {
+    const processChild = spawnAliveProcess();
+    const sessionChild = spawnAliveProcess();
+    childProcesses.add(processChild);
+    childProcesses.add(sessionChild);
+    expect(processChild.pid).toBeGreaterThan(0);
+    expect(sessionChild.pid).toBeGreaterThan(0);
+    const processRun = await seedRunFixture({
+      adapterType: "process",
+      agentStatus: "running",
+      processPid: processChild.pid ?? null,
+      processGroupId: null,
+    });
+    const sessionRun = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "running",
+      processPid: sessionChild.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result).toEqual({
+        mode: "unsupported_adapter_drain",
+        skipDrain: false,
+        activeRunIds: expect.arrayContaining([processRun.runId, sessionRun.runId]),
+        nonAdoptableRunIds: [processRun.runId],
+      });
+      expect(isPidAlive(processChild.pid)).toBe(true);
+      expect(isPidAlive(sessionChild.pid)).toBe(true);
+      const intent = await readHotRestartIntent();
+      expect(intent).toMatchObject({
+        drainRequired: true,
+        shutdownSnapshot: {
+          capturedAt: "2026-03-19T00:06:00.000Z",
+          signal: "SIGTERM",
+          activeRuns: expect.arrayContaining([
+            expect.objectContaining({
+              runId: processRun.runId,
+              adapterType: "process",
+              status: "running",
+              processPid: processChild.pid,
+            }),
+            expect.objectContaining({
+              runId: sessionRun.runId,
+              adapterType: "codex_local",
+              status: "running",
+              processPid: sessionChild.pid,
+            }),
+          ]),
+        },
+      });
+
+      const runEvents = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, processRun.runId));
+      expect(runEvents.some(
+        (event) => event.message === "Hot restart requires controlled drain because this adapter cannot be adopted",
+      )).toBe(true);
+
+      const drain = await heartbeat.drainRunningRunsForShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:30.000Z"),
+      );
+      expect(drain.interruptedRunIds).toEqual(
+        expect.arrayContaining([processRun.runId, sessionRun.runId]),
+      );
+      expect(drain.retryRunIds).toHaveLength(2);
+      expect(await waitForPidExit(processChild.pid!)).toBe(true);
+      expect(await waitForPidExit(sessionChild.pid!)).toBe(true);
+
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: expect.arrayContaining([processRun.runId, sessionRun.runId]),
+        lostRunIds: [],
+        skippedRunIds: [],
+      });
+    });
+  });
+
+  it("reports a drained source as lost when its retry was not persisted", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "process",
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "interrupted",
+          errorCode: "server_shutdown_interrupted",
+          finishedAt: new Date("2026-03-19T00:06:30.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: [],
+        lostRunIds: [runId],
+        skippedRunIds: [],
+      });
+    });
+  });
+
   it("reports adopted hot-restart runs before startup reap can mark them process_lost", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
