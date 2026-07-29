@@ -13,6 +13,7 @@ import {
   pipelineCases,
   pipelineCaseIssueLinks,
   pipelineCaseEvents,
+  pipelineGraphAdoptions,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
   pipelineGraphWakeOutbox,
@@ -56,6 +57,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     await db.delete(pipelineCaseIssueLinks);
     await db.delete(issues);
     await db.delete(pipelineCases);
+    await db.delete(pipelineGraphAdoptions);
     await db.delete(pipelineGraphVersions);
     await db.delete(pipelineTransitions);
     await db.delete(pipelineStages);
@@ -105,6 +107,214 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
     return { company: company!, companyId: resolvedCompanyId, pipeline: pipeline!, stages };
   }
+
+  const linearDefinition = {
+    entryNodeKey: "work",
+    nodes: [
+      { key: "work", name: "Work", kind: "working" as const, position: 100 },
+      { key: "done", name: "Done", kind: "done" as const, position: 200 },
+    ],
+    edges: [{ fromNodeKey: "work", toNodeKey: "done", outcome: "complete" }],
+  };
+
+  const reviewedDefinition = {
+    entryNodeKey: "work",
+    nodes: [
+      { key: "work", name: "Work", kind: "working" as const, position: 100 },
+      { key: "review", name: "Review", kind: "review" as const, position: 200 },
+      { key: "done", name: "Done", kind: "done" as const, position: 300 },
+    ],
+    edges: [
+      { fromNodeKey: "work", toNodeKey: "review", outcome: "complete" },
+      { fromNodeKey: "review", toNodeKey: "done", outcome: "approve" },
+    ],
+  };
+
+  it("atomically adopts an immutable definition with durable replay and no execution wake", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const input = {
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-linear-v1",
+      actor: { type: "user" as const, userId: "board-user" },
+    };
+
+    const adopted = await service.adoptDefinition(input);
+    expect(adopted).toMatchObject({
+      changed: true,
+      restored: false,
+      replayed: false,
+      wakeBehavior: "none",
+      version: { status: "active", version: 1 },
+    });
+
+    const replayed = await service.adoptDefinition(input);
+    expect(replayed).toMatchObject({
+      adoptionId: adopted.adoptionId,
+      changed: true,
+      restored: false,
+      replayed: true,
+      wakeBehavior: "none",
+      version: { id: adopted.version.id },
+    });
+
+    expect(await db.select().from(pipelineGraphAdoptions)).toHaveLength(1);
+    expect(
+      await db.select().from(activityLog)
+        .where(eq(activityLog.action, "pipeline.graph_definition_adopted")),
+    ).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+    expect(await db.select().from(pipelineGraphRuns)).toHaveLength(0);
+    expect(await db.select().from(pipelineGraphRunEvents)).toHaveLength(0);
+    expect(await db.select().from(pipelineGraphWakeOutbox)).toHaveLength(0);
+  });
+
+  it("fences stale callers and rejects idempotency drift without partial graph changes", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const actor = { type: "user" as const, userId: "board-user" };
+    const first = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-first",
+      actor,
+    });
+
+    await expect(service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: reviewedDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "stale-plan",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_adoption_conflict" },
+    });
+    await expect(service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: reviewedDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-first",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_adoption_idempotency_conflict" },
+    });
+
+    const versions = await db.select().from(pipelineGraphVersions);
+    expect(versions).toHaveLength(1);
+    expect(versions[0]).toMatchObject({ id: first.version.id, status: "active" });
+    expect(await db.select().from(pipelineGraphAdoptions)).toHaveLength(1);
+  });
+
+  it("restores an earlier immutable version and records no-op adoptions", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    const actor = { type: "user" as const, userId: "board-user" };
+    const first = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-a",
+      actor,
+    });
+    const noOp = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: first.version.id,
+      expectedActiveDefinitionHash: first.version.definitionHash,
+      idempotencyKey: "confirm-a",
+      actor,
+    });
+    expect(noOp).toMatchObject({
+      changed: false,
+      restored: false,
+      version: { id: first.version.id },
+    });
+
+    const second = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: reviewedDefinition,
+      expectedActiveVersionId: first.version.id,
+      expectedActiveDefinitionHash: first.version.definitionHash,
+      idempotencyKey: "adopt-b",
+      actor,
+    });
+    const restored = await service.adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: linearDefinition,
+      expectedActiveVersionId: second.version.id,
+      expectedActiveDefinitionHash: second.version.definitionHash,
+      idempotencyKey: "restore-a",
+      actor,
+    });
+    expect(restored).toMatchObject({
+      changed: true,
+      restored: true,
+      version: { id: first.version.id, status: "active" },
+    });
+    expect(
+      (await db.select().from(pipelineGraphVersions))
+        .filter((version) => version.status === "active"),
+    ).toHaveLength(1);
+  });
+
+  it("rolls adoption back when its audit receipt cannot be completed", async () => {
+    const fixture = await seedLinearPipeline();
+    const service = pipelineGraphVersionService(db);
+    await db.execute(sql`
+      CREATE FUNCTION paperclip_test_reject_graph_adoption_activity()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        IF NEW.action = 'pipeline.graph_definition_adopted' THEN
+          RAISE EXCEPTION 'forced graph adoption activity failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $function$
+    `);
+    await db.execute(sql`
+      CREATE TRIGGER paperclip_test_reject_graph_adoption_activity
+      BEFORE INSERT ON activity_log
+      FOR EACH ROW
+      EXECUTE FUNCTION paperclip_test_reject_graph_adoption_activity()
+    `);
+
+    try {
+      await expect(service.adoptDefinition({
+        companyId: fixture.companyId,
+        pipelineId: fixture.pipeline.id,
+        definition: linearDefinition,
+        expectedActiveVersionId: null,
+        expectedActiveDefinitionHash: null,
+        idempotencyKey: "audit-failure",
+        actor: { type: "user", userId: "board-user" },
+      })).rejects.toThrow();
+      expect(await db.select().from(pipelineGraphAdoptions)).toHaveLength(0);
+      expect(await db.select().from(pipelineGraphVersions)).toHaveLength(0);
+    } finally {
+      await db.execute(sql`DROP TRIGGER paperclip_test_reject_graph_adoption_activity ON activity_log`);
+      await db.execute(sql`DROP FUNCTION paperclip_test_reject_graph_adoption_activity()`);
+    }
+  });
 
   it("persists one immutable draft for concurrent identical requests", async () => {
     const fixture = await seedLinearPipeline();

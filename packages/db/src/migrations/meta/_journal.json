@@ -1303,6 +1303,13 @@
       "when": 1785241800000,
       "tag": "0188_pipeline_graph_outbox_fencing",
       "breakpoints": true
+    },
+    {
+      "idx": 189,
+      "version": "7",
+      "when": 1785337200000,
+      "tag": "0189_pipeline_graph_adoptions",
+      "breakpoints": true
     }
   ]
 }

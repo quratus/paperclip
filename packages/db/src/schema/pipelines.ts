@@ -146,3 +146,53 @@ export const pipelineGraphVersions = pgTable(
     ),
   }),
 );
+
+export const pipelineGraphAdoptions = pgTable(
+  "pipeline_graph_adoptions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    pipelineId: uuid("pipeline_id").notNull().references(() => pipelines.id, { onDelete: "cascade" }),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    expectedActiveVersionId: uuid("expected_active_version_id"),
+    expectedActiveDefinitionHash: text("expected_active_definition_hash"),
+    resultVersionId: uuid("result_version_id").notNull(),
+    resultDefinitionHash: text("result_definition_hash").notNull(),
+    changed: boolean("changed").notNull(),
+    restored: boolean("restored").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    pipelineIdempotencyUq: uniqueIndex("pipeline_graph_adoptions_pipeline_idempotency_uq")
+      .on(table.pipelineId, table.idempotencyKey),
+    companyPipelineCreatedIdx: index("pipeline_graph_adoptions_company_pipeline_created_idx")
+      .on(table.companyId, table.pipelineId, table.createdAt),
+    companyPipelineFk: foreignKey({
+      columns: [table.companyId, table.pipelineId],
+      foreignColumns: [pipelines.companyId, pipelines.id],
+      name: "pipeline_graph_adoptions_company_pipeline_fk",
+    }).onDelete("cascade"),
+    resultVersionFk: foreignKey({
+      columns: [table.companyId, table.pipelineId, table.resultVersionId],
+      foreignColumns: [
+        pipelineGraphVersions.companyId,
+        pipelineGraphVersions.pipelineId,
+        pipelineGraphVersions.id,
+      ],
+      name: "pipeline_graph_adoptions_result_version_fk",
+    }).onDelete("restrict"),
+    requestHashCheck: check(
+      "pipeline_graph_adoptions_request_hash_check",
+      sql`${table.requestHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    expectedHashCheck: check(
+      "pipeline_graph_adoptions_expected_hash_check",
+      sql`${table.expectedActiveDefinitionHash} is null or ${table.expectedActiveDefinitionHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    resultHashCheck: check(
+      "pipeline_graph_adoptions_result_hash_check",
+      sql`${table.resultDefinitionHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  }),
+);
