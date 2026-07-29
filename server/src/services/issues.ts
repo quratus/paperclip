@@ -141,6 +141,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
+export const PERSISTENT_ISSUE_IDEMPOTENCY_KEY_PREFIX = "persistent:";
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS = ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
 const DELETED_ISSUE_COMMENT_BODY = "";
@@ -6386,6 +6387,7 @@ export function issueService(db: Db) {
               from ${issueCreateIdempotencyKeys}
               where ${issueCreateIdempotencyKeys.companyId} = ${companyId}
                 and ${issueCreateIdempotencyKeys.createdAt} < ${idempotencyKeyRetentionCutoff.toISOString()}::timestamptz
+                and ${issueCreateIdempotencyKeys.idempotencyKey} not like ${`${PERSISTENT_ISSUE_IDEMPOTENCY_KEY_PREFIX}%`}
               order by ${issueCreateIdempotencyKeys.createdAt} asc, ${issueCreateIdempotencyKeys.id} asc
               limit ${ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE}
             )

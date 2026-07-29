@@ -494,6 +494,40 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     });
   });
 
+  it("retains persistent operation keys beyond the ordinary retry window", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+    const oldIssueId = randomUUID();
+    const idempotencyKey = "persistent:meteor-chat:run-1:issue";
+    await db.insert(issues).values({
+      id: oldIssueId,
+      companyId,
+      parentId: parent.id,
+      title: "Durable dispatch target",
+      status: "todo",
+      priority: "medium",
+    });
+    await db.insert(issueCreateIdempotencyKeys).values({
+      companyId,
+      idempotencyKey,
+      issueId: oldIssueId,
+      createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+    });
+
+    const replay = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Must not duplicate", idempotencyKey })
+      .expect(200);
+
+    expect(replay.body).toMatchObject({
+      id: oldIssueId,
+      deduplicated: true,
+      deduplicationReason: "idempotency_key",
+    });
+    expect(await db.select().from(issues)).toHaveLength(2);
+  });
+
   it("returns a recent open sibling whose normalized title matches", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);

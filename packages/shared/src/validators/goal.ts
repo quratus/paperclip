@@ -2,6 +2,7 @@ import { z } from "zod";
 import { GOAL_LEVELS, GOAL_STATUSES } from "../constants.js";
 
 export const createGoalSchema = z.object({
+  id: z.string().uuid().optional(),
   title: z.string().min(1),
   description: z.string().optional().nullable(),
   level: z.enum(GOAL_LEVELS).optional().default("task"),
@@ -12,6 +13,6 @@ export const createGoalSchema = z.object({
 
 export type CreateGoal = z.infer<typeof createGoalSchema>;
 
-export const updateGoalSchema = createGoalSchema.partial();
+export const updateGoalSchema = createGoalSchema.omit({ id: true }).partial();
 
 export type UpdateGoal = z.infer<typeof updateGoalSchema>;
