@@ -158,6 +158,43 @@ describeEmbeddedPostgres("agent service clearError", () => {
     });
   });
 
+  it("projects queued and running work on individual and company agent reads", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const queuedRunId = randomUUID();
+    const runningRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Operator",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      { id: queuedRunId, companyId, agentId, invocationSource: "assignment", status: "queued", contextSnapshot: { issueId: "routine-issue" } },
+      { id: runningRunId, companyId, agentId, invocationSource: "assignment", status: "running", contextSnapshot: { issueId: "recovery-issue" }, startedAt: new Date("2026-07-30T10:00:00.000Z") },
+    ]);
+
+    const service = agentService(db);
+    const agent = await service.getById(agentId);
+    const list = await service.list(companyId);
+
+    expect(agent?.activeRun).toMatchObject({ id: runningRunId, status: "running", issueId: "recovery-issue" });
+    expect(agent?.activeRuns).toHaveLength(2);
+    expect(list[0]?.activeRun?.id).toBe(runningRunId);
+  });
+
   it("rejects non-error agents with a 409 conflict", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

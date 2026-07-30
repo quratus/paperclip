@@ -22,6 +22,7 @@ import {
   isUuidLike,
   normalizeAgentApiKeyScope,
   normalizeAgentUrlKey,
+  type AgentActiveRun,
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
@@ -331,6 +332,56 @@ export function agentService(db: Db) {
     return normalizeAgentRows([row], allCompanyRows)[0]!;
   }
 
+  function issueIdFromRunContext(contextSnapshot: unknown): string | null {
+    if (typeof contextSnapshot !== "object" || contextSnapshot === null || Array.isArray(contextSnapshot)) return null;
+    const issueId = (contextSnapshot as Record<string, unknown>).issueId;
+    return typeof issueId === "string" && issueId.length > 0 ? issueId : null;
+  }
+
+  async function withActiveRuns<T extends { id: string; companyId: string }>(rows: T[]) {
+    if (rows.length === 0) return [] as Array<T & { activeRuns: AgentActiveRun[]; activeRun: AgentActiveRun | null }>;
+    const companyId = rows[0]!.companyId;
+    const liveRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        invocationSource: heartbeatRuns.invocationSource,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        inArray(heartbeatRuns.agentId, rows.map((row) => row.id)),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+      ));
+    const runsByAgent = new Map<string, AgentActiveRun[]>();
+    for (const run of liveRuns) {
+      const activeRun: AgentActiveRun = {
+        id: run.id,
+        status: run.status as AgentActiveRun["status"],
+        invocationSource: run.invocationSource,
+        issueId: issueIdFromRunContext(run.contextSnapshot),
+        startedAt: run.startedAt,
+        createdAt: run.createdAt,
+      };
+      const entries = runsByAgent.get(run.agentId) ?? [];
+      entries.push(activeRun);
+      runsByAgent.set(run.agentId, entries);
+    }
+    for (const entries of runsByAgent.values()) {
+      entries.sort((left, right) =>
+        (left.status === "running" ? 0 : 1) - (right.status === "running" ? 0 : 1)
+        || right.createdAt.getTime() - left.createdAt.getTime());
+    }
+    return rows.map((row) => {
+      const activeRuns = runsByAgent.get(row.id) ?? [];
+      return { ...row, activeRuns, activeRun: activeRuns[0] ?? null };
+    });
+  }
+
   async function listCompanyAgentRows(companyId: string) {
     return db.select().from(agents).where(eq(agents.companyId, companyId));
   }
@@ -378,7 +429,7 @@ export function agentService(db: Db) {
       listCompanyAgentRows(row.companyId),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
     ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    return (await withActiveRuns([normalizeAgentRow(hydrated, companyRows)]))[0] ?? null;
   }
 
   async function requireGetById(id: string) {
@@ -581,7 +632,7 @@ export function agentService(db: Db) {
         listCompanyAgentRows(companyId),
       ]);
       const hydrated = await hydrateAgentSpend(rows);
-      return normalizeAgentRows(hydrated, allCompanyRows);
+      return withActiveRuns(normalizeAgentRows(hydrated, allCompanyRows));
     },
 
     getById,

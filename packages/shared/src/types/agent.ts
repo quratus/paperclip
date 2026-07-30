@@ -1,5 +1,7 @@
 import type {
   AgentAdapterType,
+  HeartbeatInvocationSource,
+  HeartbeatRunStatus,
   ModelProfileKey,
   PauseReason,
   AgentRole,
@@ -79,6 +81,16 @@ export interface AgentChainOfCommandEntry {
   title: string | null;
 }
 
+/** Compact live-work projection for agent cards and assignment decisions. */
+export interface AgentActiveRun {
+  id: string;
+  status: Extract<HeartbeatRunStatus, "queued" | "running">;
+  invocationSource: HeartbeatInvocationSource;
+  issueId: string | null;
+  startedAt: Date | null;
+  createdAt: Date;
+}
+
 export interface Agent {
   id: string;
   companyId: string;
@@ -103,6 +115,8 @@ export interface Agent {
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
   orgChainHealth?: AgentOrgChainHealth;
+  activeRuns?: AgentActiveRun[];
+  activeRun?: AgentActiveRun | null;
   createdAt: Date;
   updatedAt: Date;
 }
