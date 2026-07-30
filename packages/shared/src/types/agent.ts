@@ -6,6 +6,7 @@ import type {
   PauseReason,
   AgentRole,
   AgentStatus,
+  WakeupTriggerDetail,
 } from "../constants.js";
 import type {
   CompanyMembership,
@@ -85,10 +86,14 @@ export interface AgentChainOfCommandEntry {
 export interface AgentActiveRun {
   id: string;
   status: Extract<HeartbeatRunStatus, "queued" | "running">;
+  source: HeartbeatInvocationSource;
   invocationSource: HeartbeatInvocationSource;
+  triggerDetail: WakeupTriggerDetail | null;
   issueId: string | null;
   startedAt: Date | null;
+  finishedAt: Date | null;
   createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface Agent {
@@ -114,9 +119,9 @@ export interface Agent {
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
+  activeRuns: AgentActiveRun[];
+  activeRun: AgentActiveRun | null;
   orgChainHealth?: AgentOrgChainHealth;
-  activeRuns?: AgentActiveRun[];
-  activeRun?: AgentActiveRun | null;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -657,6 +657,7 @@ export type {
   BackupRetentionPolicy,
   Agent,
   AgentAccessState,
+  AgentActiveRun,
   AgentChainOfCommandEntry,
   AgentDetail,
   ClearAgentErrorResponse,
