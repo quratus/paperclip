@@ -234,6 +234,7 @@ const adoptGraphDefinitionSchema = z.object({
   }).strict(),
   expectedActiveVersionId: z.string().uuid().nullable(),
   expectedActiveDefinitionHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  requiredAssignmentSchemaVersion: z.number().int().positive().optional(),
   idempotencyKey: z.string().trim().min(1).max(512),
 }).strict();
 const listGraphVersionsQuerySchema = z.object({
@@ -1179,6 +1180,7 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
         definition,
         expectedActiveVersionId: req.body.expectedActiveVersionId,
         expectedActiveDefinitionHash: req.body.expectedActiveDefinitionHash,
+        requiredAssignmentSchemaVersion: req.body.requiredAssignmentSchemaVersion,
         idempotencyKey: req.body.idempotencyKey,
         actor,
       });

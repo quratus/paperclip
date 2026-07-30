@@ -34,8 +34,10 @@ export {
   type CaseTypePipelineRef,
 } from "./pipeline-case-type.js";
 export {
+  PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION,
   PIPELINE_GRAPH_SCHEMA_VERSION,
   compilePipelineGraph,
+  type PipelineGraphAssignmentV1,
   type PipelineGraphCompileResult,
   type PipelineGraphCycleContractInput,
   type PipelineGraphDefinitionInput,

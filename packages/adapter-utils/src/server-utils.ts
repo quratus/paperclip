@@ -637,6 +637,28 @@ type PaperclipWakeRecovery = {
   routingFallbackReason: string | null;
 };
 
+type PaperclipWakeGraphAssignment = {
+  schemaVersion: 1;
+  id: string;
+  graphVersionId: string;
+  runId: string;
+  runRevision: number;
+  caseId: string;
+  issueId: string | null;
+  nodeKey: string;
+  nodeKind: string;
+  responsibilityOwner: string;
+  targetAgentId: string | null;
+  instruction: string | null;
+  acceptanceCriteria: string[];
+  allowedOutcomes: string[];
+  completion: {
+    method: "POST";
+    path: string;
+    requiredFields: string[];
+  };
+};
+
 type PaperclipWakePayload = {
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
@@ -667,6 +689,7 @@ type PaperclipWakePayload = {
   missingCount: number;
   truncated: boolean;
   fallbackFetchNeeded: boolean;
+  graphAssignment: PaperclipWakeGraphAssignment | null;
 };
 
 function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery | null {
@@ -686,6 +709,54 @@ function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery |
     maxAttempts: typeof recovery.maxAttempts === "number" ? recovery.maxAttempts : null,
     nextAction: asString(recovery.nextAction, "").trim() || null,
     routingFallbackReason: asString(recovery.routingFallbackReason, "").trim() || null,
+  };
+}
+
+function normalizePaperclipWakeGraphAssignment(value: unknown): PaperclipWakeGraphAssignment | null {
+  const assignment = parseObject(value);
+  const completion = parseObject(assignment.completion);
+  const id = asString(assignment.id, "").trim();
+  const graphVersionId = asString(assignment.graphVersionId, "").trim();
+  const runId = asString(assignment.runId, "").trim();
+  const runRevision = asNumber(assignment.runRevision, 0);
+  const caseId = asString(assignment.caseId, "").trim();
+  const nodeKey = asString(assignment.nodeKey, "").trim();
+  const responsibilityOwner = asString(assignment.responsibilityOwner, "").trim();
+  const completionPath = asString(completion.path, "").trim();
+  if (
+    assignment.schemaVersion !== 1
+    || !id
+    || !graphVersionId
+    || !runId
+    || runRevision < 1
+    || !caseId
+    || !nodeKey
+    || !responsibilityOwner
+    || completion.method !== "POST"
+    || !completionPath
+  ) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    id,
+    graphVersionId,
+    runId,
+    runRevision,
+    caseId,
+    issueId: asString(assignment.issueId, "").trim() || null,
+    nodeKey,
+    nodeKind: asString(assignment.nodeKind, "").trim() || "working",
+    responsibilityOwner,
+    targetAgentId: asString(assignment.targetAgentId, "").trim() || null,
+    instruction: asString(assignment.instruction, "").trim() || null,
+    acceptanceCriteria: normalizeStringList(assignment.acceptanceCriteria, 50),
+    allowedOutcomes: normalizeStringList(assignment.allowedOutcomes, 50),
+    completion: {
+      method: "POST",
+      path: completionPath,
+      requiredFields: normalizeStringList(completion.requiredFields, 20),
+    },
   };
 }
 
@@ -1213,6 +1284,7 @@ function markdownInlineCode(value: string): string {
 
 export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayload | null {
   const payload = parseObject(value);
+  const graphAssignment = normalizePaperclipWakeGraphAssignment(payload.graphAssignment);
   const comments = Array.isArray(payload.comments)
     ? payload.comments
         .map((entry) => normalizePaperclipWakeComment(entry))
@@ -1254,7 +1326,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const activeTreeHold = normalizePaperclipWakeTreeHoldSummary(payload.activeTreeHold);
   const checkboxSelection = normalizePaperclipWakeCheckboxSelection(payload.checkboxSelection);
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
+  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !recovery && !graphAssignment && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
@@ -1288,6 +1360,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     missingCount: asNumber(commentWindow.missingCount, 0),
     truncated: asBoolean(payload.truncated, false),
     fallbackFetchNeeded: asBoolean(payload.fallbackFetchNeeded, false),
+    graphAssignment,
   };
 }
 
@@ -1445,6 +1518,30 @@ export function renderPaperclipWakePrompt(
   }
   if (normalized.issue?.priority) {
     lines.push(`- issue priority: ${normalized.issue.priority}`);
+  }
+  if (normalized.graphAssignment) {
+    const assignment = normalized.graphAssignment;
+    lines.push("");
+    lines.push("### Graph assignment");
+    lines.push(`- assignment id: ${assignment.id}`);
+    lines.push(`- node: ${assignment.nodeKey} (${assignment.nodeKind})`);
+    lines.push(`- responsibility owner: ${assignment.responsibilityOwner}`);
+    if (assignment.instruction) {
+      lines.push(`- instruction: ${assignment.instruction}`);
+    }
+    if (assignment.acceptanceCriteria.length > 0) {
+      lines.push("- acceptance criteria:");
+      for (const criterion of assignment.acceptanceCriteria) {
+        lines.push(`  - ${criterion}`);
+      }
+    }
+    lines.push(`- allowed outcomes: ${assignment.allowedOutcomes.join(", ") || "(none)"}`);
+    lines.push(
+      `- complete this assignment: ${assignment.completion.method} ${assignment.completion.path} with expectedRevision=${assignment.runRevision}, a unique idempotencyKey, one allowed outcome, and a durable checkpoint`,
+    );
+    lines.push(
+      "- refusal is not a terminal disposition: choose the graph outcome that redirects responsibility, or report a concrete external prerequisite through the graph's real-block path",
+    );
   }
   if (normalized.checkboxSelection) {
     if (normalized.checkboxSelection.prompt) {

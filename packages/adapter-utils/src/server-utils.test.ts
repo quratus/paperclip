@@ -708,6 +708,40 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("preserves and renders a complete graph assignment contract", () => {
+    const graphAssignment = {
+      schemaVersion: 1,
+      id: "run-1:7:review",
+      graphVersionId: "graph-version-1",
+      runId: "run-1",
+      runRevision: 7,
+      caseId: "case-1",
+      issueId: "issue-1",
+      nodeKey: "review",
+      nodeKind: "review",
+      responsibilityOwner: "independent_reviewer",
+      targetAgentId: "agent-1",
+      instruction: "Review the change against the evidence.",
+      acceptanceCriteria: ["Tests prove the changed behavior", "No unresolved critical findings"],
+      allowedOutcomes: ["approve", "repair"],
+      completion: {
+        method: "POST",
+        path: "/api/graph-runs/run-1/transitions",
+        requiredFields: ["expectedRevision", "idempotencyKey", "outcome", "checkpoint"],
+      },
+    };
+
+    const serialized = stringifyPaperclipWakePayload({ graphAssignment });
+    expect(JSON.parse(serialized ?? "{}")).toMatchObject({ graphAssignment });
+
+    const prompt = renderPaperclipWakePrompt({ graphAssignment });
+    expect(prompt).toContain("### Graph assignment");
+    expect(prompt).toContain("allowed outcomes: approve, repair");
+    expect(prompt).toContain("POST /api/graph-runs/run-1/transitions");
+    expect(prompt).toContain("expectedRevision=7");
+    expect(prompt).toContain("refusal is not a terminal disposition");
+  });
+
   it("keeps the default local-agent prompt action-oriented", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("Start actionable work in this heartbeat");
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("do not stop at a plan");

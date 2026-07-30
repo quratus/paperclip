@@ -6,6 +6,7 @@ import {
   issues,
   pipelineCaseIssueLinks,
   pipelineGraphRuns,
+  pipelineGraphVersions,
   pipelineGraphWakeOutbox,
 } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
@@ -159,7 +160,11 @@ export function pipelineGraphOutboxService(db: Db) {
           ? payload.runRevision
           : null;
         const graphRun = await db
-          .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+          .select({
+            status: pipelineGraphRuns.status,
+            revision: pipelineGraphRuns.revision,
+            graphVersionId: pipelineGraphRuns.graphVersionId,
+          })
           .from(pipelineGraphRuns)
           .where(and(
             eq(pipelineGraphRuns.companyId, input.companyId),
@@ -230,6 +235,76 @@ export function pipelineGraphOutboxService(db: Db) {
           .limit(1)
           .then((issueRows) => issueRows[0] ?? null);
         try {
+          let rawGraphAssignment =
+            payload.graphAssignment
+            && typeof payload.graphAssignment === "object"
+            && !Array.isArray(payload.graphAssignment)
+              ? payload.graphAssignment as Record<string, unknown>
+              : null;
+          if (!rawGraphAssignment) {
+            const graphVersion = await db
+              .select({ definition: pipelineGraphVersions.definition })
+              .from(pipelineGraphVersions)
+              .where(and(
+                eq(pipelineGraphVersions.companyId, input.companyId),
+                eq(pipelineGraphVersions.id, graphRun.graphVersionId),
+              ))
+              .then((versionRows) => versionRows[0] ?? null);
+            const node = graphVersion?.definition.nodes.find(
+              (candidate) => candidate.key === row.targetNodeKey,
+            );
+            if (!node) {
+              throw new Error("Pinned graph node is unavailable for legacy wake assignment upgrade");
+            }
+            const responsibilityOwner =
+              typeof payload.responsibilityOwner === "string" && payload.responsibilityOwner.trim()
+                ? payload.responsibilityOwner.trim()
+                : typeof node.config.responsibilityOwner === "string"
+                    && node.config.responsibilityOwner.trim()
+                  ? node.config.responsibilityOwner.trim()
+                  : node.key;
+            const instruction =
+              typeof payload.responsibilityInstruction === "string"
+                && payload.responsibilityInstruction.trim()
+                ? payload.responsibilityInstruction.trim()
+                : typeof node.config.responsibilityInstruction === "string"
+                    && node.config.responsibilityInstruction.trim()
+                  ? node.config.responsibilityInstruction.trim()
+                  : null;
+            rawGraphAssignment = {
+              schemaVersion: 1,
+              id: `${row.runId}:${expectedRevision}:${row.targetNodeKey}`,
+              graphVersionId: graphRun.graphVersionId,
+              runId: row.runId,
+              runRevision: expectedRevision,
+              caseId: row.caseId,
+              nodeKey: row.targetNodeKey,
+              nodeKind: node.kind,
+              responsibilityOwner,
+              targetAgentId,
+              instruction,
+              acceptanceCriteria: Array.isArray(node.config.acceptanceCriteria)
+                ? node.config.acceptanceCriteria.filter(
+                    (criterion): criterion is string =>
+                      typeof criterion === "string" && criterion.trim().length > 0,
+                  )
+                : [],
+              allowedOutcomes: graphVersion.definition.edges
+                .filter((edge) => edge.fromNodeKey === row.targetNodeKey)
+                .map((edge) => edge.outcome)
+                .sort(),
+              completion: {
+                method: "POST",
+                path: `/api/graph-runs/${row.runId}/transitions`,
+                requiredFields: ["expectedRevision", "idempotencyKey", "outcome", "checkpoint"],
+              },
+            };
+          }
+          const graphAssignment = {
+            ...rawGraphAssignment,
+            targetAgentId,
+            ...(linkedIssue ? { issueId: linkedIssue.id } : {}),
+          };
           const run = await input.wakeup(targetAgentId, {
             source: "automation",
             triggerDetail: "system",
@@ -253,6 +328,7 @@ export function pipelineGraphOutboxService(db: Db) {
               pipelineCaseId: row.caseId,
               targetNodeKey: row.targetNodeKey,
               responsibilityOwner: payload.responsibilityOwner ?? row.targetNodeKey,
+              graphAssignment,
               ...(linkedIssue
                 ? { issueId: linkedIssue.id, taskId: linkedIssue.id }
                 : {}),

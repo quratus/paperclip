@@ -1,4 +1,5 @@
 export const PIPELINE_GRAPH_SCHEMA_VERSION = 1 as const;
+export const PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION = 1 as const;
 
 export type PipelineGraphNodeKind = "working" | "review" | "done" | "cancelled";
 
@@ -55,6 +56,34 @@ export interface PipelineGraphDefinitionV1 {
     progressField: string | null;
     exitNodeKeys: string[];
   }>;
+}
+
+/**
+ * The durable hand-off from a graph node to one agent heartbeat.
+ *
+ * Policy remains node configuration owned by the caller; the kernel only
+ * transports the resolved responsibility, allowed outcomes, and completion
+ * contract without interpreting role- or product-specific policy.
+ */
+export interface PipelineGraphAssignmentV1 {
+  schemaVersion: typeof PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION;
+  id: string;
+  graphVersionId: string;
+  runId: string;
+  runRevision: number;
+  caseId: string;
+  nodeKey: string;
+  nodeKind: PipelineGraphNodeKind;
+  responsibilityOwner: string;
+  targetAgentId: string | null;
+  instruction: string | null;
+  acceptanceCriteria: string[];
+  allowedOutcomes: string[];
+  completion: {
+    method: "POST";
+    path: string;
+    requiredFields: ["expectedRevision", "idempotencyKey", "outcome", "checkpoint"];
+  };
 }
 
 export type PipelineGraphDiagnosticCode =
