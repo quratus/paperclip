@@ -1692,6 +1692,11 @@ export function IssueProperties({
 
   const blockedByIds = issue.blockedBy?.map((relation) => relation.id) ?? [];
   const blockedByRelations = issue.blockedBy ?? [];
+  const resolvedBlockedByRelations = blockedByRelations.filter((relation) => relation.status === "done");
+  const activeBlockedByIds = blockedByRelations
+    .filter((relation) => relation.status !== "done")
+    .map((relation) => relation.id);
+  const hasResolvedBlockers = resolvedBlockedByRelations.length > 0;
   const visibleBlockedByRelations = blockedByExpanded
     ? blockedByRelations
     : blockedByRelations.slice(0, ISSUE_PROPERTY_RELATION_PREVIEW_COUNT);
@@ -1841,6 +1846,12 @@ export function IssueProperties({
   const removeBlockedBy = (blockedByIssueId: string) => {
     onUpdate({ blockedByIssueIds: blockedByIds.filter((candidate) => candidate !== blockedByIssueId) });
   };
+  const clearResolvedBlockers = () => {
+    onUpdate({
+      blockedByIssueIds: activeBlockedByIds,
+      ...(issue.status === "blocked" && activeBlockedByIds.length === 0 ? { status: "todo" } : {}),
+    });
+  };
 
   const blockedByContent = (
     <>
@@ -1904,6 +1915,26 @@ export function IssueProperties({
       Add blocker
     </button>
   );
+  const renderClearResolvedBlockersButton = () => {
+    if (!hasResolvedBlockers) return null;
+    const count = resolvedBlockedByRelations.length;
+    return (
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+        onClick={clearResolvedBlockers}
+        aria-label={`Clear ${count} resolved ${count === 1 ? "blocker" : "blockers"}`}
+        title={
+          issue.status === "blocked" && activeBlockedByIds.length === 0
+            ? "Remove resolved blockers and move this task back to todo"
+            : "Remove blockers that are already done"
+        }
+      >
+        <CheckCircle2 className="h-3 w-3" />
+        Clear resolved
+      </button>
+    );
+  };
 
   return (
     <div>
@@ -2023,6 +2054,7 @@ export function IssueProperties({
                 expanded={blockedByExpanded}
                 onClick={() => setBlockedByExpanded((expanded) => !expanded)}
               />
+              {renderClearResolvedBlockersButton()}
               {renderAddBlockedByButton(() => setBlockedByOpen((open) => !open))}
             </PropertyRow>
             {blockedByOpen && (
@@ -2041,6 +2073,7 @@ export function IssueProperties({
               expanded={blockedByExpanded}
               onClick={() => setBlockedByExpanded((expanded) => !expanded)}
             />
+            {renderClearResolvedBlockersButton()}
             <Popover
               open={blockedByOpen}
               onOpenChange={(open) => {

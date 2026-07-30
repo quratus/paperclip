@@ -450,6 +450,38 @@ describe("IssueBlockedNotice", () => {
     expect(node.querySelector('[data-testid="issue-blocked-notice-reopen-suppressed"]')).toBeNull();
   });
 
+  it("lets Cockpit clear resolved blockers from the blocker notice", () => {
+    const onClearResolvedBlockers = vi.fn();
+    const node = render(
+      <IssueBlockedNotice
+        issueStatus="blocked"
+        blockers={[]}
+        allBlockers={[
+          {
+            id: "blocker-1",
+            identifier: "PAP-500",
+            title: "Finished blocker",
+            status: "done",
+            priority: "medium",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          },
+        ]}
+        onClearResolvedBlockers={onClearResolvedBlockers}
+      />,
+    );
+
+    const button = Array.from(node.querySelectorAll("button"))
+      .find((candidate) => candidate.textContent?.includes("Clear resolved"));
+    expect(button).not.toBeUndefined();
+
+    act(() => {
+      button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onClearResolvedBlockers).toHaveBeenCalledOnce();
+  });
+
   it("shows external now-running blockers beneath the label on a separate line", () => {
     const node = render(
       <IssueBlockedNotice

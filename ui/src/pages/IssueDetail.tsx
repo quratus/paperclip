@@ -859,6 +859,8 @@ type IssueDetailChatTabProps = {
   successfulRunHandoff: Issue["successfulRunHandoff"] | null;
   scheduledRetry: Issue["scheduledRetry"] | null;
   recoveryAction: Issue["activeRecoveryAction"];
+  onClearResolvedBlockers?: () => void;
+  clearResolvedBlockersPending?: boolean;
   onResolveRecoveryAction?: (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => void;
   onReissueIsolatedRecoveryAction?: (request: import("../components/IssueRecoveryActionCard").RecoveryReissueRequest) => void;
   reissueIsolatedRecoveryActionPending?: boolean;
@@ -950,6 +952,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   successfulRunHandoff,
   scheduledRetry,
   recoveryAction,
+  onClearResolvedBlockers,
+  clearResolvedBlockersPending,
   onResolveRecoveryAction,
   onReissueIsolatedRecoveryAction,
   reissueIsolatedRecoveryActionPending,
@@ -1177,6 +1181,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         blockerAttention={blockerAttention}
         successfulRunHandoff={successfulRunHandoff}
         scheduledRetry={scheduledRetry}
+        onClearResolvedBlockers={onClearResolvedBlockers}
+        clearResolvedBlockersPending={clearResolvedBlockersPending}
         recoveryAction={recoveryAction ?? null}
         onResolveRecoveryAction={onResolveRecoveryAction}
         onReissueIsolatedRecoveryAction={onReissueIsolatedRecoveryAction}
@@ -2338,6 +2344,16 @@ export function IssueDetail() {
   const handleIssuePropertiesUpdate = useCallback((data: Record<string, unknown>) => {
     updateIssue.mutate(data);
   }, [updateIssue.mutate]);
+  const handleClearResolvedBlockers = useCallback(() => {
+    if (!issue) return;
+    const activeBlockedByIds = (issue.blockedBy ?? [])
+      .filter((blocker) => blocker.status !== "done")
+      .map((blocker) => blocker.id);
+    updateIssue.mutate({
+      blockedByIssueIds: activeBlockedByIds,
+      ...(issue.status === "blocked" && activeBlockedByIds.length === 0 ? { status: "todo" } : {}),
+    });
+  }, [issue, updateIssue.mutate]);
 
   const updateChildIssue = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) => issuesApi.update(id, data),
@@ -4734,6 +4750,8 @@ export function IssueDetail() {
               successfulRunHandoff={issue.successfulRunHandoff ?? null}
               scheduledRetry={issue.scheduledRetry ?? null}
               recoveryAction={issue.activeRecoveryAction ?? null}
+              onClearResolvedBlockers={handleClearResolvedBlockers}
+              clearResolvedBlockersPending={updateIssue.isPending}
               onResolveRecoveryAction={handleResolveRecoveryAction}
               onReissueIsolatedRecoveryAction={handleReissueIsolatedRecoveryAction}
               reissueIsolatedRecoveryActionPending={reissueIsolatedRecoveryAction.isPending}

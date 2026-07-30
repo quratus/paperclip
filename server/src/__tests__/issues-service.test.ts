@@ -3499,6 +3499,126 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("rejects clearing the only approval blocker from an already blocked issue", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Wait for approval",
+      status: "blocked",
+      priority: "medium",
+      blockedByApprovalId: approvalId,
+    });
+
+    await expect(svc.update(issue.id, { blockedByApprovalId: null }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: { code: "blocked_state_requires_typed_blocker" },
+      });
+  });
+
+  it("serializes approval blockers in issue list responses", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Listed approval blocker",
+      status: "blocked",
+      priority: "medium",
+      blockedByApprovalId: approvalId,
+    });
+
+    const [listed] = await svc.list(companyId, { status: ["blocked"], includeBlockedBy: true });
+
+    expect(listed).toEqual(expect.objectContaining({
+      id: issue.id,
+      blockedByApprovalId: approvalId,
+    }));
+  });
+
+  it("clears persisted done blocker relations when reopening a stale blocked issue", async () => {
+    const companyId = await seedCompany();
+    const blocker = await svc.create(companyId, {
+      title: "Finished blocker",
+      status: "done",
+      priority: "medium",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Stale blocked issue",
+      status: "blocked",
+      priority: "medium",
+      blockedByIssueIds: [blocker.id],
+    });
+
+    const updated = await svc.update(issue.id, {
+      status: "todo",
+      blockedByIssueIds: [],
+    });
+    const relations = await svc.getRelationSummaries(issue.id);
+
+    expect(updated?.status).toBe("todo");
+    expect(relations.blockedBy).toEqual([]);
+  });
+
+  it("automatically clears done blocker relations when a stale blocked issue resumes", async () => {
+    const companyId = await seedCompany();
+    const blocker = await svc.create(companyId, {
+      title: "Finished blocker",
+      status: "done",
+      priority: "medium",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Resume stale blocked issue",
+      status: "blocked",
+      priority: "medium",
+      blockedByIssueIds: [blocker.id],
+    });
+
+    const updated = await svc.update(issue.id, { status: "todo" });
+    const relations = await svc.getRelationSummaries(issue.id);
+
+    expect(updated?.status).toBe("todo");
+    expect(relations.blockedBy).toEqual([]);
+  });
+
+  it("keeps unresolved blocker relations when a blocked issue is moved back to todo", async () => {
+    const companyId = await seedCompany();
+    const doneBlocker = await svc.create(companyId, {
+      title: "Done blocker",
+      status: "done",
+      priority: "medium",
+    });
+    const unresolvedBlocker = await svc.create(companyId, {
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Partially blocked issue",
+      status: "blocked",
+      priority: "medium",
+      blockedByIssueIds: [doneBlocker.id, unresolvedBlocker.id],
+    });
+
+    const updated = await svc.update(issue.id, { status: "todo" });
+    const relations = await svc.getRelationSummaries(issue.id);
+
+    expect(updated?.status).toBe("todo");
+    expect(relations.blockedBy.map((relation) => relation.id)).toEqual([unresolvedBlocker.id]);
+  });
+
   it("links pending approval blockers and consumes decided approval blockers", async () => {
     const companyId = await seedCompany();
     await seedActiveUser(companyId, "approval-requester");

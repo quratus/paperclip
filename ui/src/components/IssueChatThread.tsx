@@ -434,6 +434,8 @@ interface IssueChatThreadProps {
   blockerAttention?: IssueBlockerAttention | null;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   scheduledRetry?: IssueScheduledRetry | null;
+  onClearResolvedBlockers?: () => void;
+  clearResolvedBlockersPending?: boolean;
   recoveryAction?: IssueRecoveryAction | null;
   onResolveRecoveryAction?: (outcome: RecoveryResolveOutcome) => void;
   onReissueIsolatedRecoveryAction?: (request: RecoveryReissueRequest) => void;
@@ -4189,6 +4191,8 @@ export function IssueChatThread({
   blockerAttention = null,
   successfulRunHandoff = null,
   scheduledRetry = null,
+  onClearResolvedBlockers,
+  clearResolvedBlockersPending = false,
   recoveryAction = null,
   onResolveRecoveryAction,
   onReissueIsolatedRecoveryAction,
@@ -4400,7 +4404,7 @@ export function IssueChatThread({
 
   const isRunning = displayLiveRuns.some((run) => run.status === "queued" || run.status === "running");
   const unresolvedBlockers = useMemo(
-    () => blockedBy.filter((blocker) => blocker.status !== "done" && blocker.status !== "cancelled"),
+    () => blockedBy.filter((blocker) => blocker.status !== "done"),
     [blockedBy],
   );
   const assignedAgent = useMemo(() => {
@@ -4981,6 +4985,8 @@ export function IssueChatThread({
                     blockerAttention={blockerAttention}
                     successfulRunHandoff={recoveryAction ? null : successfulRunHandoff}
                     scheduledRetry={scheduledRetry}
+                    onClearResolvedBlockers={onClearResolvedBlockers}
+                    clearResolvedBlockersPending={clearResolvedBlockersPending}
                     agentName={
                       successfulRunHandoff?.assigneeAgentId
                         ? agentMap?.get(successfulRunHandoff.assigneeAgentId)?.name ?? null

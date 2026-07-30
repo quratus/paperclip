@@ -4514,6 +4514,38 @@ export function issueService(db: Db) {
     );
   }
 
+  async function pruneResolvedIssueBlockers(
+    issueId: string,
+    companyId: string,
+    dbOrTx: any = db,
+  ) {
+    const resolvedBlockerRows = await dbOrTx
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, issueId),
+          eq(issueRelations.type, "blocks"),
+          eq(issues.status, "done"),
+        ),
+      );
+    const resolvedBlockerIssueIds = resolvedBlockerRows.map((row: { blockerIssueId: string }) => row.blockerIssueId);
+    if (resolvedBlockerIssueIds.length === 0) return;
+
+    await dbOrTx
+      .delete(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, issueId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.issueId, resolvedBlockerIssueIds),
+        ),
+      );
+  }
+
   function isTypedExternalBlocker(value: unknown) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const blocker = value as Record<string, unknown>;
@@ -6335,7 +6367,6 @@ export function issueService(db: Db) {
         blockedByExternal: issueData.blockedByExternal,
       });
       if (blockedByApprovalId) await assertApprovalCanBlock(companyId, blockedByApprovalId);
-      (issueData as Partial<typeof issues.$inferInsert>).blockedByApprovalId = blockedByApprovalId ?? null;
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -6656,6 +6687,7 @@ export function issueService(db: Db) {
           ...(executionWorkspaceId ? { executionWorkspaceId } : {}),
           ...(executionWorkspacePreference ? { executionWorkspacePreference } : {}),
           ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
+          blockedByApprovalId: blockedByApprovalId ?? null,
           companyId,
           issueNumber,
           identifier,
@@ -6948,6 +6980,8 @@ export function issueService(db: Db) {
             },
             tx,
           );
+        } else if (existing.status === "blocked" && updated.status !== "blocked") {
+          await pruneResolvedIssueBlockers(updated.id, existing.companyId, tx);
         }
         if (
           issueData.executionWorkspaceSettings !== undefined &&

@@ -360,6 +360,8 @@ export function IssueBlockedNotice({
   successfulRunHandoff,
   scheduledRetry,
   agentName,
+  onClearResolvedBlockers,
+  clearResolvedBlockersPending = false,
 }: {
   issueId?: string | null;
   issueStatus?: string;
@@ -377,6 +379,8 @@ export function IssueBlockedNotice({
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   scheduledRetry?: IssueScheduledRetry | null;
   agentName?: string | null;
+  onClearResolvedBlockers?: () => void;
+  clearResolvedBlockersPending?: boolean;
 }) {
   if (issueStatus === "done" || issueStatus === "cancelled") return null;
   const showSuccessfulRunHandoff = successfulRunHandoff?.required === true;
@@ -495,6 +499,8 @@ export function IssueBlockedNotice({
   // task's own finished run, so it always keeps its amber priority styling.
   const liveIds = liveIssueIds ?? EMPTY_LIVE_IDS;
   const chainBlockers = allBlockers ?? blockers;
+  const resolvedBlockerCount = chainBlockers.filter((blocker) => blocker.status === "done").length;
+  const canClearResolvedBlockers = resolvedBlockerCount > 0 && Boolean(onClearResolvedBlockers);
   const hasLiveWaitingBlocker = [...chainBlockers, ...terminalBlockers].some((blocker) => (
     liveIds.has(blocker.id)
   ));
@@ -607,6 +613,26 @@ export function IssueBlockedNotice({
               {blockers.length > 0 ? (
                 <div className="flex flex-wrap gap-1.5">
                   {blockers.map(renderBlockerChip)}
+                </div>
+              ) : null}
+              {canClearResolvedBlockers ? (
+                <div className="pt-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={onClearResolvedBlockers}
+                    disabled={clearResolvedBlockersPending}
+                    aria-label={`Clear ${resolvedBlockerCount} resolved ${resolvedBlockerCount === 1 ? "blocker" : "blockers"}`}
+                    title={
+                      blockers.length === 0
+                        ? "Remove done blockers and move this task back to todo"
+                        : "Remove blockers that are already done"
+                    }
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    {clearResolvedBlockersPending ? "Clearing..." : "Clear resolved"}
+                  </Button>
                 </div>
               ) : null}
               {showStalledRow ? (
