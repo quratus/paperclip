@@ -22,6 +22,7 @@ import {
   isUuidLike,
   normalizeAgentApiKeyScope,
   normalizeAgentUrlKey,
+  type AgentActiveRun,
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
@@ -86,6 +87,25 @@ interface AgentShortnameRow {
 
 interface AgentShortnameCollisionOptions {
   excludeAgentId?: string | null;
+}
+
+type ActiveRunStatus = AgentActiveRun["status"];
+type AgentProjectionRow = typeof agents.$inferSelect & {
+  activeRuns?: AgentActiveRun[];
+  activeRun?: AgentActiveRun | null;
+};
+
+interface AgentActiveRunRow {
+  id: string;
+  agentId: string;
+  status: string;
+  invocationSource: string;
+  triggerDetail: string | null;
+  contextSnapshot: Record<string, unknown> | null;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -187,6 +207,37 @@ function parseFiniteNumberLike(value: unknown): number | null {
   if (typeof value !== "string") return null;
   const parsed = Number(value.trim());
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readLinkedIssueId(contextSnapshot: Record<string, unknown> | null) {
+  if (!contextSnapshot) return null;
+  const value = contextSnapshot.issueId ?? contextSnapshot.taskId;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function toAgentActiveRun(row: AgentActiveRunRow): AgentActiveRun {
+  return {
+    id: row.id,
+    status: row.status as ActiveRunStatus,
+    source: row.invocationSource as AgentActiveRun["source"],
+    invocationSource: row.invocationSource as AgentActiveRun["invocationSource"],
+    triggerDetail: row.triggerDetail as AgentActiveRun["triggerDetail"],
+    issueId: readLinkedIssueId(row.contextSnapshot),
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function compareActiveRuns(left: AgentActiveRun, right: AgentActiveRun) {
+  if (left.status !== right.status) {
+    return left.status === "running" ? -1 : 1;
+  }
+  const leftTime = (left.startedAt ?? left.createdAt).getTime();
+  const rightTime = (right.startedAt ?? right.createdAt).getTime();
+  if (leftTime !== rightTime) return rightTime - leftTime;
+  return right.createdAt.getTime() - left.createdAt.getTime();
 }
 
 function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<string, unknown> {
@@ -296,10 +347,12 @@ export function agentService(db: Db) {
     };
   }
 
-  function normalizeAgentBaseRow(row: typeof agents.$inferSelect) {
+  function normalizeAgentBaseRow(row: AgentProjectionRow) {
     return withUrlKey({
       ...row,
       permissions: normalizeAgentPermissions(row.permissions, row.role),
+      activeRuns: row.activeRuns ?? [],
+      activeRun: row.activeRun ?? null,
     });
   }
 
@@ -313,7 +366,10 @@ export function agentService(db: Db) {
     };
   }
 
-  function normalizeAgentRows(rows: (typeof agents.$inferSelect)[], allCompanyRows = rows) {
+  function normalizeAgentRows<T extends AgentProjectionRow>(
+    rows: T[],
+    allCompanyRows: (typeof agents.$inferSelect)[] = rows,
+  ) {
     const eligibilityAgents = allCompanyRows.map(toEligibilityAgent);
     return rows.map((row) => {
       const base = normalizeAgentBaseRow(row);
@@ -327,7 +383,7 @@ export function agentService(db: Db) {
     });
   }
 
-  function normalizeAgentRow(row: typeof agents.$inferSelect, allCompanyRows?: (typeof agents.$inferSelect)[]) {
+  function normalizeAgentRow<T extends AgentProjectionRow>(row: T, allCompanyRows?: (typeof agents.$inferSelect)[]) {
     return normalizeAgentRows([row], allCompanyRows)[0]!;
   }
 
@@ -367,6 +423,61 @@ export function agentService(db: Db) {
     }));
   }
 
+  async function activeRunMapForAgents(companyId: string, agentIds: string[]) {
+    if (agentIds.length === 0) return new Map<string, AgentActiveRun[]>();
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        invocationSource: heartbeatRuns.invocationSource,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        createdAt: heartbeatRuns.createdAt,
+        updatedAt: heartbeatRuns.updatedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.agentId, agentIds),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+        ),
+      );
+
+    const byAgentId = new Map<string, AgentActiveRun[]>();
+    for (const row of rows) {
+      const run = toAgentActiveRun(row);
+      const activeRuns = byAgentId.get(row.agentId) ?? [];
+      activeRuns.push(run);
+      byAgentId.set(row.agentId, activeRuns);
+    }
+    for (const activeRuns of byAgentId.values()) {
+      activeRuns.sort(compareActiveRuns);
+    }
+    return byAgentId;
+  }
+
+  async function hydrateAgentActiveRuns<T extends { id: string; companyId: string }>(
+    rows: T[],
+  ): Promise<Array<T & { activeRuns: AgentActiveRun[]; activeRun: AgentActiveRun | null }>> {
+    const companyId = rows[0]?.companyId;
+    if (!companyId || rows.length === 0) {
+      return rows.map((row) => ({ ...row, activeRuns: [], activeRun: null }));
+    }
+    const activeRunsByAgentId = await activeRunMapForAgents(companyId, rows.map((row) => row.id));
+    return rows.map((row) => {
+      const activeRuns = activeRunsByAgentId.get(row.id) ?? [];
+      return {
+        ...row,
+        activeRuns,
+        activeRun: activeRuns[0] ?? null,
+      };
+    });
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
@@ -376,7 +487,9 @@ export function agentService(db: Db) {
     if (!row) return null;
     const [companyRows, hydrated] = await Promise.all([
       listCompanyAgentRows(row.companyId),
-      hydrateAgentSpend([row]).then((rows) => rows[0]!),
+      hydrateAgentSpend([row])
+        .then((rows) => hydrateAgentActiveRuns(rows))
+        .then((rows) => rows[0]!),
     ]);
     return normalizeAgentRow(hydrated, companyRows);
   }
@@ -580,7 +693,7 @@ export function agentService(db: Db) {
         db.select().from(agents).where(and(...conditions)),
         listCompanyAgentRows(companyId),
       ]);
-      const hydrated = await hydrateAgentSpend(rows);
+      const hydrated = await hydrateAgentSpend(rows).then((rows) => hydrateAgentActiveRuns(rows));
       return normalizeAgentRows(hydrated, allCompanyRows);
     },
 

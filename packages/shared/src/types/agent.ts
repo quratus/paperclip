@@ -1,9 +1,12 @@
 import type {
   AgentAdapterType,
+  HeartbeatInvocationSource,
+  HeartbeatRunStatus,
   ModelProfileKey,
   PauseReason,
   AgentRole,
   AgentStatus,
+  WakeupTriggerDetail,
 } from "../constants.js";
 import type {
   CompanyMembership,
@@ -79,6 +82,20 @@ export interface AgentChainOfCommandEntry {
   title: string | null;
 }
 
+/** Compact live-work projection for agent cards and assignment decisions. */
+export interface AgentActiveRun {
+  id: string;
+  status: Extract<HeartbeatRunStatus, "queued" | "running">;
+  source: HeartbeatInvocationSource;
+  invocationSource: HeartbeatInvocationSource;
+  triggerDetail: WakeupTriggerDetail | null;
+  issueId: string | null;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface Agent {
   id: string;
   companyId: string;
@@ -102,6 +119,10 @@ export interface Agent {
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
+  /** Present on agent-service reads; omitted by older API clients and fixtures. */
+  activeRuns?: AgentActiveRun[];
+  /** The primary active run when the service has projected live work. */
+  activeRun?: AgentActiveRun | null;
   orgChainHealth?: AgentOrgChainHealth;
   createdAt: Date;
   updatedAt: Date;

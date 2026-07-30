@@ -1994,6 +1994,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             },
             lastHeartbeatAt: null,
             metadata: managedAgentMetadata(agentKey),
+            activeRuns: [],
+            activeRun: null,
             createdAt: now,
             updatedAt: now,
           };
@@ -2035,6 +2037,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               },
               lastHeartbeatAt: null,
               metadata: managedAgentMetadata(agentKey),
+              activeRuns: [],
+              activeRun: null,
               createdAt: now,
               updatedAt: now,
             };
@@ -2042,8 +2046,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           }
           const resolved = managedResolution(agentKey, cid, agent, "resolved");
           if (!resolved.agent) return resolved;
+          const resolvedAgent = resolved.agent;
           const updated: Agent = {
-            ...resolved.agent,
+            ...resolvedAgent,
             name: declaration.displayName,
             role: (declaration.role ?? "general") as Agent["role"],
             title: declaration.title ?? null,
@@ -2057,7 +2062,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               canCreateAgents: Boolean(declaration.permissions?.canCreateAgents),
               canCreateSkills: declaration.permissions?.canCreateSkills !== false,
             },
-            metadata: managedAgentMetadata(agentKey, resolved.agent.metadata),
+            metadata: managedAgentMetadata(agentKey, resolvedAgent.metadata),
             updatedAt: new Date(),
           };
           agents.set(updated.id, updated);

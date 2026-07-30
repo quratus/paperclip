@@ -209,6 +209,7 @@ export type {
 export type {
   Agent,
   AgentAccessState,
+  AgentActiveRun,
   AgentChainOfCommandEntry,
   AgentDetail,
   ClearAgentErrorResponse,
