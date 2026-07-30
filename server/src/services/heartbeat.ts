@@ -4418,6 +4418,7 @@ export async function buildPaperclipWakePayload(input: {
   exposeLowTrustRaw?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
+  const graphAssignment = parseObject(input.contextSnapshot.graphAssignment);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
@@ -4438,7 +4439,12 @@ export async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
-  if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
+  if (
+    commentIds.length === 0
+    && Object.keys(executionStage).length === 0
+    && Object.keys(graphAssignment).length === 0
+    && !issueSummary
+  ) return null;
 
   const commentRows =
     commentIds.length === 0
@@ -4621,6 +4627,7 @@ export async function buildPaperclipWakePayload(input: {
 
   return {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    graphAssignment: Object.keys(graphAssignment).length > 0 ? graphAssignment : null,
     recovery: recoveryAction || recoveryCause
       ? {
           cause: recoveryAction?.cause ?? recoveryCause,

@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import {
   compilePipelineGraph,
+  PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION,
   type PipelineGraphCycleContractInput,
   type PipelineGraphDefinitionInput,
 } from "@paperclipai/shared";
@@ -54,11 +55,13 @@ function adoptionRequestHash(input: {
   canonicalJson: string;
   expectedActiveVersionId: string | null;
   expectedActiveDefinitionHash: string | null;
+  requiredAssignmentSchemaVersion?: number;
 }) {
   return definitionHash(JSON.stringify({
     definition: JSON.parse(input.canonicalJson),
     expectedActiveVersionId: input.expectedActiveVersionId,
     expectedActiveDefinitionHash: input.expectedActiveDefinitionHash,
+    requiredAssignmentSchemaVersion: input.requiredAssignmentSchemaVersion ?? null,
   }));
 }
 
@@ -371,6 +374,7 @@ export function pipelineGraphVersionService(db: Db) {
       definition: PipelineGraphDefinitionInput;
       expectedActiveVersionId: string | null;
       expectedActiveDefinitionHash: string | null;
+      requiredAssignmentSchemaVersion?: number;
       idempotencyKey: string;
       actor: PipelineGraphVersionActor;
     }) {
@@ -381,11 +385,22 @@ export function pipelineGraphVersionService(db: Db) {
           diagnostics: compiled.diagnostics,
         });
       }
+      if (
+        input.requiredAssignmentSchemaVersion !== undefined
+        && input.requiredAssignmentSchemaVersion !== PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION
+      ) {
+        throw unprocessable("Required pipeline graph assignment schema is unsupported", {
+          code: "pipeline_graph_assignment_schema_unsupported",
+          requiredAssignmentSchemaVersion: input.requiredAssignmentSchemaVersion,
+          supportedAssignmentSchemaVersions: [PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION],
+        });
+      }
       const desiredDefinitionHash = definitionHash(compiled.canonicalJson);
       const requestHash = adoptionRequestHash({
         canonicalJson: compiled.canonicalJson,
         expectedActiveVersionId: input.expectedActiveVersionId,
         expectedActiveDefinitionHash: input.expectedActiveDefinitionHash,
+        requiredAssignmentSchemaVersion: input.requiredAssignmentSchemaVersion,
       });
 
       return db.transaction(async (tx) => {

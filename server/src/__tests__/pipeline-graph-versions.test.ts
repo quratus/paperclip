@@ -919,6 +919,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       definition: first.body.version.definition,
       expectedActiveVersionId: first.body.version.id,
       expectedActiveDefinitionHash: first.body.version.definitionHash,
+      requiredAssignmentSchemaVersion: 1,
       idempotencyKey: "route-adopt",
     };
     const adoption = await http
@@ -943,6 +944,16 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       adoptionId: adoption.body.adoptionId,
       replayed: true,
     });
+    const assignmentRequirementConflict = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({
+        ...adoptionBody,
+        requiredAssignmentSchemaVersion: undefined,
+      });
+    expect(assignmentRequirementConflict.status).toBe(409);
+    expect(assignmentRequirementConflict.body.details).toMatchObject({
+      code: "pipeline_graph_adoption_idempotency_conflict",
+    });
 
     const staleAdoption = await http
       .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
@@ -959,6 +970,20 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
       .send({ ...adoptionBody, unsupported: true });
     expect(invalidAdoption.status).toBe(400);
+
+    const unsupportedAssignmentSchema = await http
+      .post(`/api/pipelines/${fixture.pipeline.id}/graph/adoptions`)
+      .send({
+        ...adoptionBody,
+        requiredAssignmentSchemaVersion: 2,
+        idempotencyKey: "route-unsupported-assignment-schema",
+      });
+    expect(unsupportedAssignmentSchema.status).toBe(422);
+    expect(unsupportedAssignmentSchema.body.details).toMatchObject({
+      code: "pipeline_graph_assignment_schema_unsupported",
+      requiredAssignmentSchemaVersion: 2,
+      supportedAssignmentSchemaVersions: [1],
+    });
 
     const driftedDefinition = {
       ...first.body.version.definition,
@@ -1495,7 +1520,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
         responsibilityInstruction: "Review the linked issue and commit an explicit graph outcome.",
         dispatchEnabled: true,
         targetAgentId,
-        requireApproval: true,
+        requireApproval: false,
         approveToStageKey: "done",
         rejectToStageKey: "work",
       },
@@ -1581,9 +1606,167 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
           responsibilityInstruction: "Review the linked issue and commit an explicit graph outcome.",
           dispatchEnabled: true,
           targetAgentId,
+          graphAssignment: {
+            schemaVersion: 1,
+            graphVersionId: draft.version.id,
+            runId: started.run.id,
+            caseId: ingested.case.id,
+            nodeKey: "review",
+            nodeKind: "review",
+            responsibilityOwner: "independent_reviewer",
+            targetAgentId,
+            instruction: "Review the linked issue and commit an explicit graph outcome.",
+            allowedOutcomes: ["approve"],
+            completion: {
+              method: "POST",
+              path: `/api/graph-runs/${started.run.id}/transitions`,
+            },
+          },
         },
       });
     }
+
+    const [wrongAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Wrong graph worker",
+      role: "engineer",
+    }).returning();
+    await expect(runs.transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 4,
+      idempotencyKey: "allowlisted:wrong-agent",
+      outcome: "approve",
+      checkpoint: { reviewed: true },
+      actor: { type: "agent", agentId: wrongAgent!.id, runId: randomUUID() },
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "graph_assignment_agent_mismatch" },
+    });
+
+    const [resumeWake] = wakeRows.filter((wake) => wake.payload.reason === "run_resumed");
+    const [staleAttempt] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 3,
+        targetNodeKey: "review",
+        graphAssignment: resumeWake!.payload.graphAssignment,
+      },
+    }).returning();
+    await expect(runs.transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 4,
+      idempotencyKey: "allowlisted:stale-attempt",
+      outcome: "approve",
+      checkpoint: { reviewed: true },
+      actor: { type: "agent", agentId: targetAgentId, runId: staleAttempt!.id },
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "graph_assignment_attempt_mismatch" },
+    });
+
+    const assignment = resumeWake!.payload.graphAssignment as Record<string, unknown>;
+    const [boundAttempt] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 4,
+        targetNodeKey: "review",
+        graphAssignment: assignment,
+      },
+    }).returning();
+    await expect(runs.transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 4,
+      idempotencyKey: "allowlisted:bound-approve",
+      outcome: "approve",
+      checkpoint: { reviewed: true },
+      actor: { type: "agent", agentId: targetAgentId, runId: boundAttempt!.id },
+    })).resolves.toMatchObject({
+      changed: true,
+      run: { status: "succeeded", currentNodeKey: "done", revision: 5 },
+    });
+  });
+
+  it("atomically wakes a configured entry-node owner when a graph run starts", async () => {
+    const fixture = await seedLinearPipeline();
+    const [targetAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Entry graph worker",
+      role: "engineer",
+    }).returning();
+    await db.update(pipelineStages)
+      .set({
+        config: {
+          responsibilityOwner: "implementer",
+          responsibilityInstruction: "Implement the linked issue and submit a graph outcome.",
+          acceptanceCriteria: ["The changed behavior is verified"],
+          dispatchEnabled: true,
+          targetAgentId: targetAgent!.id,
+        },
+      })
+      .where(eq(pipelineStages.id, fixture.stages.find((stage) => stage.key === "work")!.id));
+    const draft = await pipelineGraphVersionService(db).createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphVersionService(db).activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "entry-wake",
+      title: "Entry wake",
+      actor: { type: "user", userId: "board-user" },
+    });
+
+    const started = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "entry-wake:start",
+      actor: { type: "user", userId: "board-user" },
+    });
+
+    expect((await pipelineGraphRunService(db).listEvents({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+    })).map((event) => event.type)).toEqual(["run_started", "wake_requested"]);
+    const [wake] = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id));
+    expect(wake).toMatchObject({
+      targetNodeKey: "work",
+      payload: {
+        reason: "run_started",
+        dispatchEnabled: true,
+        targetAgentId: targetAgent!.id,
+        graphAssignment: {
+          id: `${started.run.id}:1:work`,
+          runRevision: 1,
+          nodeKey: "work",
+          responsibilityOwner: "implementer",
+          acceptanceCriteria: ["The changed behavior is verified"],
+          allowedOutcomes: ["complete"],
+        },
+      },
+    });
   });
 
   it("serializes graph start against the legacy case transition authority", async () => {
@@ -2081,7 +2264,9 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
         status: "pending",
         lastError: null,
         payload: {
-          ...dispatchable.payload,
+          ...Object.fromEntries(
+            Object.entries(dispatchable.payload).filter(([key]) => key !== "graphAssignment"),
+          ),
           dispatchEnabled: true,
           targetAgentId,
         },
@@ -2114,6 +2299,14 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
           graphEventId: dispatchable!.eventId,
           pipelineCaseId: dispatchable!.caseId,
           targetNodeKey: dispatchable!.targetNodeKey,
+          graphAssignment: {
+            runId: dispatchable!.runId,
+            runRevision: dispatchable!.payload.runRevision,
+            caseId: dispatchable!.caseId,
+            nodeKey: dispatchable!.targetNodeKey,
+            targetAgentId,
+            issueId: linkedWorkIssue!.id,
+          },
           issueId: linkedWorkIssue!.id,
           taskId: linkedWorkIssue!.id,
         },

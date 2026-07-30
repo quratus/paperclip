@@ -13,8 +13,12 @@ import {
   pipelineGraphWakeOutbox,
   pipelineStages,
 } from "@paperclipai/db";
-import type { PipelineGraphDefinitionV1 } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import {
+  PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION,
+  type PipelineGraphAssignmentV1,
+  type PipelineGraphDefinitionV1,
+} from "@paperclipai/shared";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { PipelineGraphVersionActor } from "./pipeline-graph-versions.js";
 import { pipelineService } from "./pipelines.js";
 
@@ -79,6 +83,12 @@ function actorEnvelope(actor: PipelineGraphVersionActor) {
     actorId: actorId(actor),
     actorRunId: actor.type === "agent" ? actor.runId : null,
   };
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
 }
 
 type CycleRuntimeState = Record<string, {
@@ -171,11 +181,28 @@ function evolveCycleState(input: {
   return { state, interruption };
 }
 
-function graphWakeRouting(nodeKey: string, config: Record<string, unknown>) {
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function graphWakeRouting(input: {
+  definition: PipelineGraphDefinitionV1;
+  node: PipelineGraphDefinitionV1["nodes"][number];
+  graphVersionId: string;
+  runId: string;
+  runRevision: number;
+  caseId: string;
+}) {
+  const { definition, node } = input;
+  const config = node.config;
   const responsibilityOwner =
     typeof config.responsibilityOwner === "string" && config.responsibilityOwner.trim()
       ? config.responsibilityOwner.trim()
-      : nodeKey;
+      : node.key;
   const targetAgentId =
     typeof config.targetAgentId === "string" && config.targetAgentId.trim()
       ? config.targetAgentId.trim()
@@ -184,11 +211,35 @@ function graphWakeRouting(nodeKey: string, config: Record<string, unknown>) {
     typeof config.responsibilityInstruction === "string" && config.responsibilityInstruction.trim()
       ? config.responsibilityInstruction.trim()
       : null;
+  const assignment: PipelineGraphAssignmentV1 = {
+    schemaVersion: PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION,
+    id: `${input.runId}:${input.runRevision}:${node.key}`,
+    graphVersionId: input.graphVersionId,
+    runId: input.runId,
+    runRevision: input.runRevision,
+    caseId: input.caseId,
+    nodeKey: node.key,
+    nodeKind: node.kind,
+    responsibilityOwner,
+    targetAgentId,
+    instruction: responsibilityInstruction,
+    acceptanceCriteria: stringList(config.acceptanceCriteria),
+    allowedOutcomes: definition.edges
+      .filter((edge) => edge.fromNodeKey === node.key)
+      .map((edge) => edge.outcome)
+      .sort(),
+    completion: {
+      method: "POST",
+      path: `/api/graph-runs/${input.runId}/transitions`,
+      requiredFields: ["expectedRevision", "idempotencyKey", "outcome", "checkpoint"],
+    },
+  };
   return {
     responsibilityOwner,
     dispatchEnabled: config.dispatchEnabled === true,
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(responsibilityInstruction ? { responsibilityInstruction } : {}),
+    graphAssignment: assignment,
   };
 }
 
@@ -307,7 +358,7 @@ export function pipelineGraphRunService(
           });
         }
 
-        const [run] = await tx
+        const [createdRun] = await tx
           .insert(pipelineGraphRuns)
           .values({
             companyId: input.companyId,
@@ -321,6 +372,7 @@ export function pipelineGraphRunService(
             startedById: actorId(input.actor),
           })
           .returning();
+        let run = createdRun!;
         const [event] = await tx
           .insert(pipelineGraphRunEvents)
           .values({
@@ -333,7 +385,7 @@ export function pipelineGraphRunService(
             idempotencyKey: input.idempotencyKey,
             requestHash: hash,
             payload: {
-              revision: run!.revision,
+              revision: run.revision,
               checkpoint: input.checkpoint ?? {},
               graphVersionId: row.graphVersion.id,
               graphVersion: row.graphVersion.version,
@@ -341,12 +393,79 @@ export function pipelineGraphRunService(
             },
           })
           .returning();
+        const entryNode = row.graphVersion.definition.nodes.find(
+          (node) => node.key === row.stageKey,
+        )!;
+        const targetAgentId =
+          typeof entryNode.config.targetAgentId === "string"
+            ? entryNode.config.targetAgentId.trim()
+            : "";
+        if (entryNode.config.dispatchEnabled === true && targetAgentId) {
+          const wakeRouting = graphWakeRouting({
+            definition: row.graphVersion.definition,
+            node: entryNode,
+            graphVersionId: run.graphVersionId,
+            runId: run.id,
+            runRevision: run.revision,
+            caseId: run.caseId,
+          });
+          const [wakeEvent] = await tx
+            .insert(pipelineGraphRunEvents)
+            .values({
+              companyId: input.companyId,
+              runId: run.id,
+              sequence: run.nextEventSequence,
+              type: "wake_requested",
+              nodeKey: entryNode.key,
+              actorType: "system",
+              actorId: null,
+              actorRunId: null,
+              idempotencyKey: `${input.idempotencyKey}:wake_requested`,
+              requestHash: hash,
+              payload: {
+                runRevision: run.revision,
+                targetNodeKey: entryNode.key,
+                reason: "run_started",
+              },
+            })
+            .returning();
+          const [sequencedRun] = await tx
+            .update(pipelineGraphRuns)
+            .set({
+              nextEventSequence: run.nextEventSequence + 1,
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(pipelineGraphRuns.id, run.id),
+              eq(pipelineGraphRuns.revision, run.revision),
+            ))
+            .returning();
+          if (!sequencedRun) {
+            throw conflict("Graph run changed", { code: "graph_run_revision_conflict" });
+          }
+          run = sequencedRun;
+          await tx.insert(pipelineGraphWakeOutbox).values({
+            companyId: input.companyId,
+            runId: run.id,
+            eventId: wakeEvent!.id,
+            caseId: run.caseId,
+            targetNodeKey: entryNode.key,
+            idempotencyKey: `${run.id}:${run.revision}:${entryNode.key}`,
+            payload: {
+              runRevision: run.revision,
+              graphVersionId: run.graphVersionId,
+              targetNodeKey: entryNode.key,
+              ...wakeRouting,
+              reason: "run_started",
+            },
+          });
+        }
         return {
           created: true as const,
-          run: run!,
+          run,
           event: event!,
           committed: {
-            revision: run!.revision,
+            revision: run.revision,
             checkpoint: input.checkpoint ?? {},
           },
         };
@@ -594,6 +713,61 @@ export function pipelineGraphRunService(
             caseNodeKey: row.caseStageKey,
           });
         }
+        const currentNode = graphVersion.definition.nodes.find(
+          (node) => node.key === run.currentNodeKey,
+        );
+        if (!currentNode) {
+          throw unprocessable("Pinned graph current node is missing", {
+            code: "graph_run_node_missing",
+            currentNodeKey: run.currentNodeKey,
+          });
+        }
+        const assignedAgentId =
+          typeof currentNode.config.targetAgentId === "string"
+            ? currentNode.config.targetAgentId.trim()
+            : "";
+        if (
+          input.actor.type === "agent"
+          && currentNode.config.dispatchEnabled === true
+          && assignedAgentId
+        ) {
+          if (input.actor.agentId !== assignedAgentId) {
+            throw forbidden("Only the agent assigned to this graph node can submit its outcome", {
+              code: "graph_assignment_agent_mismatch",
+              assignedAgentId,
+              actorAgentId: input.actor.agentId,
+              currentNodeKey: run.currentNodeKey,
+            });
+          }
+          const attempt = await tx
+            .select({
+              agentId: heartbeatRuns.agentId,
+              contextSnapshot: heartbeatRuns.contextSnapshot,
+            })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.id, input.actor.runId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          const attemptContext = objectValue(attempt?.contextSnapshot);
+          const assignment = objectValue(attemptContext.graphAssignment);
+          if (
+            !attempt
+            || attempt.agentId !== input.actor.agentId
+            || attemptContext.graphRunId !== run.id
+            || attemptContext.targetNodeKey !== run.currentNodeKey
+            || attemptContext.graphRunRevision !== input.expectedRevision
+            || assignment.id !== `${run.id}:${input.expectedRevision}:${run.currentNodeKey}`
+          ) {
+            throw forbidden("Agent outcome is not bound to the current graph assignment", {
+              code: "graph_assignment_attempt_mismatch",
+              currentNodeKey: run.currentNodeKey,
+              expectedRevision: input.expectedRevision,
+              actorRunId: input.actor.runId,
+            });
+          }
+        }
         const edge = graphVersion.definition.edges.find((candidate) =>
           candidate.fromNodeKey === run.currentNodeKey && candidate.outcome === input.outcome);
         if (!edge) {
@@ -819,7 +993,14 @@ export function pipelineGraphRunService(
           })
           .returning();
         if (!terminalStatus) {
-          const wakeRouting = graphWakeRouting(targetNode.key, targetNode.config);
+          const wakeRouting = graphWakeRouting({
+            definition: row.graphVersion.definition,
+            node: targetNode,
+            graphVersionId: run.graphVersionId,
+            runId: run.id,
+            runRevision: updated!.revision,
+            caseId: run.caseId,
+          });
           await tx.insert(pipelineGraphWakeOutbox).values({
             companyId: input.companyId,
             runId: run.id,
@@ -952,10 +1133,20 @@ export function pipelineGraphRunService(
           const currentNode = graphVersion?.definition.nodes.find(
             (node) => node.key === run.currentNodeKey,
           );
-          const wakeRouting = graphWakeRouting(
-            run.currentNodeKey,
-            currentNode?.config ?? {},
-          );
+          if (!graphVersion || !currentNode) {
+            throw conflict("Pinned graph node is missing", {
+              code: "graph_run_node_missing",
+              currentNodeKey: run.currentNodeKey,
+            });
+          }
+          const wakeRouting = graphWakeRouting({
+            definition: graphVersion.definition,
+            node: currentNode,
+            graphVersionId: run.graphVersionId,
+            runId: run.id,
+            runRevision: updated!.revision,
+            caseId: run.caseId,
+          });
           const [wakeEvent] = await tx.insert(pipelineGraphRunEvents).values({
             companyId: input.companyId,
             runId: run.id,
@@ -1480,7 +1671,14 @@ export function pipelineGraphRunService(
           throw conflict("Graph run changed", { code: "graph_run_revision_conflict" });
         }
         if (derivedType === "wake_requested") {
-          const wakeRouting = graphWakeRouting(currentNodeKey, finalNode.config);
+          const wakeRouting = graphWakeRouting({
+            definition: row.graphVersion.definition,
+            node: finalNode,
+            graphVersionId: finalRun.graphVersionId,
+            runId: finalRun.id,
+            runRevision: finalRun.revision,
+            caseId: finalRun.caseId,
+          });
           await tx.insert(pipelineGraphWakeOutbox).values({
             companyId: input.companyId,
             runId: finalRun.id,

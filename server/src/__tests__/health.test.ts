@@ -421,6 +421,7 @@ describe("GET /health", () => {
       bootstrapInviteActive: false,
       features: {
         companyDeletionEnabled: false,
+        pipelineGraphAssignmentSchemaVersions: [1],
       },
       serverInfo: testServerInfo,
     });

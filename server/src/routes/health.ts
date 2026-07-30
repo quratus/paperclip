@@ -3,7 +3,11 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { and, count, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, instanceUserRoles, invites } from "@paperclipai/db";
-import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import {
+  PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION,
+  type DeploymentExposure,
+  type DeploymentMode,
+} from "@paperclipai/shared";
 import { readPersistedDevServerStatus, toDevServerHealthStatus, writeDevServerRestartRequest } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
 import { getServerInfoSnapshot, type ServerInfoSnapshot } from "../server-info.js";
@@ -223,6 +227,7 @@ export function healthRoutes(
       bootstrapInviteActive,
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
+        pipelineGraphAssignmentSchemaVersions: [PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION],
       },
       serverInfo,
       ...(databaseBackup ? { databaseBackup } : {}),
