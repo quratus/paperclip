@@ -1,0 +1,69 @@
+{
+  "$doc": "SQN-4278 - Paperclip merge-review classifier policy. Non-critical work can route to auto once objective gates are green. Foundational, irreversible, security, execution-control, schema, CI/gate, release, and lockfile changes route to human review. Design surface changes route to auto plus visual/design conformance.",
+  "critical": {
+    "$why": "Foundational or irreversible Paperclip control-plane surfaces: persistent data contracts, auth/security, approvals, budget, issue execution semantics, agent runtime/adapters, plugins/sandboxing, CI/release gates, and dependency locks.",
+    "paths": [
+      "^packages/db/(src/(schema|migrations)|drizzle\\.config\\.ts)",
+      "(^|/)migrations?/",
+      "\\.sql$",
+      "^packages/shared/src/(constants|validators|types)/",
+      "^server/src/(auth|secrets|middleware)/",
+      "^server/src/(adapter-registry|adapter-plugin-loader|board-claim|budget|cost|execution|execution-workspaces|heartbeat|issue-checkout|issue-recovery|permissions|plugin|project-workspace|runtime|workspace)",
+      "^server/src/services/(recovery|runtime|workspace|.*approval|.*budget|.*checkout|.*execution|.*permission|.*secret)",
+      "^server/src/routes/(approvals|auth|board-claim|companies|issue|issues|plugin|projects|runtime|secrets|tokens|workspaces)",
+      "^packages/adapters/",
+      "^packages/adapter-utils/",
+      "^packages/plugins/(sdk|sandbox-providers|plugin-workspace-diff|create-paperclip-plugin)/",
+      "^packages/mcp-server/",
+      "^cli/src/(commands/(agent|agent-prompt|heartbeat|issue|token|worktree)|lib/auth|lib/client)",
+      "^\\.github/workflows/",
+      "^\\.github/scripts/",
+      "^scripts/(classify-change|change-policy)\\.(mjs|json)$",
+      "^scripts/(gate|check-[^/]+|release|rollback|build-npm|docker-[^/]+|request-hot-restart|dev-runner|dev-service)\\.(mjs|ts|sh)$",
+      "(^|/)Dockerfile$",
+      "(^|/)docker/",
+      "(^|/)package\\.json$",
+      "(^|/)pnpm-lock\\.yaml$",
+      "(^|/)package-lock\\.json$"
+    ],
+    "coreStateFiles": [
+      "doc/SPEC-implementation.md",
+      "doc/DEPLOYMENT-MODES.md",
+      "packages/db/src/schema/index.ts",
+      "packages/shared/src/constants.ts",
+      "server/src/routes/issues.ts",
+      "server/src/heartbeat.ts",
+      "server/src/issue-recovery.ts"
+    ],
+    "rewriteThreshold": 300,
+    "sourceDeletionRe": "\\.(ts|tsx|mjs|cjs|js)$",
+    "breakingSubjectRe": "(BREAKING[ -]CHANGE|^\\w+(\\([^)]*\\))?!:)",
+    "labels": ["critical", "needs-human", "human-review", "breaking"]
+  },
+  "design": {
+    "$why": "Visual/user-facing board surfaces require design conformance and visual proof, unless a critical rule already requires human review.",
+    "paths": [
+      "^ui/src/(components|pages|layouts|App\\.tsx|index\\.css)",
+      "^ui/public/",
+      "^DESIGN\\.md$",
+      "^tests/(e2e|storybook-visual)/",
+      "^ui/storybook/",
+      "\\.css$",
+      "\\.(svg|png|jpg|jpeg|webp|gif)$"
+    ],
+    "componentRe": "^ui/src/.*\\.(tsx|jsx)$"
+  },
+  "nonCritical": {
+    "$why": "Docs, focused tests, examples, fixtures, catalog content, and isolated helper logic default to objective gate routing.",
+    "hintPaths": [
+      "\\.(md|mdx|txt)$",
+      "^docs?/",
+      "(^|/)__tests__/",
+      "\\.test\\.(ts|tsx|mjs|cjs|js)$",
+      "(^|/)fixtures?/",
+      "^packages/(teams-catalog|skills-catalog)/catalog/",
+      "^packages/plugins/.*/(tests|fixtures|templates|README\\.md)",
+      "^scripts/[^/]+\\.test\\.mjs$"
+    ]
+  }
+}
