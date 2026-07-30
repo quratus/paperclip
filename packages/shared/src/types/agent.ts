@@ -119,8 +119,10 @@ export interface Agent {
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
-  activeRuns: AgentActiveRun[];
-  activeRun: AgentActiveRun | null;
+  /** Present on agent-service reads; omitted by older API clients and fixtures. */
+  activeRuns?: AgentActiveRun[];
+  /** The primary active run when the service has projected live work. */
+  activeRun?: AgentActiveRun | null;
   orgChainHealth?: AgentOrgChainHealth;
   createdAt: Date;
   updatedAt: Date;
