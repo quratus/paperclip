@@ -1311,7 +1311,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: managerId })
+      .set({
+        status: "blocked",
+        assigneeAgentId: managerId,
+        blockedByExternal: {
+          type: "automatic_recovery",
+          owner: "assigned recovery owner",
+          note: "Recovery action is responsible for restoring a runnable path.",
+        },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -1347,6 +1355,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "todo",
       assigneeAgentId: coderId,
       activeRecoveryAction: null,
+      blockedByExternal: null,
     });
     expect(resolved.body.recoveryAction).toMatchObject({
       id: action.id,
@@ -1398,6 +1407,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .expect(200);
 
     expect(enqueueRecoveryActionWakeup).not.toHaveBeenCalled();
+  });
+
+  it("preserves an unrelated external blocker when resolving a recovery action", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const unrelatedBlocker = {
+      type: "vendor_outage",
+      owner: "External vendor",
+      recheckDate: "2026-08-01T09:00:00.000Z",
+    };
+    await db
+      .update(issues)
+      .set({
+        status: "blocked",
+        assigneeAgentId: managerId,
+        blockedByExternal: unrelatedBlocker,
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:unrelated-external-blocker",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Confirm the recovery path without changing the vendor blocker.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const resolved = await request(createApp(undefined, {
+      recoveryActionEnqueueWakeup: vi.fn(async () => null),
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Recovery path restored; vendor dependency remains.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "todo",
+      blockedByExternal: unrelatedBlocker,
+      activeRecoveryAction: null,
+    });
   });
 
   it("resolves an active recovery action by returning the source issue to todo", async () => {

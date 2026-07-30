@@ -299,6 +299,10 @@ function createRunContextDb(
   const buildQuery = (selection: Record<string, unknown>) => {
     const whereResult = {
       orderBy: vi.fn(async () => []),
+      for: vi.fn(() => ({
+        then: async (resolve: (rows: unknown[]) => unknown) =>
+          resolve([{ blockedByExternal: null }]),
+      })),
       then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
     };
     const query = {
@@ -307,11 +311,13 @@ function createRunContextDb(
     };
     return query;
   };
+  const select = vi.fn((selection: Record<string, unknown> = {}) => ({
+    from: vi.fn(() => buildQuery(selection)),
+  }));
   return {
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-    select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn(() => buildQuery(selection)),
-    })),
+    transaction: async (callback: (tx: { select: typeof select }) => Promise<unknown>) =>
+      callback({ select }),
+    select,
   };
 }
 
