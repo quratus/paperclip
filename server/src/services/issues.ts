@@ -4546,6 +4546,22 @@ export function issueService(db: Db) {
       );
   }
 
+  async function issueHasResolvedIssueBlockers(companyId: string, issueId: string, dbOrTx: DbReader = db) {
+    const row = await dbOrTx
+      .select({ id: issueRelations.id })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.relatedIssueId, issueId),
+        eq(issueRelations.type, "blocks"),
+        eq(issues.status, "done"),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
+  }
+
   function isTypedExternalBlocker(value: unknown) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const blocker = value as Record<string, unknown>;
@@ -6861,17 +6877,30 @@ export function issueService(db: Db) {
         existingBlockedByExternal: existing.blockedByExternal,
         dbOrTx,
       });
-      await assertBlockedIssueCanLeaveBlocked({
-        companyId: existing.companyId,
-        issueId: existing.id,
-        existingStatus: existing.status,
-        nextStatus: patch.status,
-        blockedByIssueIds,
-        blockedByApprovalId,
-        blockedByExternal: issueData.blockedByExternal,
-        existingBlockedByExternal: existing.blockedByExternal,
-        dbOrTx,
-      });
+      const isBlockedLeaveAttempt = existing.status === "blocked" && Boolean(patch.status) && patch.status !== "blocked";
+      const hasResolvedIssueBlockersForBlockedLeave = isBlockedLeaveAttempt && blockedByIssueIds === undefined
+        ? await issueHasResolvedIssueBlockers(existing.companyId, existing.id, dbOrTx)
+        : false;
+      try {
+        await assertBlockedIssueCanLeaveBlocked({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          existingStatus: existing.status,
+          nextStatus: patch.status,
+          blockedByIssueIds,
+          blockedByApprovalId,
+          blockedByExternal: issueData.blockedByExternal,
+          existingBlockedByExternal: existing.blockedByExternal,
+          dbOrTx,
+        });
+      } catch (error) {
+        if (!hasResolvedIssueBlockersForBlockedLeave) throw error;
+        if (!(error instanceof HttpError) || error.status !== 422) throw error;
+        const details = error.details as { code?: string } | undefined;
+        if (details?.code !== "blocked_state_has_remaining_blocker") throw error;
+        patch.status = "blocked";
+        issueData.status = "blocked";
+      }
       if (blockedByApprovalId) await assertApprovalCanBlock(existing.companyId, blockedByApprovalId, dbOrTx);
       if (blockedByApprovalId !== undefined) patch.blockedByApprovalId = blockedByApprovalId;
       if (patch.status === "in_progress") {
@@ -7031,7 +7060,10 @@ export function issueService(db: Db) {
             },
             tx,
           );
-        } else if (existing.status === "blocked" && updated.status !== "blocked") {
+        } else if (
+          existing.status === "blocked" &&
+          (updated.status !== "blocked" || hasResolvedIssueBlockersForBlockedLeave)
+        ) {
           await pruneResolvedIssueBlockers(updated.id, existing.companyId, tx);
         }
         if (

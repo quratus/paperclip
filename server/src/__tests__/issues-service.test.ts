@@ -3661,7 +3661,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(relations.blockedBy).toEqual([]);
   });
 
-  it("rejects moving a blocked issue back to todo while unresolved blocker relations remain", async () => {
+  it("clears done blocker relations and stays blocked when a blocked issue resumes with unresolved blockers", async () => {
     const companyId = await seedCompany();
     const doneBlocker = await svc.create(companyId, {
       title: "Done blocker",
@@ -3680,20 +3680,11 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       blockedByIssueIds: [doneBlocker.id, unresolvedBlocker.id],
     });
 
-    await expect(svc.update(issue.id, { status: "todo" }))
-      .rejects.toMatchObject({
-        status: 422,
-        details: {
-          code: "blocked_state_has_remaining_blocker",
-          unresolvedBlockerIssueIds: [unresolvedBlocker.id],
-        },
-      });
+    const updated = await svc.update(issue.id, { status: "todo" });
     const relations = await svc.getRelationSummaries(issue.id);
 
-    expect(relations.blockedBy.map((relation) => relation.id).sort()).toEqual([
-      doneBlocker.id,
-      unresolvedBlocker.id,
-    ].sort());
+    expect(updated?.status).toBe("blocked");
+    expect(relations.blockedBy.map((relation) => relation.id)).toEqual([unresolvedBlocker.id]);
   });
 
   it("clears done blocker relations but stays blocked when unresolved issue blockers remain", async () => {
