@@ -86,9 +86,32 @@ export function classifyChange(input, policy) {
   };
 }
 
-const git = (args) => spawnSync("git", args, { encoding: "utf8" });
+export class GitCommandError extends Error {
+  constructor(args, result) {
+    const stderr = (result.stderr || result.error?.message || "").trim();
+    const detail = stderr ? `: ${stderr}` : "";
+    super(`git ${args.join(" ")} failed with status ${result.status ?? "error"}${detail}`);
+    this.name = "GitCommandError";
+    this.args = args;
+    this.status = result.status;
+    this.stderr = stderr;
+  }
+}
 
-export function gatherFiles(range) {
+const git = (args) => {
+  const result = spawnSync("git", args, { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    throw new GitCommandError(args, result);
+  }
+  return result;
+};
+
+function resolveCommit(ref) {
+  return git(["rev-parse", "--verify", `${ref}^{commit}`]).stdout.trim();
+}
+
+export function gatherFiles(range, options = {}) {
+  const allowEmpty = options.allowEmpty === true;
   const numstat = git(["diff", "--numstat", range]).stdout || "";
   const names = git(["diff", "--name-status", range]).stdout || "";
   const statuses = new Map();
@@ -114,6 +137,9 @@ export function gatherFiles(range) {
       deleted: fields[1] === "-" ? null : Number(fields[1]),
     });
   }
+  if (files.length === 0 && !allowEmpty) {
+    throw new Error(`No changed files found for ${range}; refusing to auto-route an empty classifier input.`);
+  }
   return files;
 }
 
@@ -123,6 +149,7 @@ function parseArgs(argv) {
     head: process.env.CLASSIFY_HEAD || "HEAD",
     labels: process.env.PAPERCLIP_PR_LABELS || "",
     writeArtifact: true,
+    allowEmpty: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -131,6 +158,7 @@ function parseArgs(argv) {
     else if (arg === "--head") options.head = argv[++i];
     else if (arg === "--labels") options.labels = argv[++i];
     else if (arg === "--no-artifact") options.writeArtifact = false;
+    else if (arg === "--allow-empty") options.allowEmpty = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
@@ -144,46 +172,57 @@ export function isMainModule(url) {
 if (isMainModule(import.meta.url)) {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
-    console.log("Usage: node scripts/classify-change.mjs [--base <ref>] [--head <ref>] [--labels <csv>] [--no-artifact]");
+    console.log("Usage: node scripts/classify-change.mjs [--base <ref>] [--head <ref>] [--labels <csv>] [--no-artifact] [--allow-empty]");
     process.exit(0);
   }
 
-  const here = dirname(fileURLToPath(import.meta.url));
-  const policy = JSON.parse(readFileSync(join(here, "change-policy.json"), "utf8"));
-  git(["fetch", "--quiet", "origin"]);
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const policy = JSON.parse(readFileSync(join(here, "change-policy.json"), "utf8"));
+    git(["fetch", "--quiet", "origin"]);
+    const baseSha = resolveCommit(options.base);
+    const headSha = resolveCommit(options.head);
 
-  const range = `${options.base}...${options.head}`;
-  const files = gatherFiles(range);
-  const subjects = (git(["log", "--format=%s", `${options.base}..${options.head}`]).stdout || "")
-    .split("\n")
-    .filter(Boolean);
-  const labels = options.labels.split(",").map((label) => label.trim()).filter(Boolean);
-  const verdict = classifyChange({ files, subjects, labels }, policy);
+    const range = `${options.base}...${options.head}`;
+    const files = gatherFiles(range, { allowEmpty: options.allowEmpty });
+    const subjects = (git(["log", "--format=%s", `${options.base}..${options.head}`]).stdout || "")
+      .split("\n")
+      .filter(Boolean);
+    const labels = options.labels.split(",").map((label) => label.trim()).filter(Boolean);
+    const verdict = classifyChange({ files, subjects, labels }, policy);
 
-  console.log(`\nclassify-change: ${files.length} file(s) for ${range}`);
-  for (const reason of verdict.reasons) {
-    console.log(`  [${reason.tier}] ${reason.file || reason.subject || reason.rule} - ${reason.rule}`);
-  }
-  console.log(
-    `\nCLASSIFICATION=${verdict.classification} ROUTING=${verdict.routing}`
-      + ` HUMAN=${verdict.requiresHumanApproval} CONFORMANCE=${verdict.requiresConformance}`,
-  );
-  if (verdict.routing === "human") {
-    console.log("CRITICAL: a human must review this before it merges.");
-  } else if (verdict.requiresConformance) {
-    console.log("DESIGN: auto-route requires design-conformance and visual checks to pass.");
-  } else {
-    console.log("NON-CRITICAL: eligible to auto-route once objective gates are green.");
-  }
-
-  if (options.writeArtifact) {
-    try {
-      const { mkdirSync, writeFileSync } = await import("node:fs");
-      mkdirSync("artifacts", { recursive: true });
-      writeFileSync("artifacts/classification.json", JSON.stringify({ range, ...verdict }, null, 2));
-    } catch {
-      // Printed verdict is the contract; artifact writing is best effort.
+    console.log(`\nclassify-change: ${files.length} file(s) for ${range}`);
+    console.log(`BASE_SHA=${baseSha} HEAD_SHA=${headSha}`);
+    for (const reason of verdict.reasons) {
+      console.log(`  [${reason.tier}] ${reason.file || reason.subject || reason.rule} - ${reason.rule}`);
     }
+    console.log(
+      `\nCLASSIFICATION=${verdict.classification} ROUTING=${verdict.routing}`
+        + ` HUMAN=${verdict.requiresHumanApproval} CONFORMANCE=${verdict.requiresConformance}`,
+    );
+    if (verdict.routing === "human") {
+      console.log("CRITICAL: a human must review this before it merges.");
+    } else if (verdict.requiresConformance) {
+      console.log("DESIGN: auto-route requires design-conformance and visual checks to pass.");
+    } else {
+      console.log("NON-CRITICAL: eligible to auto-route once objective gates are green.");
+    }
+
+    if (options.writeArtifact) {
+      try {
+        const { mkdirSync, writeFileSync } = await import("node:fs");
+        mkdirSync("artifacts", { recursive: true });
+        writeFileSync(
+          "artifacts/classification.json",
+          JSON.stringify({ range, baseSha, headSha, ...verdict }, null, 2),
+        );
+      } catch {
+        // Printed verdict is the contract; artifact writing is best effort.
+      }
+    }
+  } catch (error) {
+    console.error(`classify-change: ERROR: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
   }
 
   process.exit(0);

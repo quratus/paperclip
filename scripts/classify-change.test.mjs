@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -9,8 +10,10 @@ import { classifyChange, classifyFile } from "./classify-change.mjs";
 const policy = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "change-policy.json"), "utf8"),
 );
+const scriptPath = join(dirname(fileURLToPath(import.meta.url)), "classify-change.mjs");
 const file = (path, status = "M", added = 10, deleted = 5) => ({ path, status, added, deleted });
 const tierOf = (path, status, added, deleted) => classifyFile(file(path, status, added, deleted), policy).tier;
+const runCli = (args) => spawnSync(process.execPath, [scriptPath, ...args], { encoding: "utf8" });
 
 test("flags Paperclip schema, auth, execution, adapter, CI, and lockfile surfaces as critical", () => {
   assert.equal(tierOf("packages/db/src/schema/issues.ts"), "critical");
@@ -77,4 +80,27 @@ test("breaking subjects and explicit human-review labels force critical routing"
     classifyChange({ files: [file("README.md")], labels: ["human-review"] }, policy).routing,
     "human",
   );
+});
+
+test("CLI fails closed when the base ref cannot be resolved", () => {
+  const result = runCli(["--base", "refs/does-not-exist", "--head", "HEAD", "--no-artifact"]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /classify-change: ERROR:/);
+  assert.match(result.stderr, /git rev-parse --verify refs\/does-not-exist\^\{commit\} failed/);
+  assert.doesNotMatch(result.stdout, /CLASSIFICATION=non-critical ROUTING=auto/);
+});
+
+test("CLI rejects empty diffs unless explicitly allowed", () => {
+  const rejected = runCli(["--base", "HEAD", "--head", "HEAD", "--no-artifact"]);
+
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /No changed files found for HEAD\.\.\.HEAD/);
+  assert.doesNotMatch(rejected.stdout, /CLASSIFICATION=non-critical ROUTING=auto/);
+
+  const allowed = runCli(["--base", "HEAD", "--head", "HEAD", "--no-artifact", "--allow-empty"]);
+
+  assert.equal(allowed.status, 0);
+  assert.match(allowed.stdout, /classify-change: 0 file\(s\) for HEAD\.\.\.HEAD/);
+  assert.match(allowed.stdout, /CLASSIFICATION=non-critical ROUTING=auto/);
 });
