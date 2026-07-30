@@ -434,6 +434,7 @@ interface IssueChatThreadProps {
   blockerAttention?: IssueBlockerAttention | null;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   scheduledRetry?: IssueScheduledRetry | null;
+  remainingTypedBlockers?: string[];
   onClearResolvedBlockers?: () => void;
   clearResolvedBlockersPending?: boolean;
   recoveryAction?: IssueRecoveryAction | null;
@@ -4191,6 +4192,7 @@ export function IssueChatThread({
   blockerAttention = null,
   successfulRunHandoff = null,
   scheduledRetry = null,
+  remainingTypedBlockers = [],
   onClearResolvedBlockers,
   clearResolvedBlockersPending = false,
   recoveryAction = null,
@@ -4985,6 +4987,7 @@ export function IssueChatThread({
                     blockerAttention={blockerAttention}
                     successfulRunHandoff={recoveryAction ? null : successfulRunHandoff}
                     scheduledRetry={scheduledRetry}
+                    remainingTypedBlockers={remainingTypedBlockers}
                     onClearResolvedBlockers={onClearResolvedBlockers}
                     clearResolvedBlockersPending={clearResolvedBlockersPending}
                     agentName={

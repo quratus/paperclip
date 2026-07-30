@@ -892,6 +892,86 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
+  it("clears resolved blocker relations without reopening when an external blocker remains", async () => {
+    const onUpdate = vi.fn();
+    const root = renderProperties(container, {
+      issue: createIssue({
+        status: "blocked",
+        blockedByExternal: {
+          type: "vendor_response",
+          owner: "Vendor support",
+          recheckDate: "2026-07-24T00:00:00.000Z",
+        },
+        blockedBy: [
+          {
+            id: "issue-2",
+            identifier: "PAP-2",
+            title: "Finished blocker",
+            status: "done",
+            priority: "medium",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          },
+        ],
+      }),
+      childIssues: [],
+      onUpdate,
+      inline: true,
+    });
+    await flush();
+
+    expect(container.textContent).toContain("Still blocked by external blocker");
+    const clearButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Clear resolved"));
+    expect(clearButton).not.toBeUndefined();
+
+    await act(async () => {
+      clearButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({ blockedByIssueIds: [] });
+
+    act(() => root.unmount());
+  });
+
+  it("clears resolved blocker relations without reopening when an approval blocker remains", async () => {
+    const onUpdate = vi.fn();
+    const root = renderProperties(container, {
+      issue: createIssue({
+        status: "blocked",
+        blockedByApprovalId: "approval-1",
+        blockedBy: [
+          {
+            id: "issue-2",
+            identifier: "PAP-2",
+            title: "Finished blocker",
+            status: "done",
+            priority: "medium",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          },
+        ],
+      }),
+      childIssues: [],
+      onUpdate,
+      inline: true,
+    });
+    await flush();
+
+    expect(container.textContent).toContain("Still blocked by approval blocker");
+    const clearButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Clear resolved"));
+    expect(clearButton).not.toBeUndefined();
+
+    await act(async () => {
+      clearButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({ blockedByIssueIds: [] });
+
+    act(() => root.unmount());
+  });
+
   it("leaves cancelled blockers visible when clearing resolved blockers", async () => {
     const onUpdate = vi.fn();
     const root = renderProperties(container, {

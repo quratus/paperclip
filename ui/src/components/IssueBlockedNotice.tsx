@@ -362,6 +362,7 @@ export function IssueBlockedNotice({
   agentName,
   onClearResolvedBlockers,
   clearResolvedBlockersPending = false,
+  remainingTypedBlockers = [],
 }: {
   issueId?: string | null;
   issueStatus?: string;
@@ -381,10 +382,14 @@ export function IssueBlockedNotice({
   agentName?: string | null;
   onClearResolvedBlockers?: () => void;
   clearResolvedBlockersPending?: boolean;
+  remainingTypedBlockers?: string[];
 }) {
   if (issueStatus === "done" || issueStatus === "cancelled") return null;
   const showSuccessfulRunHandoff = successfulRunHandoff?.required === true;
   if (!showSuccessfulRunHandoff && blockers.length === 0 && issueStatus !== "blocked") return null;
+  const remainingTypedBlockerLabel = remainingTypedBlockers.length > 0
+    ? remainingTypedBlockers.join(" and ")
+    : null;
   const successfulRunRetryNow = showSuccessfulRunHandoff
     && issueId
     && scheduledRetry?.status === "scheduled_retry"
@@ -592,8 +597,15 @@ export function IssueBlockedNotice({
                     : reopenSuppressed
                       ? <>A message won&rsquo;t move this back to todo yet — it stays blocked by {blockerLabel} until {blockers.length === 1 ? "it is" : "they are"} done, then it reopens automatically. Comments still wake {responsibleName} for questions or triage in the meantime.</>
                       : <>Work on this task is blocked by {blockerLabel} until {blockers.length === 1 ? "it is" : "they are"} complete. Comments still wake the responsible for questions or triage.</>
-                  : <>Work on this task is blocked until it is moved back to todo. Comments still wake the responsible for questions or triage.</>}
+                  : remainingTypedBlockerLabel
+                    ? <>Work on this task is blocked by {remainingTypedBlockerLabel}. Comments still wake the responsible for questions or triage.</>
+                    : <>Work on this task is blocked until it is moved back to todo. Comments still wake the responsible for questions or triage.</>}
               </p>
+              {remainingTypedBlockerLabel && resolvedBlockerCount > 0 ? (
+                <p className="text-xs font-medium leading-5 text-amber-900 dark:text-amber-100">
+                  Clear resolved removes done task blockers; this task stays blocked by {remainingTypedBlockerLabel}.
+                </p>
+              ) : null}
               {reopenSuppressed && reopenSuppressedLeafId ? (
                 <p
                   data-testid="issue-blocked-notice-reopen-suppressed"

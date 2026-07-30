@@ -339,7 +339,7 @@ export function SidebarAgents({ streamlined = false }: { streamlined?: boolean }
     resourceKey: "live-runs",
     queryKey: liveRunsQueryKey,
     enabled: !!selectedCompanyId,
-    // Event-sourced via LiveUpdatesProvider (#9627); no interval poll needed.
+    // Event-sourced via LiveUpdatesProvider (SQN-9627); no interval poll needed.
     refetchInterval: false,
     leaderOnly: true,
   });

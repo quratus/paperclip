@@ -4634,6 +4634,46 @@ export function issueService(db: Db) {
     }
   }
 
+  async function assertBlockedIssueCanLeaveBlocked(input: {
+    companyId: string;
+    issueId: string;
+    existingStatus: string;
+    nextStatus: string | null | undefined;
+    blockedByIssueIds?: string[];
+    blockedByApprovalId?: string | null;
+    blockedByExternal?: unknown;
+    existingBlockedByExternal?: unknown;
+    dbOrTx?: DbReader;
+  }) {
+    if (input.existingStatus !== "blocked" || !input.nextStatus || input.nextStatus === "blocked") return;
+    const dbOrTx = input.dbOrTx ?? db;
+    const unresolvedBlockerIssueIds = input.blockedByIssueIds !== undefined
+      ? await listUnresolvedBlockerIssueIds(dbOrTx, input.companyId, input.blockedByIssueIds)
+      : (
+          await listIssueDependencyReadinessMap(dbOrTx, input.companyId, [input.issueId])
+        ).get(input.issueId)?.unresolvedBlockerIssueIds ?? [];
+    const hasApprovalBlocker = input.blockedByApprovalId !== undefined
+      ? input.blockedByApprovalId
+        ? (await assertApprovalCanBlock(input.companyId, input.blockedByApprovalId, dbOrTx), true)
+        : false
+      : await issueHasActiveApprovalBlocker(input.companyId, input.issueId, dbOrTx);
+    const hasExternalBlocker = input.blockedByExternal !== undefined
+      ? isTypedExternalBlocker(input.blockedByExternal)
+      : isTypedExternalBlocker(input.existingBlockedByExternal);
+
+    if (unresolvedBlockerIssueIds.length > 0 || hasApprovalBlocker || hasExternalBlocker) {
+      throw unprocessable(
+        "blocked issues cannot move to another status while unresolved issue, approval, or external blockers remain",
+        {
+          code: "blocked_state_has_remaining_blocker",
+          unresolvedBlockerIssueIds,
+          hasApprovalBlocker,
+          hasExternalBlocker,
+        },
+      );
+    }
+  }
+
   async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
     const run = await dbOrTx
       .select({ status: heartbeatRuns.status })
@@ -6815,6 +6855,17 @@ export function issueService(db: Db) {
         companyId: existing.companyId,
         issueId: existing.id,
         nextStatus: patch.status ?? existing.status,
+        blockedByIssueIds,
+        blockedByApprovalId,
+        blockedByExternal: issueData.blockedByExternal,
+        existingBlockedByExternal: existing.blockedByExternal,
+        dbOrTx,
+      });
+      await assertBlockedIssueCanLeaveBlocked({
+        companyId: existing.companyId,
+        issueId: existing.id,
+        existingStatus: existing.status,
+        nextStatus: patch.status,
         blockedByIssueIds,
         blockedByApprovalId,
         blockedByExternal: issueData.blockedByExternal,

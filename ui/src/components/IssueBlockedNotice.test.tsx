@@ -482,6 +482,32 @@ describe("IssueBlockedNotice", () => {
     expect(onClearResolvedBlockers).toHaveBeenCalledOnce();
   });
 
+  it("explains that typed blockers remain after resolved blockers are cleared", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueStatus="blocked"
+        blockers={[]}
+        allBlockers={[
+          {
+            id: "blocker-1",
+            identifier: "PAP-500",
+            title: "Finished blocker",
+            status: "done",
+            priority: "medium",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          },
+        ]}
+        remainingTypedBlockers={["external blocker"]}
+        onClearResolvedBlockers={() => undefined}
+      />,
+    );
+
+    expect(node.textContent).toContain("blocked by external blocker");
+    expect(node.textContent).toContain("stays blocked by external blocker");
+    expect(node.textContent).toContain("Clear resolved");
+  });
+
   it("shows external now-running blockers beneath the label on a separate line", () => {
     const node = render(
       <IssueBlockedNotice

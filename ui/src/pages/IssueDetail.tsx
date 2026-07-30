@@ -858,6 +858,7 @@ type IssueDetailChatTabProps = {
   blockerAttention: Issue["blockerAttention"] | null;
   successfulRunHandoff: Issue["successfulRunHandoff"] | null;
   scheduledRetry: Issue["scheduledRetry"] | null;
+  remainingTypedBlockers?: string[];
   recoveryAction: Issue["activeRecoveryAction"];
   onClearResolvedBlockers?: () => void;
   clearResolvedBlockersPending?: boolean;
@@ -951,6 +952,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   blockerAttention,
   successfulRunHandoff,
   scheduledRetry,
+  remainingTypedBlockers = [],
   recoveryAction,
   onClearResolvedBlockers,
   clearResolvedBlockersPending,
@@ -1181,6 +1183,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         blockerAttention={blockerAttention}
         successfulRunHandoff={successfulRunHandoff}
         scheduledRetry={scheduledRetry}
+        remainingTypedBlockers={remainingTypedBlockers}
         onClearResolvedBlockers={onClearResolvedBlockers}
         clearResolvedBlockersPending={clearResolvedBlockersPending}
         recoveryAction={recoveryAction ?? null}
@@ -1702,7 +1705,7 @@ export function IssueDetail() {
     resourceKey: "live-runs",
     queryKey: companyLiveRunsQueryKey,
     enabled: !!resolvedCompanyId,
-    // Event-sourced via LiveUpdatesProvider (#9627); no interval poll needed.
+    // Event-sourced via LiveUpdatesProvider (SQN-9627); no interval poll needed.
     refetchInterval: false,
     leaderOnly: true,
   });
@@ -2349,9 +2352,15 @@ export function IssueDetail() {
     const activeBlockedByIds = (issue.blockedBy ?? [])
       .filter((blocker) => blocker.status !== "done")
       .map((blocker) => blocker.id);
+    const hasTypedBlocker = Boolean(
+      issue.blockedByApprovalId ||
+      (issue.blockedByExternal?.type?.trim() &&
+        issue.blockedByExternal.owner?.trim() &&
+        issue.blockedByExternal.recheckDate),
+    );
     updateIssue.mutate({
       blockedByIssueIds: activeBlockedByIds,
-      ...(issue.status === "blocked" && activeBlockedByIds.length === 0 ? { status: "todo" } : {}),
+      ...(issue.status === "blocked" && activeBlockedByIds.length === 0 && !hasTypedBlocker ? { status: "todo" } : {}),
     });
   }, [issue, updateIssue.mutate]);
 
@@ -4749,6 +4758,14 @@ export function IssueDetail() {
               blockerAttention={issue.blockerAttention ?? null}
               successfulRunHandoff={issue.successfulRunHandoff ?? null}
               scheduledRetry={issue.scheduledRetry ?? null}
+              remainingTypedBlockers={[
+                ...(issue.blockedByApprovalId ? ["approval blocker"] : []),
+                ...(issue.blockedByExternal?.type?.trim() &&
+                  issue.blockedByExternal.owner?.trim() &&
+                  issue.blockedByExternal.recheckDate
+                  ? ["external blocker"]
+                  : []),
+              ]}
               recoveryAction={issue.activeRecoveryAction ?? null}
               onClearResolvedBlockers={handleClearResolvedBlockers}
               clearResolvedBlockersPending={updateIssue.isPending}

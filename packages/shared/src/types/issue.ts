@@ -773,6 +773,13 @@ export interface Issue {
   sourceTrust?: SourceTrustMetadata | null;
   labelIds?: string[];
   labels?: IssueLabel[];
+  blockedByApprovalId?: string | null;
+  blockedByExternal?: {
+    type: string;
+    owner: string;
+    recheckDate: string;
+    note?: string | null;
+  } | null;
   blockedBy?: IssueRelationIssueSummary[];
   blocks?: IssueRelationIssueSummary[];
   blockerAttention?: IssueBlockerAttention;

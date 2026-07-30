@@ -131,6 +131,18 @@ interface IssuePropertiesProps {
 const ISSUE_BLOCKER_SEARCH_LIMIT = 50;
 const ISSUE_PROPERTY_RELATION_PREVIEW_COUNT = 5;
 
+function hasTypedExternalBlocker(issue: Issue) {
+  const blocker = issue.blockedByExternal;
+  return Boolean(blocker?.type?.trim() && blocker?.owner?.trim() && blocker?.recheckDate);
+}
+
+function remainingTypedBlockerLabels(issue: Issue) {
+  const labels: string[] = [];
+  if (issue.blockedByApprovalId) labels.push("approval blocker");
+  if (hasTypedExternalBlocker(issue)) labels.push("external blocker");
+  return labels;
+}
+
 export function IssueProperties({
   issue,
   childIssues = [],
@@ -1696,6 +1708,8 @@ export function IssueProperties({
   const activeBlockedByIds = blockedByRelations
     .filter((relation) => relation.status !== "done")
     .map((relation) => relation.id);
+  const typedBlockerLabels = remainingTypedBlockerLabels(issue);
+  const hasRemainingTypedBlocker = typedBlockerLabels.length > 0;
   const hasResolvedBlockers = resolvedBlockedByRelations.length > 0;
   const visibleBlockedByRelations = blockedByExpanded
     ? blockedByRelations
@@ -1838,7 +1852,9 @@ export function IssueProperties({
   const updateBlockedByIds = (nextBlockedByIds: string[]) => {
     onUpdate({
       blockedByIssueIds: nextBlockedByIds,
-      ...(issue.status === "blocked" && nextBlockedByIds.length === 0 ? { status: "todo" } : {}),
+      ...(issue.status === "blocked" && nextBlockedByIds.length === 0 && !hasRemainingTypedBlocker
+        ? { status: "todo" }
+        : {}),
     });
   };
   const toggleBlockedBy = (blockedByIssueId: string) => {
@@ -1928,9 +1944,11 @@ export function IssueProperties({
         onClick={clearResolvedBlockers}
         aria-label={`Clear ${count} resolved ${count === 1 ? "blocker" : "blockers"}`}
         title={
-          issue.status === "blocked" && activeBlockedByIds.length === 0
+          issue.status === "blocked" && activeBlockedByIds.length === 0 && !hasRemainingTypedBlocker
             ? "Remove resolved blockers and move this task back to todo"
-            : "Remove blockers that are already done"
+            : hasRemainingTypedBlocker
+              ? `Remove done blockers; task stays blocked by ${typedBlockerLabels.join(" and ")}`
+              : "Remove blockers that are already done"
         }
       >
         <CheckCircle2 className="h-3 w-3" />
@@ -2065,33 +2083,45 @@ export function IssueProperties({
                 {blockedByContent}
               </div>
             )}
+            {issue.status === "blocked" && hasRemainingTypedBlocker ? (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Still blocked by {typedBlockerLabels.join(" and ")} after resolved task blockers are cleared.
+              </p>
+            ) : null}
           </div>
         ) : (
-          <PropertyRow label="Blocked by" wrap>
-            {visibleBlockedByRelations.map((relation) => (
-              <RemovableIssueReferencePill key={relation.id} issue={relation} onRemove={removeBlockedBy} />
-            ))}
-            <ExpandRelationListButton
-              hiddenCount={hiddenBlockedByCount}
-              expanded={blockedByExpanded}
-              onClick={() => setBlockedByExpanded((expanded) => !expanded)}
-            />
-            {renderClearResolvedBlockersButton()}
-            <Popover
-              open={blockedByOpen}
-              onOpenChange={(open) => {
-                setBlockedByOpen(open);
-                if (!open) setBlockedBySearch("");
-              }}
-            >
-              <PopoverTrigger asChild>
-                {renderAddBlockedByButton()}
-              </PopoverTrigger>
-              <PopoverContent className="w-72 p-1" align="end" collisionPadding={16}>
-                {blockedByContent}
-              </PopoverContent>
-            </Popover>
-          </PropertyRow>
+          <>
+            <PropertyRow label="Blocked by" wrap>
+              {visibleBlockedByRelations.map((relation) => (
+                <RemovableIssueReferencePill key={relation.id} issue={relation} onRemove={removeBlockedBy} />
+              ))}
+              <ExpandRelationListButton
+                hiddenCount={hiddenBlockedByCount}
+                expanded={blockedByExpanded}
+                onClick={() => setBlockedByExpanded((expanded) => !expanded)}
+              />
+              {renderClearResolvedBlockersButton()}
+              <Popover
+                open={blockedByOpen}
+                onOpenChange={(open) => {
+                  setBlockedByOpen(open);
+                  if (!open) setBlockedBySearch("");
+                }}
+              >
+                <PopoverTrigger asChild>
+                  {renderAddBlockedByButton()}
+                </PopoverTrigger>
+                <PopoverContent className="w-72 p-1" align="end" collisionPadding={16}>
+                  {blockedByContent}
+                </PopoverContent>
+              </Popover>
+            </PropertyRow>
+            {issue.status === "blocked" && hasRemainingTypedBlocker ? (
+              <div className="text-xs text-muted-foreground">
+                Still blocked by {typedBlockerLabels.join(" and ")} after resolved task blockers are cleared.
+              </div>
+            ) : null}
+          </>
         )}
 
         <PropertyRow label="Blocking" wrap>

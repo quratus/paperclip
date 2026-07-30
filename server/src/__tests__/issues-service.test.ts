@@ -3572,6 +3572,74 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(relations.blockedBy).toEqual([]);
   });
 
+  it("clears done blocker relations but stays blocked when an external blocker remains", async () => {
+    const companyId = await seedCompany();
+    const blocker = await svc.create(companyId, {
+      title: "Finished blocker",
+      status: "done",
+      priority: "medium",
+    });
+    const issue = await svc.create(companyId, {
+      title: "External wait with stale blocker",
+      status: "blocked",
+      priority: "medium",
+      blockedByIssueIds: [blocker.id],
+      blockedByExternal: {
+        type: "vendor_response",
+        owner: "Vendor support",
+        recheckDate: "2026-07-24T00:00:00.000Z",
+      },
+    });
+
+    const updated = await svc.update(issue.id, { blockedByIssueIds: [] });
+    const relations = await svc.getRelationSummaries(issue.id);
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.blockedByExternal).toMatchObject({ type: "vendor_response" });
+    expect(relations.blockedBy).toEqual([]);
+    await expect(svc.update(issue.id, { status: "todo" }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: { code: "blocked_state_has_remaining_blocker", hasExternalBlocker: true },
+      });
+  });
+
+  it("clears done blocker relations but stays blocked when an approval blocker remains", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const blocker = await svc.create(companyId, {
+      title: "Finished blocker",
+      status: "done",
+      priority: "medium",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Approval wait with stale blocker",
+      status: "blocked",
+      priority: "medium",
+      blockedByIssueIds: [blocker.id],
+      blockedByApprovalId: approvalId,
+    });
+
+    const updated = await svc.update(issue.id, { blockedByIssueIds: [] });
+    const relations = await svc.getRelationSummaries(issue.id);
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.blockedByApprovalId).toBe(approvalId);
+    expect(relations.blockedBy).toEqual([]);
+    await expect(svc.update(issue.id, { status: "todo" }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: { code: "blocked_state_has_remaining_blocker", hasApprovalBlocker: true },
+      });
+  });
+
   it("automatically clears done blocker relations when a stale blocked issue resumes", async () => {
     const companyId = await seedCompany();
     const blocker = await svc.create(companyId, {
@@ -3593,7 +3661,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(relations.blockedBy).toEqual([]);
   });
 
-  it("keeps unresolved blocker relations when a blocked issue is moved back to todo", async () => {
+  it("rejects moving a blocked issue back to todo while unresolved blocker relations remain", async () => {
     const companyId = await seedCompany();
     const doneBlocker = await svc.create(companyId, {
       title: "Done blocker",
@@ -3612,11 +3680,98 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       blockedByIssueIds: [doneBlocker.id, unresolvedBlocker.id],
     });
 
-    const updated = await svc.update(issue.id, { status: "todo" });
+    await expect(svc.update(issue.id, { status: "todo" }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: {
+          code: "blocked_state_has_remaining_blocker",
+          unresolvedBlockerIssueIds: [unresolvedBlocker.id],
+        },
+      });
     const relations = await svc.getRelationSummaries(issue.id);
 
-    expect(updated?.status).toBe("todo");
+    expect(relations.blockedBy.map((relation) => relation.id).sort()).toEqual([
+      doneBlocker.id,
+      unresolvedBlocker.id,
+    ].sort());
+  });
+
+  it("clears done blocker relations but stays blocked when unresolved issue blockers remain", async () => {
+    const companyId = await seedCompany();
+    const doneBlocker = await svc.create(companyId, {
+      title: "Done blocker",
+      status: "done",
+      priority: "medium",
+    });
+    const unresolvedBlocker = await svc.create(companyId, {
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Partially blocked issue",
+      status: "blocked",
+      priority: "medium",
+      blockedByIssueIds: [doneBlocker.id, unresolvedBlocker.id],
+    });
+
+    const updated = await svc.update(issue.id, { blockedByIssueIds: [unresolvedBlocker.id] });
+    const relations = await svc.getRelationSummaries(issue.id);
+
+    expect(updated?.status).toBe("blocked");
     expect(relations.blockedBy.map((relation) => relation.id)).toEqual([unresolvedBlocker.id]);
+  });
+
+  it("rejects moving a blocked issue back to todo while typed blockers remain", async () => {
+    const companyId = await seedCompany();
+    const issue = await svc.create(companyId, {
+      title: "External wait",
+      status: "blocked",
+      priority: "medium",
+      blockedByExternal: {
+        type: "vendor_response",
+        owner: "Vendor support",
+        recheckDate: "2026-07-24T00:00:00.000Z",
+      },
+    });
+
+    await expect(svc.update(issue.id, { status: "todo" }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: {
+          code: "blocked_state_has_remaining_blocker",
+          unresolvedBlockerIssueIds: [],
+          hasExternalBlocker: true,
+        },
+      });
+  });
+
+  it("rejects moving a blocked issue back to todo while approval blockers remain", async () => {
+    const companyId = await seedCompany();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+    });
+    const issue = await svc.create(companyId, {
+      title: "Approval wait",
+      status: "blocked",
+      priority: "medium",
+      blockedByApprovalId: approvalId,
+    });
+
+    await expect(svc.update(issue.id, { status: "todo" }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: {
+          code: "blocked_state_has_remaining_blocker",
+          unresolvedBlockerIssueIds: [],
+          hasApprovalBlocker: true,
+        },
+      });
   });
 
   it("links pending approval blockers and consumes decided approval blockers", async () => {
