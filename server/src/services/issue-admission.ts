@@ -29,6 +29,7 @@ export function evaluateIssueAdmission(input: {
     id: string;
     description?: string | null;
     executionPolicy?: unknown;
+    originKind?: string | null;
   };
   nextDescription?: string | null;
   nextExecutionPolicy?: unknown;
@@ -44,6 +45,7 @@ export function evaluateIssueAdmission(input: {
   );
   const workClass = policy?.workClass ?? null;
   if (workClass === "docs_ops") return { kind: "allow" };
+  if (input.source === "checkout" && input.issue.originKind === "routine_execution") return { kind: "allow" };
 
   const hasContract = hasProductTruthContract(
     input.nextDescription === undefined

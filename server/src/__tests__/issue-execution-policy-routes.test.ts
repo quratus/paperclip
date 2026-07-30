@@ -600,6 +600,43 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.checkout).toHaveBeenCalled();
   });
 
+  it("allows routine execution checkout without a Product Truth Contract review chain", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "done",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1108",
+      title: "Routine execution comment triage",
+      description: "Acknowledge the follow-up comment on the completed routine run.",
+      executionPolicy: null,
+      executionState: null,
+      harnessKind: null,
+      originKind: "routine_execution",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.checkout.mockResolvedValue({ ...issue, checkoutRunId: "run-1" });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/checkout")
+      .send({
+        agentId: "33333333-3333-4333-8333-333333333333",
+        expectedStatuses: ["done"],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalled();
+  });
+
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
