@@ -5807,10 +5807,21 @@ export function issueRoutes(
       }
 
       if (sourceIssueStatus) {
+        const lockedIssue = await tx
+          .select({ blockedByExternal: issueRows.blockedByExternal })
+          .from(issueRows)
+          .where(eq(issueRows.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedIssue) throw notFound("Issue not found");
+
         const updatedIssue = await svc.update(
           id,
           {
             status: sourceIssueStatus,
+            ...(lockedIssue.blockedByExternal?.type === "automatic_recovery"
+              ? { blockedByExternal: null }
+              : {}),
             ...(handBackAgentId ? { assigneeAgentId: handBackAgentId } : {}),
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
