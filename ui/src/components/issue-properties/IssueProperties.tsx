@@ -1835,22 +1835,25 @@ export function IssueProperties({
     blockerSearchActive ? isFetchingSearchedBlockedByIssues : isFetchingIssuePickerIssues
   );
 
+  const updateBlockedByIds = (nextBlockedByIds: string[]) => {
+    onUpdate({
+      blockedByIssueIds: nextBlockedByIds,
+      ...(issue.status === "blocked" && nextBlockedByIds.length === 0 ? { status: "todo" } : {}),
+    });
+  };
   const toggleBlockedBy = (blockedByIssueId: string) => {
     const nextBlockedByIds = blockedByIds.includes(blockedByIssueId)
       ? blockedByIds.filter((candidate) => candidate !== blockedByIssueId)
       : [...blockedByIds, blockedByIssueId];
-    onUpdate({ blockedByIssueIds: nextBlockedByIds });
+    updateBlockedByIds(nextBlockedByIds);
     setBlockedByOpen(false);
     setBlockedBySearch("");
   };
   const removeBlockedBy = (blockedByIssueId: string) => {
-    onUpdate({ blockedByIssueIds: blockedByIds.filter((candidate) => candidate !== blockedByIssueId) });
+    updateBlockedByIds(blockedByIds.filter((candidate) => candidate !== blockedByIssueId));
   };
   const clearResolvedBlockers = () => {
-    onUpdate({
-      blockedByIssueIds: activeBlockedByIds,
-      ...(issue.status === "blocked" && activeBlockedByIds.length === 0 ? { status: "todo" } : {}),
-    });
+    updateBlockedByIds(activeBlockedByIds);
   };
 
   const blockedByContent = (
@@ -1870,7 +1873,7 @@ export function IssueProperties({
             blockedByIds.length === 0 && "bg-accent",
           )}
           onClick={() => {
-            onUpdate({ blockedByIssueIds: [] });
+            updateBlockedByIds([]);
             setBlockedByOpen(false);
             setBlockedBySearch("");
           }}
