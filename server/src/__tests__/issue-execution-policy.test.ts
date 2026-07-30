@@ -33,6 +33,12 @@ function approvalOnlyPolicy() {
   ]);
 }
 
+function agentApprovalPolicy(agentId: string) {
+  return makePolicy([
+    { type: "approval", participants: [{ type: "agent", agentId }] },
+  ]);
+}
+
 describe("normalizeIssueExecutionPolicy", () => {
   it("returns null for null/undefined input", () => {
     expect(normalizeIssueExecutionPolicy(null)).toBeNull();
@@ -315,6 +321,56 @@ describe("issue execution policy transitions", () => {
       });
     });
 
+    it("allows the return assignee to own the next approval stage", () => {
+      const policy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
+      ]);
+      const reviewStageId = policy.stages[0].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Review approved",
+      });
+
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionState: {
+          status: "pending",
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: coderAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [reviewStageId],
+        },
+      });
+      expect(result.decision).toMatchObject({
+        stageType: "review",
+        outcome: "approved",
+      });
+    });
+
     it("lets a reviewer provide loose instructions for the next approval stage", () => {
       const reviewStageId = policy.stages[0].id;
       const approvalInstructions = "Please decide whether this is ready to ship, with any launch caveats.";
@@ -544,6 +600,36 @@ describe("issue execution policy transitions", () => {
       expect(result.patch.executionState).toMatchObject({
         status: "pending",
         currentStageType: "approval",
+      });
+    });
+
+    it("can route directly to an approval participant that is also the executor", () => {
+      const policy = agentApprovalPolicy(coderAgentId);
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Ready for owner approval",
+      });
+
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionState: {
+          status: "pending",
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: coderAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+        },
       });
     });
   });

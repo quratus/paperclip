@@ -470,6 +470,13 @@ function selectStageParticipant(
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
+function reviewParticipantExclusion(
+  stage: IssueExecutionStage,
+  returnAssignee: IssueExecutionStagePrincipal | null,
+) {
+  return stage.type === "review" ? returnAssignee : null;
+}
+
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
@@ -671,7 +678,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     const currentParticipant =
       existingState?.currentParticipant ??
       selectStageParticipant(activeStage, {
-        exclude: existingState?.returnAssignee ?? null,
+        exclude: reviewParticipantExclusion(activeStage, existingState?.returnAssignee ?? null),
       });
     if (!currentParticipant) {
       throw unprocessable(`No eligible ${activeStage.type} participant is configured for this issue`);
@@ -680,7 +687,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     if (!stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
         preferred: explicitAssignee ?? existingState?.currentParticipant ?? null,
-        exclude: existingState?.returnAssignee ?? null,
+        exclude: reviewParticipantExclusion(activeStage, existingState?.returnAssignee ?? null),
       });
       if (!participant) {
         clearExecutionStatePatch({
@@ -733,7 +740,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
         const participant = selectStageParticipant(nextStage, {
           preferred: explicitAssignee,
-          exclude: existingState?.returnAssignee ?? null,
+          exclude: reviewParticipantExclusion(nextStage, existingState?.returnAssignee ?? null),
         });
         if (!participant) {
           throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
@@ -835,7 +842,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       existingState?.status === CHANGES_REQUESTED_STATUS
         ? explicitAssignee ?? existingState.currentParticipant ?? null
         : explicitAssignee,
-    exclude: returnAssignee,
+    exclude: reviewParticipantExclusion(pendingStage, returnAssignee),
   });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
@@ -860,7 +867,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         existingState?.status === CHANGES_REQUESTED_STATUS
           ? explicitAssignee ?? existingState.currentParticipant ?? null
           : explicitAssignee,
-      exclude: returnAssignee,
+      exclude: reviewParticipantExclusion(pendingStage, returnAssignee),
     });
   }
   if (!participant) {
