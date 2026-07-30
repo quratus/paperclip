@@ -102,8 +102,11 @@ if [[ -z "${PAPERCLIP_API_URL:-}" || -z "${PAPERCLIP_API_KEY:-}" || -z "${PAPERC
   exit 1
 fi
 
+paperclip_api_base="${PAPERCLIP_API_URL%/}"
+paperclip_api_base="${paperclip_api_base%/api}"
+
 curl -sS -X PATCH \
-  "$PAPERCLIP_API_URL/api/issues/$issue_id" \
+  "$paperclip_api_base/api/issues/$issue_id" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H 'Content-Type: application/json' \
