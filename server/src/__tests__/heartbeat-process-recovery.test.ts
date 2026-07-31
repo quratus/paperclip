@@ -1886,6 +1886,128 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comment?.body).toContain("Awaiting capacity");
   });
 
+  it("does not let a late capacity finalizer erase a newer responsibility lock", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const recoveryAgentId = randomUUID();
+    const issueId = randomUUID();
+    const recoveryRunId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cwd = await fs.mkdtemp(path.join(tmpdir(), "paperclip-capacity-race-"));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Saturated implementer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", "process.exit(75)"], cwd },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: recoveryAgentId,
+        companyId,
+        name: "Capacity recovery owner",
+        role: "operations",
+        status: "running",
+        adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"], cwd },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Preserve the newer recovery owner",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    let finishCapacityRun!: (result: {
+      exitCode: number;
+      signal: null;
+      timedOut: boolean;
+      errorCode: string;
+      errorMessage: string;
+      resultJson: { stdout: string; stderr: string };
+    }) => void;
+    mockAdapterExecute.mockImplementationOnce(() => new Promise((resolve) => {
+      finishCapacityRun = resolve;
+    }));
+    const heartbeat = heartbeatService(db);
+    const queuedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+    });
+    expect(await waitForValue(async () =>
+      mockAdapterExecute.mock.calls.some(([context]) => context?.runId === queuedRun?.id) || null,
+    )).toBe(true);
+
+    await db.insert(heartbeatRuns).values({
+      id: recoveryRunId,
+      companyId,
+      agentId: recoveryAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId, wakeReason: "pipeline_graph_wake", pipelineGraphWake: true },
+      startedAt: new Date(),
+    });
+    await db.update(issues).set({
+      status: "in_progress",
+      executionRunId: recoveryRunId,
+      checkoutRunId: queuedRun!.id,
+      executionAgentNameKey: "capacity-recovery-owner",
+      executionLockedAt: new Date(),
+    }).where(eq(issues.id, issueId));
+
+    finishCapacityRun({
+      exitCode: 75,
+      signal: null,
+      timedOut: false,
+      errorCode: "capacity_exhausted",
+      errorMessage: "Temporary capacity unavailable",
+      resultJson: { stdout: "", stderr: "" },
+    });
+    const failedRun = await waitForRunToSettle(heartbeat, queuedRun?.id ?? "", 4_000);
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "capacity_exhausted" });
+    expect(await waitForValue(async () => {
+      const current = await db.select({ checkoutRunId: issues.checkoutRunId })
+        .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      return current?.checkoutRunId === null ? true : null;
+    })).toBe(true);
+
+    const [issue, comments] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+    ]);
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      executionRunId: recoveryRunId,
+      checkoutRunId: null,
+      executionAgentNameKey: "capacity-recovery-owner",
+    });
+    expect(comments.some((comment) => comment.body.includes("Awaiting capacity"))).toBe(false);
+
+    await heartbeat.cancelRun(recoveryRunId);
+  });
+
   it("classifies Claude session quota output as capacity and requeues the issue", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
