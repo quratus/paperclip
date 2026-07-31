@@ -13,6 +13,12 @@ import {
   issueComments,
   issueDocuments,
   issues,
+  pipelineCaseIssueLinks,
+  pipelineCases,
+  pipelineGraphRuns,
+  pipelineGraphVersions,
+  pipelineStages,
+  pipelines,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -537,7 +543,6 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         skipTimerWhenNoActionableWork: true,
       },
     });
-
     const run = await heartbeat.wakeup(agentId, {
       source: "timer",
       triggerDetail: "schedule",
@@ -1591,6 +1596,170 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup?.error).toContain("in-review participant changed");
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
+
+  it("runs a current graph assignment when legacy issue routing still names the reviewer", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "LegacyReviewer",
+      role: "qa",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId,
+      key: `graph-${randomUUID()}`,
+      name: "Graph-owned work",
+    }).returning();
+    const [stage] = await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "implement",
+      name: "Implement",
+      kind: "working",
+      position: 100,
+    }).returning();
+    const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      version: 1,
+      definitionHash: "a".repeat(64),
+      schemaVersion: 1,
+      definition: {
+        schemaVersion: 1,
+        entryNodeKey: "implement",
+        nodes: [{
+          key: "implement",
+          kind: "working",
+          name: "Implement",
+          config: { targetAgentId: agentId },
+        }],
+        edges: [],
+      },
+      status: "active",
+      createdByType: "user",
+      createdById: "board-user",
+      activatedByType: "user",
+      activatedById: "board-user",
+      activatedAt: new Date(),
+    }).returning();
+    const [pipelineCase] = await db.insert(pipelineCases).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      stageId: stage!.id,
+      caseKey: `case-${randomUUID()}`,
+      title: "Graph canary",
+    }).returning();
+    const [graphRun] = await db.insert(pipelineGraphRuns).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      caseId: pipelineCase!.id,
+      startIdempotencyKey: `start-${randomUUID()}`,
+      status: "running",
+      currentNodeKey: "implement",
+      revision: 3,
+      startedByType: "user",
+      startedById: "board-user",
+    }).returning();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legacy review projection lags the graph",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId,
+      caseId: pipelineCase!.id,
+      issueId,
+      role: "work",
+    });
+    const unrelatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: unrelatedIssueId,
+      companyId,
+      title: "Unrelated issue must not inherit graph authority",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+    });
+    const { runId: unrelatedRunId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId: unrelatedIssueId,
+      wakeReason: "pipeline_graph_wake",
+      invocationSource: "automation",
+      contextExtras: {
+        pipelineGraphWake: true,
+        graphRunId: graphRun!.id,
+        graphRunRevision: graphRun!.revision,
+        targetNodeKey: graphRun!.currentNodeKey,
+      },
+    });
+
+    await heartbeat.reapOrphanedRuns();
+
+    expect(await db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, unrelatedRunId))
+      .then((rows) => rows[0]?.status)).toBe("cancelled");
+    expect(await db.select({ errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, unrelatedRunId))
+      .then((rows) => rows[0]?.errorCode)).toBe("pipeline_graph_superseded");
+    expect(countExecuteCallsForRun(unrelatedRunId)).toBe(0);
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "pipeline_graph_wake",
+      invocationSource: "automation",
+      contextExtras: {
+        pipelineGraphWake: true,
+        graphRunId: graphRun!.id,
+        graphRunRevision: graphRun!.revision,
+        targetNodeKey: graphRun!.currentNodeKey,
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db.select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const run = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "succeeded", errorCode: null });
+    expect(countExecuteCallsForRun(runId)).toBe(1);
+  }, 10_000);
 
   it("redirects comment-driven work away from a former in_review participant", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();

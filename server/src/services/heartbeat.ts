@@ -57,8 +57,10 @@ import {
   issues,
   issueWorkProducts,
   projects,
+  pipelineCaseIssueLinks,
   projectWorkspaces,
   pipelineGraphRuns,
+  pipelineGraphVersions,
   routineRevisions,
   routineRuns,
   routines,
@@ -9285,6 +9287,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       input.retryReason ?? readNonEmptyString(contextSnapshot.retryReason) ?? run.scheduledRetryReason ?? null;
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     const projectId = readNonEmptyString(contextSnapshot.projectId);
+    const isPipelineGraphWake = contextSnapshot.pipelineGraphWake === true;
 
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
       issueId,
@@ -9341,7 +9344,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.assigneeAgentId !== run.agentId) {
+    if (!isPipelineGraphWake && issue.assigneeAgentId !== run.agentId) {
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because issue ownership changed",
@@ -9393,7 +9396,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.status === "in_review") {
+    if (!isPipelineGraphWake && issue.status === "in_review") {
       const executionState = parseIssueExecutionState(issue.executionState);
       const currentParticipant = executionState?.currentParticipant ?? null;
       if (currentParticipant) {
@@ -10763,8 +10766,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return "Graph wake is missing its run id or expected revision";
     }
     const graphRun = await db
-      .select({ status: pipelineGraphRuns.status, revision: pipelineGraphRuns.revision })
+      .select({
+        status: pipelineGraphRuns.status,
+        revision: pipelineGraphRuns.revision,
+        caseId: pipelineGraphRuns.caseId,
+        currentNodeKey: pipelineGraphRuns.currentNodeKey,
+        definition: pipelineGraphVersions.definition,
+      })
       .from(pipelineGraphRuns)
+      .innerJoin(
+        pipelineGraphVersions,
+        and(
+          eq(pipelineGraphVersions.companyId, pipelineGraphRuns.companyId),
+          eq(pipelineGraphVersions.pipelineId, pipelineGraphRuns.pipelineId),
+          eq(pipelineGraphVersions.id, pipelineGraphRuns.graphVersionId),
+        ),
+      )
       .where(and(
         eq(pipelineGraphRuns.companyId, run.companyId),
         eq(pipelineGraphRuns.id, graphRunId),
@@ -10776,6 +10793,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     if (graphRun.revision !== expectedRevision) {
       return `Graph wake revision ${expectedRevision} was superseded by revision ${graphRun.revision}`;
+    }
+    const expectedNodeKey = readNonEmptyString(context.targetNodeKey);
+    if (!expectedNodeKey || expectedNodeKey !== graphRun.currentNodeKey) {
+      return `Graph wake node ${expectedNodeKey ?? "missing"} differs from current node ${graphRun.currentNodeKey}`;
+    }
+    const currentNode = graphRun.definition.nodes.find((node) => node.key === graphRun.currentNodeKey);
+    const targetAgentId = readNonEmptyString(parseObject(currentNode?.config).targetAgentId);
+    if (!currentNode || !targetAgentId || targetAgentId !== run.agentId) {
+      return "Graph wake target agent differs from the pinned current-node owner";
+    }
+    const issueId = readNonEmptyString(context.issueId);
+    if (issueId) {
+      const activeIssueLink = await db
+        .select({ id: pipelineCaseIssueLinks.id })
+        .from(pipelineCaseIssueLinks)
+        .where(and(
+          eq(pipelineCaseIssueLinks.companyId, run.companyId),
+          eq(pipelineCaseIssueLinks.caseId, graphRun.caseId),
+          eq(pipelineCaseIssueLinks.issueId, issueId),
+          inArray(pipelineCaseIssueLinks.role, ["origin", "work"]),
+          isNull(pipelineCaseIssueLinks.retiredAt),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!activeIssueLink) {
+        return "Graph wake issue is not actively linked to the pinned case";
+      }
     }
     return null;
   }
@@ -10956,6 +11000,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const claimedContext = parseObject(claimed.contextSnapshot);
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
+    const isPipelineGraphWake = claimedContext.pipelineGraphWake === true;
     if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
       const claimedAgent = await getAgent(claimed.agentId);
       const issueLock = await db
@@ -10970,9 +11015,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(issues.id, claimedIssueId),
             eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
+            // Durable graph admission already proved the pinned run revision and
+            // target agent. Legacy issue routing may lag that authority, so a
+            // current graph assignment can own the execution lock without first
+            // rewriting the issue's review participant or assignee projection.
+            isPipelineGraphWake ? undefined : eq(issues.assigneeAgentId, claimed.agentId),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
         ).returning({ id: issues.id });
@@ -11092,6 +11139,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
     const hasResolvedInteractionEvidence = interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
+    const isPipelineGraphWake = context.pipelineGraphWake === true;
 
     if (
       issue.status === "in_progress" &&
@@ -11132,6 +11180,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (
       issue.assigneeAgentId !== run.agentId &&
+      !isPipelineGraphWake &&
       !isTargetedInteractionWake &&
       !isCurrentReviewParticipant
     ) {
@@ -11182,7 +11231,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.status === "in_review") {
+    if (!isPipelineGraphWake && issue.status === "in_review") {
       const currentParticipant = reviewExecutionState?.currentParticipant ?? null;
       if (currentParticipant) {
         const participantMatches =

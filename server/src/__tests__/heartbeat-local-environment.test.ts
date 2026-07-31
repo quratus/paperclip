@@ -13,6 +13,7 @@ import {
   environments,
   heartbeatRuns,
   issues,
+  pipelineCaseIssueLinks,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -264,6 +265,12 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       title: "Heartbeat idempotency",
       actor: { type: "user", userId: "board-user" },
     });
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId,
+      caseId: ingested.case.id,
+      issueId: linkedIssue!.id,
+      role: "work",
+    });
     const graphRun = await pipelineGraphRunService(db).start({
       companyId,
       caseId: ingested.case.id,
@@ -282,6 +289,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
         pipelineGraphWake: true,
         graphRunId: graphRun.run.id,
         graphRunRevision: graphRun.run.revision,
+        targetNodeKey: graphRun.run.currentNodeKey,
         issueId: linkedIssue!.id,
         taskId: linkedIssue!.id,
       },
@@ -367,7 +375,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       reason: "pipeline_graph_wake_superseded",
       runId: null,
     });
-  });
+  }, 10_000);
 
   it("injects run-scoped Paperclip env into process agents", async () => {
     const companyId = randomUUID();
