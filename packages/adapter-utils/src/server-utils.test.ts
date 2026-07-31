@@ -70,6 +70,15 @@ describe("buildInvocationEnvForLogs", () => {
       "env OPENAI_API_KEY=***REDACTED*** PAPERCLIP_API_KEY='***REDACTED***' custom-acp --paperclip-api-key=***REDACTED*** --token ***REDACTED***",
     );
   });
+
+  it("redacts structured wake payloads from invocation metadata", () => {
+    const loggedEnv = buildInvocationEnvForLogs({
+      PAPERCLIP_WAKE_PAYLOAD_JSON: JSON.stringify({ apiKey: "wake-secret" }),
+    });
+
+    expect(loggedEnv.PAPERCLIP_WAKE_PAYLOAD_JSON).toBe("***REDACTED***");
+    expect(JSON.stringify(loggedEnv)).not.toContain("wake-secret");
+  });
 });
 
 describe("sanitizeSshRemoteEnv", () => {
