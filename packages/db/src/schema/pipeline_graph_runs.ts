@@ -14,6 +14,7 @@ import {
 import { companies } from "./companies.js";
 import { pipelineCases } from "./pipeline_cases.js";
 import { pipelineGraphVersions, pipelines } from "./pipelines.js";
+import { heartbeatRuns } from "./heartbeat_runs.js";
 
 export const pipelineGraphRuns = pgTable(
   "pipeline_graph_runs",
@@ -234,6 +235,126 @@ export const pipelineGraphWakeOutbox = pgTable(
           and ${table.claimedBy} is null
           and ${table.claimExpiresAt} is null
         )
+      )`,
+    ),
+  }),
+);
+
+export const pipelineGraphEffectAttempts = pgTable(
+  "pipeline_graph_effect_attempts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    runId: uuid("run_id").notNull(),
+    nodeKey: text("node_key").notNull(),
+    runRevision: integer("run_revision").notNull(),
+    effectType: text("effect_type").notNull(),
+    authorityClass: text("authority_class").notNull(),
+    targetRef: jsonb("target_ref").$type<Record<string, unknown>>().notNull(),
+    payloadHash: text("payload_hash").notNull(),
+    subjectHash: text("subject_hash").notNull(),
+    authorityReceipt: jsonb("authority_receipt").$type<Record<string, unknown>>().notNull(),
+    executorAttestation: jsonb("executor_attestation").$type<{
+      keyId: string;
+      controllerBuildId: string;
+      subjectHash: string;
+      action: "request";
+      actionHash: string;
+      signature: string;
+    }>().notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    retryPolicy: jsonb("retry_policy").$type<{ maxAttempts: number }>().notNull().default({ maxAttempts: 1 }),
+    status: text("status").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    requestedByType: text("requested_by_type").notNull(),
+    requestedById: text("requested_by_id").notNull(),
+    requestedByRunId: uuid("requested_by_run_id"),
+    executorType: text("executor_type"),
+    executorId: text("executor_id"),
+    leaseToken: uuid("lease_token"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    reconciliationEvidence: jsonb("reconciliation_evidence").$type<Record<string, unknown>>(),
+    providerReceipt: jsonb("provider_receipt").$type<Record<string, unknown>>(),
+    failureEvidence: jsonb("failure_evidence").$type<Record<string, unknown>>(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    companyIdempotencyUq: uniqueIndex("pipeline_graph_effect_attempts_company_idempotency_uq")
+      .on(table.companyId, table.idempotencyKey),
+    companySubjectUq: uniqueIndex("pipeline_graph_effect_attempts_company_subject_uq")
+      .on(table.companyId, table.subjectHash),
+    companyIdUq: uniqueIndex("pipeline_graph_effect_attempts_company_id_uq")
+      .on(table.companyId, table.id),
+    pendingIdx: index("pipeline_graph_effect_attempts_pending_idx")
+      .on(table.status, table.createdAt),
+    runIdx: index("pipeline_graph_effect_attempts_run_idx")
+      .on(table.companyId, table.runId, table.createdAt),
+    runFk: foreignKey({
+      columns: [table.companyId, table.runId],
+      foreignColumns: [pipelineGraphRuns.companyId, pipelineGraphRuns.id],
+      name: "pipeline_graph_effect_attempts_run_fk",
+    }).onDelete("cascade"),
+    runRevisionCheck: check("pipeline_graph_effect_attempts_run_revision_check", sql`${table.runRevision} > 0`),
+    attemptCountCheck: check("pipeline_graph_effect_attempts_attempt_count_check", sql`${table.attemptCount} >= 0`),
+    payloadHashCheck: check("pipeline_graph_effect_attempts_payload_hash_check", sql`${table.payloadHash} ~ '^[0-9a-f]{64}$'`),
+    subjectHashCheck: check("pipeline_graph_effect_attempts_subject_hash_check", sql`${table.subjectHash} ~ '^[0-9a-f]{64}$'`),
+    requestHashCheck: check("pipeline_graph_effect_attempts_request_hash_check", sql`${table.requestHash} ~ '^[0-9a-f]{64}$'`),
+    statusCheck: check(
+      "pipeline_graph_effect_attempts_status_check",
+      sql`${table.status} in ('pending', 'executing', 'succeeded', 'failed', 'cancelled')`,
+    ),
+    requesterTypeCheck: check(
+      "pipeline_graph_effect_attempts_requested_by_type_check",
+      sql`${table.requestedByType} in ('user', 'agent')`,
+    ),
+    requesterIdentityCheck: check(
+      "pipeline_graph_effect_attempts_requested_by_identity_check",
+      sql`(
+        (${table.requestedByType} = 'user' and ${table.requestedByRunId} is null)
+        or (${table.requestedByType} = 'agent' and ${table.requestedByRunId} is not null)
+      )`,
+    ),
+    executorTypeCheck: check(
+      "pipeline_graph_effect_attempts_executor_type_check",
+      sql`${table.executorType} is null or ${table.executorType} in ('user', 'agent', 'system')`,
+    ),
+    lifecycleCheck: check(
+      "pipeline_graph_effect_attempts_lifecycle_check",
+      sql`(
+        (
+          ${table.status} = 'pending'
+          and ${table.executorType} is null and ${table.executorId} is null
+          and ${table.leaseToken} is null and ${table.claimedAt} is null
+          and ${table.claimExpiresAt} is null and ${table.finishedAt} is null
+        )
+        or (
+          ${table.status} = 'executing'
+          and ${table.executorType} is not null and ${table.executorId} is not null
+          and ${table.leaseToken} is not null and ${table.claimedAt} is not null
+          and ${table.claimExpiresAt} is not null and ${table.finishedAt} is null
+        )
+        or (
+          ${table.status} in ('succeeded', 'failed')
+          and ${table.executorType} is not null and ${table.executorId} is not null
+          and ${table.leaseToken} is null and ${table.claimedAt} is not null
+          and ${table.claimExpiresAt} is null and ${table.finishedAt} is not null
+        )
+        or (
+          ${table.status} = 'cancelled' and ${table.leaseToken} is null
+          and ${table.claimExpiresAt} is null and ${table.finishedAt} is not null
+        )
+      )`,
+    ),
+    resultCheck: check(
+      "pipeline_graph_effect_attempts_result_check",
+      sql`(
+        (${table.status} = 'succeeded' and ${table.providerReceipt} is not null and ${table.failureEvidence} is null)
+        or (${table.status} = 'failed' and ${table.providerReceipt} is null and ${table.failureEvidence} is not null)
+        or (${table.status} not in ('succeeded', 'failed') and ${table.providerReceipt} is null and ${table.failureEvidence} is null)
       )`,
     ),
   }),

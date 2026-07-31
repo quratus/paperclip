@@ -82,7 +82,31 @@ async function assertDefinitionTargets(
   dbOrTx: PipelineGraphDb,
   companyId: string,
   definition: PipelineGraphDefinitionInput,
+  actor: PipelineGraphVersionActor,
 ) {
+  for (const node of definition.nodes) {
+    const effectType = typeof node.config?.requiredEffectType === "string"
+      ? node.config.requiredEffectType.trim()
+      : "";
+    if (!effectType) continue;
+    if (
+      actor.type !== "user"
+      || effectType !== "github.merge"
+      || node.config?.requiredAuthorityClass !== "merge.exact_sha"
+      || node.config?.effectExecutorType !== "agent"
+      || node.config?.effectExecutorId !== node.config?.targetAgentId
+      || node.config?.effectExecutorKeyId !== "botinsky.github-merge.v1"
+      || !Array.isArray(node.config?.requiredEffectOutcomes)
+      || node.config.requiredEffectOutcomes.length !== 1
+      || node.config.requiredEffectOutcomes[0] !== "merged"
+    ) {
+      throw unprocessable("Pipeline graph effect policy is not kernel-authorized", {
+        code: "pipeline_graph_effect_policy_invalid",
+        nodeKey: node.key,
+        effectType,
+      });
+    }
+  }
   const targetAgentIds = [...new Set(definition.nodes.flatMap((node) => {
     const targetAgentId = node.config?.targetAgentId;
     if (targetAgentId === undefined) return [];
@@ -178,6 +202,7 @@ export function pipelineGraphVersionService(db: Db) {
             diagnostics: compiled.diagnostics,
           });
         }
+        await assertDefinitionTargets(tx, input.companyId, compiled.definition, input.actor);
         const existing = await tx
           .select()
           .from(pipelineGraphVersions)
@@ -302,6 +327,7 @@ export function pipelineGraphVersionService(db: Db) {
             code: "pipeline_graph_version_retired",
           });
         }
+        await assertDefinitionTargets(tx, input.companyId, selected.definition, input.actor);
         const currentActive = await tx
           .select({ id: pipelineGraphVersions.id })
           .from(pipelineGraphVersions)
@@ -408,7 +434,7 @@ export function pipelineGraphVersionService(db: Db) {
           sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-version:" + input.pipelineId}, 0))`,
         );
         await assertPipeline(tx, input.companyId, input.pipelineId);
-        await assertDefinitionTargets(tx, input.companyId, input.definition);
+        await assertDefinitionTargets(tx, input.companyId, input.definition, input.actor);
 
         const replay = await tx
           .select()

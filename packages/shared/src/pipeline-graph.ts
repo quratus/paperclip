@@ -1,5 +1,6 @@
 export const PIPELINE_GRAPH_SCHEMA_VERSION = 1 as const;
 export const PIPELINE_GRAPH_ASSIGNMENT_SCHEMA_VERSION = 1 as const;
+export const PIPELINE_GRAPH_EFFECT_REQUEST_SCHEMA_VERSION = 1 as const;
 
 export type PipelineGraphNodeKind = "working" | "review" | "done" | "cancelled";
 
@@ -83,6 +84,34 @@ export interface PipelineGraphAssignmentV1 {
     method: "POST";
     path: string;
     requiredFields: ["expectedRevision", "idempotencyKey", "outcome", "checkpoint"];
+  };
+}
+
+export type PipelineGraphEffectStatus =
+  | "pending"
+  | "executing"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface PipelineGraphEffectRequestV1 {
+  schemaVersion: typeof PIPELINE_GRAPH_EFFECT_REQUEST_SCHEMA_VERSION;
+  expectedRevision: number;
+  effectType: string;
+  targetRef: Record<string, unknown>;
+  payloadHash: string;
+  authorityReceipt: Record<string, unknown>;
+  executorAttestation: {
+    keyId: string;
+    controllerBuildId: string;
+    subjectHash: string;
+    action: "request";
+    actionHash: string;
+    signature: string;
+  };
+  idempotencyKey: string;
+  retryPolicy: {
+    maxAttempts: number;
   };
 }
 

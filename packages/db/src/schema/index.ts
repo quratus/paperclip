@@ -59,6 +59,7 @@ export {
   pipelineTransitions,
 } from "./pipelines.js";
 export {
+  pipelineGraphEffectAttempts,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
   pipelineGraphWakeOutbox,
