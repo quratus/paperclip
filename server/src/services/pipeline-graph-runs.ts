@@ -250,6 +250,31 @@ export function pipelineGraphRunService(
     cancelHeartbeatRun?: (runId: string, reason: string) => Promise<unknown>;
   } = {},
 ) {
+  async function cancelSupersededHeartbeatRuns(input: {
+    companyId: string;
+    graphRunId: string;
+    currentRevision: number;
+    actorRunId?: string | null;
+    reason: string;
+  }) {
+    if (!deps.cancelHeartbeatRun) return;
+    const runIds = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'pipelineGraphWake' = 'true'`,
+        sql`${heartbeatRuns.contextSnapshot} ->> 'graphRunId' = ${input.graphRunId}`,
+        sql`${heartbeatRuns.contextSnapshot} ->> 'graphRunRevision' is distinct from ${String(input.currentRevision)}`,
+        input.actorRunId ? sql`${heartbeatRuns.id} <> ${input.actorRunId}` : undefined,
+      ))
+      .then((rows) => rows.map((row) => row.id));
+    await Promise.all(runIds.map((runId) =>
+      deps.cancelHeartbeatRun!(runId, input.reason)
+    ));
+  }
+
   return {
     async start(input: {
       companyId: string;
@@ -488,7 +513,7 @@ export function pipelineGraphRunService(
         checkpoint: input.checkpoint,
         actor: actorEnvelope(input.actor),
       });
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + input.runId}, 0))`,
         );
@@ -596,6 +621,14 @@ export function pipelineGraphRunService(
           },
         };
       });
+      await cancelSupersededHeartbeatRuns({
+        companyId: input.companyId,
+        graphRunId: input.runId,
+        currentRevision: result.run.revision,
+        actorRunId: input.actor.type === "agent" ? input.actor.runId : null,
+        reason: `Cancelled because graph run ${input.runId} advanced to revision ${result.run.revision}`,
+      });
+      return result;
     },
 
     async transition(input: {
@@ -1095,6 +1128,13 @@ export function pipelineGraphRunService(
           committed: event!.payload,
         };
       });
+      await cancelSupersededHeartbeatRuns({
+        companyId: input.companyId,
+        graphRunId: input.runId,
+        currentRevision: result.run.revision,
+        actorRunId: null,
+        reason: `Cancelled because graph run ${input.runId} advanced to revision ${result.run.revision}`,
+      });
       if (automationLedgers.length > 0) {
         await pipelineService(db).executeTransitionAutomationLedgers(automationLedgers);
       }
@@ -1118,7 +1158,7 @@ export function pipelineGraphRunService(
         reason: input.reason,
         actor: actorEnvelope(input.actor),
       });
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:" + input.runId}, 0))`,
         );
@@ -1253,6 +1293,14 @@ export function pipelineGraphRunService(
         }
         return { changed: true as const, run: updated!, event: event! };
       });
+      await cancelSupersededHeartbeatRuns({
+        companyId: input.companyId,
+        graphRunId: input.runId,
+        currentRevision: result.run.revision,
+        actorRunId: null,
+        reason: `Cancelled because graph run ${input.runId} ${operation}d at revision ${result.run.revision}`,
+      });
+      return result;
     },
 
     async cancel(input: {
@@ -1774,6 +1822,13 @@ export function pipelineGraphRunService(
           traversedOutcomes: input.outcomes,
           wakeBehavior: derivedType === "wake_requested" ? "final_only" as const : "none" as const,
         };
+      });
+      await cancelSupersededHeartbeatRuns({
+        companyId: input.companyId,
+        graphRunId: input.runId,
+        currentRevision: result.run.revision,
+        actorRunId: null,
+        reason: `Cancelled because graph run ${input.runId} caught up to revision ${result.run.revision}`,
       });
       if (automationLedgers.length > 0) {
         await pipelineService(db).executeTransitionAutomationLedgers(automationLedgers);

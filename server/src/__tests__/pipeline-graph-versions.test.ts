@@ -2095,7 +2095,8 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       title: "Allowlisted responsibility",
       actor: { type: "user", userId: "board-user" },
     });
-    const runs = pipelineGraphRunService(db);
+    const cancelHeartbeatRun = vi.fn(async () => null);
+    const runs = pipelineGraphRunService(db, { cancelHeartbeatRun });
     const started = await runs.start({
       companyId: fixture.companyId,
       caseId: ingested.case.id,
@@ -2232,6 +2233,10 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       changed: true,
       run: { status: "succeeded", currentNodeKey: "done", revision: 5 },
     });
+    expect(cancelHeartbeatRun).toHaveBeenCalledWith(
+      boundAttempt!.id,
+      expect.stringContaining("advanced to revision 5"),
+    );
   });
 
   it("atomically wakes a configured entry-node owner when a graph run starts", async () => {
@@ -3075,5 +3080,68 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(denied.body.details).toMatchObject({
       code: "graph_control_operator_required",
     });
+  });
+
+  it("revokes an accepted graph wake synchronously when the graph revision pauses", async () => {
+    const fixture = await seedLinearPipeline();
+    const draft = await pipelineGraphVersionService(db).createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphVersionService(db).activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "pause-revokes-wake",
+      title: "Pause revokes wake",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [targetAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Revision target",
+      role: "engineer",
+    }).returning();
+    const started = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "pause-revokes-wake:start",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [acceptedHeartbeatRun] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgent!.id,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: started.run.revision,
+      },
+    }).returning();
+    const cancelHeartbeatRun = vi.fn(async () => null);
+    const paused = await pipelineGraphRunService(db, { cancelHeartbeatRun }).setPaused({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: started.run.revision,
+      idempotencyKey: "pause-revokes-wake:pause",
+      paused: true,
+      reason: "operator paused the graph",
+      actor: { type: "user", userId: "board-user" },
+    });
+
+    expect(paused.run).toMatchObject({ status: "paused", revision: 2 });
+    expect(cancelHeartbeatRun).toHaveBeenCalledOnce();
+    expect(cancelHeartbeatRun).toHaveBeenCalledWith(
+      acceptedHeartbeatRun!.id,
+      expect.stringContaining("paused at revision 2"),
+    );
   });
 });
