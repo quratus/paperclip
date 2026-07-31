@@ -3047,6 +3047,15 @@ function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot, null));
 }
 
+function isExplicitlyTargetedIssueInteractionWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  return (
+    readNonEmptyString(contextSnapshot?.wakeReason) === "issue_comment_mentioned" &&
+    Boolean(deriveCommentId(contextSnapshot, null))
+  );
+}
+
 async function listUnresolvedBlockerSummaries(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -10967,7 +10976,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
         ).returning({ id: issues.id });
-      if (issueLock.length === 0 && !allowsIssueInteractionWake(claimedContext)) {
+      if (issueLock.length === 0 && !isExplicitlyTargetedIssueInteractionWake(claimedContext)) {
         await cancelQueuedRunForStaleIssue(claimed, claimedIssueId, { stale: true, errorCode: "issue_execution_lock_changed", reason: "Cancelled because issue execution ownership changed before lock acquisition; the current owner remains responsible", details: { issueId: claimedIssueId, expectedAssigneeAgentId: claimed.agentId } });
         return null;
       }
@@ -11077,7 +11086,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const wakeCommentId = deriveCommentId(context, null);
-    const isInteractionWake = allowsIssueInteractionWake(context);
+    const isTargetedInteractionWake = isExplicitlyTargetedIssueInteractionWake(context);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
@@ -11121,7 +11130,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isCurrentReviewParticipant = reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
 
-    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake && !isCurrentReviewParticipant) {
+    if (
+      issue.assigneeAgentId !== run.agentId &&
+      !isTargetedInteractionWake &&
+      !isCurrentReviewParticipant
+    ) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -11174,7 +11187,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (currentParticipant) {
         const participantMatches =
           currentParticipant.type === "agent" && currentParticipant.agentId === run.agentId;
-        if (!participantMatches && !wakeCommentId) {
+        if (!participantMatches && !isTargetedInteractionWake) {
           return {
             stale: true,
             errorCode: "issue_review_participant_changed",

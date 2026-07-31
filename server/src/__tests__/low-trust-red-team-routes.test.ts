@@ -1236,6 +1236,9 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
         status: "succeeded",
         finishedAt: new Date("2026-05-14T12:02:00.000Z"),
       }).where(eq(heartbeatRuns.id, fixture.runs.standard.id));
+      await db.update(issues).set({
+        assigneeAgentId: fixture.agents.standard.id,
+      }).where(eq(issues.id, fixture.issues.reviewRoot.id));
 
       const run = await heartbeat.wakeup(fixture.agents.standard.id, {
         source: "automation",

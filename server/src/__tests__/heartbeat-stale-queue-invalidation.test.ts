@@ -258,7 +258,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     return { runId, wakeupRequestId };
   }
 
-  it("cancels a run reassigned after pre-claim validation but before execution-lock acquisition", async () => {
+  it.each(["issue_assigned", "issue_commented"] as const)(
+    "cancels a %s run reassigned after pre-claim validation but before execution-lock acquisition",
+    async (wakeReason) => {
     const { companyId, agentId: formerOwnerId } = await seedCompanyAndAgent({ agentName: "Former Owner" });
     const currentOwnerId = randomUUID();
     const issueId = randomUUID();
@@ -281,11 +283,15 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       priority: "high",
       assigneeAgentId: formerOwnerId,
     });
+    const wakeCommentId = randomUUID();
     const stale = await seedQueuedRun({
       companyId,
       agentId: formerOwnerId,
       issueId,
-      wakeReason: "issue_assigned",
+      wakeReason,
+      contextExtras: wakeReason === "issue_commented"
+        ? { commentId: wakeCommentId, wakeCommentId }
+        : undefined,
     });
     await db.execute(sql.raw(`
       CREATE FUNCTION paperclip_test_reassign_after_claim() RETURNS trigger AS $$
@@ -324,7 +330,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       resultJson: { stopReason: "issue_execution_lock_changed" },
     });
     expect(issue).toEqual({ assigneeAgentId: currentOwnerId, executionRunId: null });
-  });
+    },
+  );
 
   it("cancels a former owner's queued assignment run after reassignment before the current owner proceeds", async () => {
     const { companyId, agentId: formerOwnerId } = await seedCompanyAndAgent({ agentName: "Former Owner" });
@@ -1585,7 +1592,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
-  it("still runs comment-driven wakes on in_review issues even when the agent is no longer the current participant", async () => {
+  it("redirects comment-driven work away from a former in_review participant", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const otherAgentId = randomUUID();
     await db.insert(agents).values({
@@ -1651,7 +1658,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
         .then((rows) => rows[0] ?? null);
-      return run?.status === "succeeded";
+      return run?.status === "cancelled";
     });
 
     const run = await db
@@ -1659,8 +1666,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
-    expect(run?.status).toBe("succeeded");
-    expect(run?.errorCode).toBeNull();
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_review_participant_changed");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
   it("baseline: runs queued runs when the issue is in_progress with the same assignee", async () => {
