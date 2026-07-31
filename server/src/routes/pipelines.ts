@@ -92,6 +92,7 @@ import {
 import {
   decodePipelineGraphRunCursor,
   pipelineGraphRunService,
+  resolveGraphTransitionAssignmentAuthorization,
 } from "../services/pipeline-graph-runs.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { pipelineGraphEffectService } from "../services/pipeline-graph-effects.js";
@@ -1919,13 +1920,33 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
       const runId = z.string().uuid().safeParse(req.params.runId);
       if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
       const scope = await graphRunAccess(req, runId.data);
-      await assertPipelineWriteAccess(req, {
-        access,
-        companyId: scope.companyId,
-        pipelineId: scope.pipelineId,
-      });
       const actor = actorForMutation(req);
       if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      // A graph-assigned agent may commit its one allowed transition on the
+      // strength of that exact, currently-persisted assignment alone. This
+      // narrow predicate never trusts the request body as authority — it is
+      // re-derived from durable state and is re-verified transactionally by
+      // graphRuns.transition() itself. Anyone who does not satisfy it falls
+      // back to the pre-existing broad pipelines:write gate, unchanged.
+      const assignmentAuthorization = await resolveGraphTransitionAssignmentAuthorization(db, {
+        companyId: scope.companyId,
+        runId: runId.data,
+        expectedRevision: req.body.expectedRevision,
+        idempotencyKey: req.body.idempotencyKey,
+        outcome: req.body.outcome,
+        checkpoint: req.body.checkpoint,
+        leaseToken: req.body.leaseToken,
+        effectAttemptId: req.body.effectAttemptId,
+        reason: req.body.reason,
+        actor,
+      });
+      if (!assignmentAuthorization.authorized) {
+        await assertPipelineWriteAccess(req, {
+          access,
+          companyId: scope.companyId,
+          pipelineId: scope.pipelineId,
+        });
+      }
       res.json(await graphRuns.transition({
         companyId: scope.companyId,
         runId: runId.data,

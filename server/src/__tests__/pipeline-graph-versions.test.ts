@@ -8,6 +8,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   pipelineCases,
@@ -33,6 +34,7 @@ import {
   decodePipelineGraphRunCursor,
   graphReconciliationIssueStateHash,
   pipelineGraphRunService,
+  resolveGraphTransitionAssignmentAuthorization,
 } from "../services/pipeline-graph-runs.js";
 import { pipelineGraphOutboxService } from "../services/pipeline-graph-outbox.js";
 import {
@@ -62,6 +64,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(pipelineGraphWakeOutbox);
     await db.delete(pipelineGraphEffectAttempts);
@@ -2239,6 +2242,493 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     );
   });
 
+  async function seedRouteAuthorityFixture() {
+    const fixture = await seedLinearPipeline();
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId: fixture.companyId,
+      name: "Route-bound graph worker",
+      role: "engineer",
+    });
+    const [legacyAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Legacy-assigned but not graph-pinned",
+      role: "engineer",
+    }).returning();
+    const [reviewStage] = await db.insert(pipelineStages).values({
+      pipelineId: fixture.pipeline.id,
+      key: "review",
+      name: "Review",
+      kind: "review",
+      position: 150,
+      config: {
+        responsibilityOwner: "independent_reviewer",
+        dispatchEnabled: true,
+        targetAgentId,
+        requireApproval: false,
+        approveToStageKey: "done",
+        rejectToStageKey: "work",
+      },
+    }).returning();
+    await db.insert(pipelineTransitions).values([
+      {
+        pipelineId: fixture.pipeline.id,
+        fromStageId: fixture.stages.find((stage) => stage.key === "work")!.id,
+        toStageId: reviewStage!.id,
+        label: "review",
+      },
+      {
+        pipelineId: fixture.pipeline.id,
+        fromStageId: reviewStage!.id,
+        toStageId: fixture.stages.find((stage) => stage.key === "done")!.id,
+        label: "approve",
+      },
+    ]);
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: `route-authority-${randomUUID().slice(0, 8)}`,
+      title: "Route authority",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const started = await runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: `route-authority:start:${ingested.case.id}`,
+      actor: { type: "user", userId: "board-user" },
+    });
+    await runs.transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      idempotencyKey: `route-authority:review:${started.run.id}`,
+      outcome: "review",
+      checkpoint: { review_revision: 1 },
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [wake] = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id));
+    const graphAssignment = wake!.payload.graphAssignment as Record<string, unknown>;
+    return { fixture, versions, runs, targetAgentId, legacyAgent: legacyAgent!, started, graphAssignment };
+  }
+
+  type RouteActor =
+    | { type: "agent"; agentId: string; runId: string; companyId: string }
+    | { type: "board"; userId: string };
+
+  function buildPipelineRouteApp(db: ReturnType<typeof createDb>, actor: RouteActor) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = actor.type === "agent"
+        ? {
+          type: "agent",
+          agentId: actor.agentId,
+          companyId: actor.companyId,
+          runId: actor.runId,
+          source: "agent_key",
+        }
+        : { type: "board", userId: actor.userId, source: "local_implicit" };
+      next();
+    });
+    app.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    app.use(errorHandler);
+    return app;
+  }
+
+  it("lets a graph-assigned agent commit its exact transition through the route without pipelines:write, while every other binding fails closed", async () => {
+    const { fixture, targetAgentId, legacyAgent, started, graphAssignment } =
+      await seedRouteAuthorityFixture();
+
+    // A legacy-issue "assignee" that is not the current graph-pinned target
+    // agent must never gain transition authority from that stale projection.
+    const legacyIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: legacyIssueId,
+      companyId: fixture.companyId,
+      title: "Stale legacy assignment",
+      status: "in_review",
+      assigneeAgentId: legacyAgent.id,
+    });
+    const legacyApp = buildPipelineRouteApp(db, {
+      type: "agent",
+      agentId: legacyAgent.id,
+      companyId: fixture.companyId,
+      runId: randomUUID(),
+    });
+    const legacyAttempt = await request(legacyApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:legacy-agent",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(legacyAttempt.status).toBe(403);
+    expect(legacyAttempt.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // The exact pinned target agent, but with no heartbeat run bound to the
+    // assignment at all, must also fail closed.
+    const noHeartbeatApp = buildPipelineRouteApp(db, {
+      type: "agent",
+      agentId: targetAgentId,
+      companyId: fixture.companyId,
+      runId: randomUUID(),
+    });
+    const noHeartbeatAttempt = await request(noHeartbeatApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:no-heartbeat",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(noHeartbeatAttempt.status).toBe(403);
+    expect(noHeartbeatAttempt.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // Bind a real heartbeat run to the current assignment.
+    const [boundAttempt] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 2,
+        targetNodeKey: "review",
+        graphAssignment,
+      },
+    }).returning();
+    const boundApp = buildPipelineRouteApp(db, {
+      type: "agent",
+      agentId: targetAgentId,
+      companyId: fixture.companyId,
+      runId: boundAttempt!.id,
+    });
+
+    // A disallowed outcome fails closed even though identity and heartbeat
+    // binding both match.
+    const badOutcome = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:bad-outcome",
+        outcome: "not-an-edge",
+        checkpoint: { reviewed: true },
+      });
+    expect(badOutcome.status).toBe(403);
+    expect(badOutcome.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // A stale/foreign revision fails closed.
+    const staleRevision = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 99,
+        idempotencyKey: "route-authority:stale-revision",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(staleRevision.status).toBe(403);
+    expect(staleRevision.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // Exact current agent + exact bound heartbeat + allowed outcome commits,
+    // despite this agent never holding a pipelines:write grant.
+    const committed = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:approve",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(committed.status).toBe(200);
+    expect(committed.body).toMatchObject({
+      changed: true,
+      run: { status: "succeeded", currentNodeKey: "done", revision: 3 },
+    });
+
+    // Duplicate/replayed delivery of the exact same request commits at most
+    // once and returns the prior result — no second wake, no second mutation.
+    const replay = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:approve",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ changed: false });
+    expect(replay.body.committed).toEqual(committed.body.committed);
+    expect(await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id))).toHaveLength(1);
+
+    // The run is now terminal; the same agent cannot transition again.
+    const terminalAttempt = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:post-terminal",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(terminalAttempt.status).toBe(403);
+    expect(terminalAttempt.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // A cross-company caller cannot reach this run at all, regardless of grants.
+    const [otherCompany] = await db.insert(companies).values({
+      name: "Other Route Co",
+      issuePrefix: `X${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const crossCompanyApp = buildPipelineRouteApp(db, {
+      type: "agent",
+      agentId: targetAgentId,
+      companyId: otherCompany!.id,
+      runId: boundAttempt!.id,
+    });
+    const crossCompanyAttempt = await request(crossCompanyApp)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 2,
+        idempotencyKey: "route-authority:cross-company",
+        outcome: "approve",
+        checkpoint: { reviewed: true },
+      });
+    expect(crossCompanyAttempt.status).toBe(404);
+
+    // Human/operator behavior is completely unchanged: the board actor still
+    // goes through (and here satisfies) the pre-existing pipelines:write gate.
+    const boardApp = buildPipelineRouteApp(db, { type: "board", userId: "board-user" });
+    const secondCase = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "route-authority-human",
+      title: "Route authority human path",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const secondRun = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: secondCase.case.id,
+      idempotencyKey: "route-authority-human:start",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const humanTransition = await request(boardApp)
+      .post(`/api/graph-runs/${secondRun.run.id}/transitions`)
+      .send({
+        expectedRevision: 1,
+        idempotencyKey: "route-authority-human:complete",
+        outcome: "complete",
+        checkpoint: { proof: "reviewed" },
+      });
+    expect(humanTransition.status).toBe(200);
+    expect(humanTransition.body).toMatchObject({
+      changed: true,
+      run: { status: "succeeded", currentNodeKey: "done" },
+    });
+
+    // A board actor without any grant is still denied exactly as before.
+    const [ungrantedCompany] = await db.insert(companies).values({
+      name: "Ungranted Board Co",
+      issuePrefix: `U${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+    }).returning();
+    const ungrantedFixture = await seedLinearPipeline(ungrantedCompany!.id);
+    const ungrantedDraft = await pipelineGraphVersionService(db).createDraft({
+      companyId: ungrantedFixture.companyId,
+      pipelineId: ungrantedFixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "unprivileged-user" },
+    });
+    await pipelineGraphVersionService(db).activate({
+      companyId: ungrantedFixture.companyId,
+      pipelineId: ungrantedFixture.pipeline.id,
+      versionId: ungrantedDraft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "unprivileged-user" },
+    });
+    const ungrantedCase = await pipelineService(db).ingestCase({
+      companyId: ungrantedFixture.companyId,
+      pipelineId: ungrantedFixture.pipeline.id,
+      caseKey: "ungranted-case",
+      title: "Ungranted case",
+      actor: { type: "user", userId: "unprivileged-user" },
+    });
+    const ungrantedRun = await pipelineGraphRunService(db).start({
+      companyId: ungrantedFixture.companyId,
+      caseId: ungrantedCase.case.id,
+      idempotencyKey: "ungranted:start",
+      actor: { type: "user", userId: "unprivileged-user" },
+    });
+    const unprivilegedBoardApp = express();
+    unprivilegedBoardApp.use(express.json());
+    unprivilegedBoardApp.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "unprivileged-user",
+        source: "session",
+        companyIds: [ungrantedFixture.companyId],
+      };
+      next();
+    });
+    unprivilegedBoardApp.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    unprivilegedBoardApp.use(errorHandler);
+    const unprivilegedAttempt = await request(unprivilegedBoardApp)
+      .post(`/api/graph-runs/${ungrantedRun.run.id}/transitions`)
+      .send({
+        expectedRevision: 1,
+        idempotencyKey: "ungranted:complete",
+        outcome: "complete",
+        checkpoint: { proof: "reviewed" },
+      });
+    expect(unprivilegedAttempt.status).toBe(403);
+    expect(unprivilegedAttempt.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+  });
+
+  it("derives assignment_authorized only from durable state and never from the request body", async () => {
+    const { fixture, targetAgentId, started, graphAssignment } = await seedRouteAuthorityFixture();
+    const [boundAttempt] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 2,
+        targetNodeKey: "review",
+        graphAssignment,
+      },
+    }).returning();
+    const baseInput = {
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 2,
+      idempotencyKey: "predicate:base",
+      outcome: "approve",
+      checkpoint: { reviewed: true },
+      actor: { type: "agent" as const, agentId: targetAgentId, runId: boundAttempt!.id },
+    };
+
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, baseInput))
+      .resolves.toEqual({ authorized: true });
+
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      actor: { type: "user", userId: "board-user" },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_actor_not_agent" });
+
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:missing-run",
+      runId: randomUUID(),
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_not_found" });
+
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:wrong-company",
+      companyId: randomUUID(),
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_not_found" });
+
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:stale-revision",
+      expectedRevision: 99,
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_revision_conflict" });
+
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:bad-outcome",
+      outcome: "not-an-edge",
+    })).resolves.toMatchObject({ authorized: false, code: "graph_transition_not_allowed" });
+
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Other predicate agent",
+      role: "engineer",
+    }).returning();
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:wrong-agent",
+      actor: { type: "agent", agentId: otherAgent!.id, runId: boundAttempt!.id },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_agent_mismatch" });
+
+    const [staleHeartbeat] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 1,
+        targetNodeKey: "work",
+        graphAssignment: { ...graphAssignment, id: `${started.run.id}:1:work` },
+      },
+    }).returning();
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:stale-attempt",
+      actor: { type: "agent", agentId: targetAgentId, runId: staleHeartbeat!.id },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_attempt_mismatch" });
+
+    const [cancelledHeartbeat] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "cancelled",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 2,
+        targetNodeKey: "review",
+        graphAssignment,
+      },
+    }).returning();
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:cancelled-heartbeat",
+      actor: { type: "agent", agentId: targetAgentId, runId: cancelledHeartbeat!.id },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_attempt_mismatch" });
+
+    // Terminal run: commit the real transition first, then prove a further
+    // attempt against the now-succeeded run fails closed even naming the
+    // previously-valid revision.
+    const runsService = pipelineGraphRunService(db);
+    await runsService.transition(baseInput);
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      idempotencyKey: "predicate:terminal",
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_not_running" });
+
+    // Idempotent replay of the exact original committed request is
+    // authorized regardless of the run's now-advanced state.
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, baseInput))
+      .resolves.toEqual({ authorized: true });
+
+    // Replaying the same idempotency key with a materially different
+    // request is a conflict, not a silent allow.
+    await expect(resolveGraphTransitionAssignmentAuthorization(db, {
+      ...baseInput,
+      checkpoint: { reviewed: false },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_event_idempotency_conflict" });
+  });
+
   it("atomically wakes a configured entry-node owner when a graph run starts", async () => {
     const fixture = await seedLinearPipeline();
     const [targetAgent] = await db.insert(agents).values({
@@ -2483,7 +2973,9 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
         responsibilityOwner: "graph_owner",
       },
     });
-    const outbox = await db.select().from(pipelineGraphWakeOutbox);
+    const outbox = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id))
+      .orderBy(pipelineGraphWakeOutbox.createdAt);
     expect(outbox).toHaveLength(4);
     expect(outbox.at(-1)).toMatchObject({
       status: "pending",
