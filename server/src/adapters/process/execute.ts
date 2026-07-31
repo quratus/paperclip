@@ -5,6 +5,7 @@ import {
   asStringArray,
   parseObject,
   buildPaperclipEnv,
+  stringifyPaperclipWakePayload,
   buildInvocationEnvForLogs,
   ensurePathInEnv,
   resolveCommandForLogs,
@@ -48,9 +49,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     (typeof context.wakeCommentId === "string" && context.wakeCommentId.trim()) ||
     (typeof context.commentId === "string" && context.commentId.trim()) ||
     "";
+  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
   if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
   if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
+  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   if (authToken && !env.PAPERCLIP_API_KEY?.trim()) env.PAPERCLIP_API_KEY = authToken;
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const resolvedCommand = await resolveCommandForLogs(command, cwd, runtimeEnv);
