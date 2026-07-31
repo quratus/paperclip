@@ -137,6 +137,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { pipelineGraphRunService } from "./pipeline-graph-runs.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -14231,8 +14232,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        if (livenessRun.status === "failed" && livenessRun.errorCode === "capacity_exhausted" && issueId) {
-          await requeueCapacityExhaustedIssue(livenessRun, issueId);
+        if (livenessRun.status === "failed" && livenessRun.errorCode === "capacity_exhausted") {
+          if (issueId) {
+            await requeueCapacityExhaustedIssue(livenessRun, issueId);
+          } else {
+            await releaseIssueExecutionAndPromote(livenessRun);
+          }
+          // Clear the failed legacy execution lock before the graph emits the recovery wake.
+          // Otherwise the outbox consumer can assign the recovery owner and this finalizer can
+          // race behind it, erasing the new owner's lock with the old run's requeue cleanup.
+          await redirectCapacityExhaustedGraphHeartbeat(livenessRun, issueId);
         } else {
           await releaseIssueExecutionAndPromote(livenessRun);
         }
@@ -14665,21 +14674,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .select()
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.status === "done" || issue.status === "cancelled") return;
 
+      const ownsExecutionLock = issue.executionRunId === run.id;
+      const ownsCheckoutLock = issue.checkoutRunId === run.id;
+      if (!ownsExecutionLock && !ownsCheckoutLock) return;
+      const hasNewerOwner =
+        Boolean(issue.executionRunId && issue.executionRunId !== run.id)
+        || Boolean(issue.checkoutRunId && issue.checkoutRunId !== run.id);
       const now = new Date();
       await tx
         .update(issues)
         .set({
-          status: "todo",
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          checkoutRunId: null,
+          ...(!hasNewerOwner ? { status: "todo" as const } : {}),
+          ...(ownsExecutionLock
+            ? {
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+              }
+            : {}),
+          ...(ownsCheckoutLock ? { checkoutRunId: null } : {}),
           updatedAt: now,
         })
-        .where(eq(issues.id, issue.id));
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, run.companyId)));
+      if (hasNewerOwner) return;
 
       await tx.insert(issueComments).values({
         companyId: issue.companyId,
@@ -14695,6 +14716,121 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ].join("\n"),
       });
     });
+  }
+
+  async function redirectCapacityExhaustedGraphHeartbeat(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string | null,
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    const graphRunId = readNonEmptyString(context.graphRunId);
+    const targetNodeKey = readNonEmptyString(context.targetNodeKey);
+    const graphRunRevision = context.graphRunRevision;
+    const assignment = parseObject(context.graphAssignment);
+    const allowedOutcomes = Array.isArray(assignment.allowedOutcomes)
+      ? assignment.allowedOutcomes.filter((outcome): outcome is string => typeof outcome === "string")
+      : [];
+    if (
+      context.pipelineGraphWake !== true
+      || !graphRunId
+      || !targetNodeKey
+      || typeof graphRunRevision !== "number"
+      || !Number.isInteger(graphRunRevision)
+      || graphRunRevision < 1
+      || assignment.id !== `${graphRunId}:${graphRunRevision}:${targetNodeKey}`
+      || !allowedOutcomes.includes("capacity_unavailable")
+    ) {
+      return false;
+    }
+
+    const graphRun = await db
+      .select({
+        status: pipelineGraphRuns.status,
+        revision: pipelineGraphRuns.revision,
+        currentNodeKey: pipelineGraphRuns.currentNodeKey,
+        checkpoint: pipelineGraphRuns.checkpoint,
+        definition: pipelineGraphVersions.definition,
+      })
+      .from(pipelineGraphRuns)
+      .innerJoin(
+        pipelineGraphVersions,
+        and(
+          eq(pipelineGraphVersions.companyId, pipelineGraphRuns.companyId),
+          eq(pipelineGraphVersions.pipelineId, pipelineGraphRuns.pipelineId),
+          eq(pipelineGraphVersions.id, pipelineGraphRuns.graphVersionId),
+        ),
+      )
+      .where(and(
+        eq(pipelineGraphRuns.companyId, run.companyId),
+        eq(pipelineGraphRuns.id, graphRunId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (
+      !graphRun
+      || graphRun.status !== "running"
+      || graphRun.revision !== graphRunRevision
+      || graphRun.currentNodeKey !== targetNodeKey
+    ) {
+      return false;
+    }
+
+    const capacityEdge = graphRun.definition.edges.find((edge) =>
+      edge.fromNodeKey === targetNodeKey && edge.outcome === "capacity_unavailable");
+    const recoveryNode = capacityEdge
+      ? graphRun.definition.nodes.find((node) => node.key === capacityEdge.toNodeKey)
+      : null;
+    if (!recoveryNode) return false;
+    const recoveryConfig = parseObject(recoveryNode.config);
+    const recoveryOwner = readNonEmptyString(recoveryConfig.responsibilityOwner) ?? recoveryNode.key;
+    const recoveryAgentId = readNonEmptyString(recoveryConfig.targetAgentId);
+    const checkpoint = parseObject(graphRun.checkpoint);
+    const reviewRevision = asNumber(checkpoint.review_revision, 0);
+    try {
+      await pipelineGraphRunService(db, {
+        cancelHeartbeatRun: (runId, reason) => cancelRunInternal(runId, reason),
+      }).transition({
+        companyId: run.companyId,
+        runId: graphRunId,
+        expectedRevision: graphRunRevision,
+        idempotencyKey: `capacity-exhausted:${run.id}`,
+        outcome: "capacity_unavailable",
+        checkpoint: {
+          ...checkpoint,
+          review_revision: Math.max(0, Math.floor(reviewRevision)) + 1,
+          capacityFailure: {
+            heartbeatRunId: run.id,
+            failedAgentId: run.agentId,
+            issueId,
+            errorCode: run.errorCode,
+            responsibleOwner: recoveryOwner,
+            recoveryAgentId,
+            nextAction: `Restore runner capacity or redirect this graph responsibility to an available qualified agent; ${recoveryOwner} owns the next action.`,
+          },
+        },
+        reason: `Heartbeat ${run.id} could not execute because agent capacity was unavailable; responsibility redirected to capacity recovery.`,
+        actor: { type: "agent", agentId: run.agentId, runId: run.id },
+      });
+      return true;
+    } catch (error) {
+      const code = error instanceof HttpError
+        ? readNonEmptyString(parseObject(error.details).code)
+        : null;
+      if (
+        error instanceof HttpError
+        && ["graph_run_revision_conflict", "graph_run_not_running", "graph_assignment_attempt_mismatch"].includes(code ?? "")
+      ) {
+        logger.info(
+          { runId: run.id, graphRunId, graphRunRevision, code },
+          "capacity graph redirection became stale before it could commit",
+        );
+        return false;
+      }
+      logger.warn(
+        { err: error, runId: run.id, graphRunId, graphRunRevision },
+        "failed to redirect capacity-exhausted graph heartbeat",
+      );
+      return false;
+    }
   }
 
   async function releaseIssueExecutionAndPromote(

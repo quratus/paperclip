@@ -17,6 +17,7 @@ import {
   pipelineCases,
   pipelineGraphRuns,
   pipelineGraphVersions,
+  pipelineGraphWakeOutbox,
   pipelineStages,
   pipelines,
 } from "@paperclipai/db";
@@ -1759,6 +1760,204 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .then((rows) => rows[0] ?? null);
     expect(run).toMatchObject({ status: "succeeded", errorCode: null });
     expect(countExecuteCallsForRun(runId)).toBe(1);
+  }, 10_000);
+
+  it("redirects a capacity-exhausted graph assignment to its recovery owner", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const recoveryAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: recoveryAgentId,
+      companyId,
+      name: "CapacityRecoveryOwner",
+      role: "operations",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId,
+      key: `capacity-graph-${randomUUID()}`,
+      name: "Capacity-aware work",
+    }).returning();
+    const [implementStage] = await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "implement",
+      name: "Implement",
+      kind: "working",
+      position: 100,
+    }).returning();
+    await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "capacity_recovery",
+      name: "Capacity recovery",
+      kind: "working",
+      position: 200,
+    });
+    const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      version: 1,
+      definitionHash: "b".repeat(64),
+      schemaVersion: 1,
+      definition: {
+        schemaVersion: 1,
+        entryNodeKey: "implement",
+        nodes: [
+          {
+            key: "implement",
+            kind: "working",
+            name: "Implement",
+            config: {
+              dispatchEnabled: true,
+              targetAgentId: agentId,
+              responsibilityOwner: "implementer",
+            },
+          },
+          {
+            key: "capacity_recovery",
+            kind: "working",
+            name: "Capacity recovery",
+            config: {
+              dispatchEnabled: true,
+              targetAgentId: recoveryAgentId,
+              responsibilityOwner: "capacity_recovery_owner",
+            },
+          },
+        ],
+        edges: [{
+          fromNodeKey: "implement",
+          toNodeKey: "capacity_recovery",
+          outcome: "capacity_unavailable",
+        }],
+        cycleContracts: [],
+      },
+      status: "active",
+      createdByType: "user",
+      createdById: "board-user",
+      activatedByType: "user",
+      activatedById: "board-user",
+      activatedAt: new Date(),
+    }).returning();
+    const [pipelineCase] = await db.insert(pipelineCases).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      stageId: implementStage!.id,
+      caseKey: `capacity-case-${randomUUID()}`,
+      title: "Capacity redirect canary",
+    }).returning();
+    const [graphRun] = await db.insert(pipelineGraphRuns).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      caseId: pipelineCase!.id,
+      startIdempotencyKey: `start-${randomUUID()}`,
+      status: "running",
+      currentNodeKey: "implement",
+      checkpoint: { review_revision: 4, evidence: "preserved" },
+      revision: 5,
+      startedByType: "user",
+      startedById: "board-user",
+    }).returning();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Redirect capacity instead of refusing",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId,
+      caseId: pipelineCase!.id,
+      issueId,
+      role: "work",
+    });
+    const graphAssignment = {
+      schemaVersion: 1,
+      id: `${graphRun!.id}:${graphRun!.revision}:implement`,
+      graphVersionId: graphVersion!.id,
+      runId: graphRun!.id,
+      runRevision: graphRun!.revision,
+      caseId: pipelineCase!.id,
+      nodeKey: "implement",
+      nodeKind: "working",
+      responsibilityOwner: "implementer",
+      targetAgentId: agentId,
+      instruction: null,
+      acceptanceCriteria: [],
+      allowedOutcomes: ["capacity_unavailable"],
+      completion: {
+        method: "POST",
+        path: `/api/graph-runs/${graphRun!.id}/transitions`,
+        requiredFields: ["expectedRevision", "idempotencyKey", "outcome", "checkpoint"],
+      },
+    };
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "pipeline_graph_wake",
+      invocationSource: "automation",
+      contextExtras: {
+        pipelineGraphWake: true,
+        graphRunId: graphRun!.id,
+        graphRunRevision: graphRun!.revision,
+        pipelineCaseId: pipelineCase!.id,
+        targetNodeKey: "implement",
+        graphAssignment,
+      },
+    });
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 75,
+      signal: null,
+      timedOut: false,
+      errorCode: "capacity_exhausted",
+      errorMessage: "Temporary capacity unavailable",
+      resultJson: { stdout: "", stderr: "" },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await waitForCondition(async () => {
+      const current = await db.select({
+        revision: pipelineGraphRuns.revision,
+        currentNodeKey: pipelineGraphRuns.currentNodeKey,
+      }).from(pipelineGraphRuns).where(eq(pipelineGraphRuns.id, graphRun!.id))
+        .then((rows) => rows[0] ?? null);
+      return current?.revision === 6 && current.currentNodeKey === "capacity_recovery";
+    }, 5_000)).toBe(true);
+    const [failedRun, redirectedGraph, recoveryWake] = await Promise.all([
+      db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null),
+      db.select({ checkpoint: pipelineGraphRuns.checkpoint })
+        .from(pipelineGraphRuns).where(eq(pipelineGraphRuns.id, graphRun!.id)).then((rows) => rows[0] ?? null),
+      db.select({ targetNodeKey: pipelineGraphWakeOutbox.targetNodeKey, payload: pipelineGraphWakeOutbox.payload })
+        .from(pipelineGraphWakeOutbox).where(eq(pipelineGraphWakeOutbox.runId, graphRun!.id))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "capacity_exhausted" });
+    expect(redirectedGraph?.checkpoint).toMatchObject({
+      review_revision: 5,
+      evidence: "preserved",
+      capacityFailure: {
+        heartbeatRunId: runId,
+        failedAgentId: agentId,
+        issueId,
+        errorCode: "capacity_exhausted",
+        responsibleOwner: "capacity_recovery_owner",
+      },
+    });
+    expect(recoveryWake).toMatchObject({
+      targetNodeKey: "capacity_recovery",
+      payload: {
+        targetAgentId: recoveryAgentId,
+        responsibilityOwner: "capacity_recovery_owner",
+      },
+    });
   }, 10_000);
 
   it("redirects comment-driven work away from a former in_review participant", async () => {
