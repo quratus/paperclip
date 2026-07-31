@@ -7674,6 +7674,98 @@ export function issueService(db: Db) {
         };
       }),
 
+    // SQN-4980: force-reconcile orphaned run ownership. Unlike adminForceRelease
+    // (which resets the issue to todo and can drop the assignee), this clears
+    // ONLY the run pointers that reference a terminal/missing heartbeat run and
+    // preserves the assignee and status, so a completed-but-stranded issue can
+    // reach its terminal state. A pointer that still references a live run is
+    // left intact (a live competing run cannot be reconciled away). The route
+    // layer owns the authority check; this method writes the audit comment.
+    forceReconcileRunOwnership: async (
+      id: string,
+      actor: { runId: string | null; label: string },
+    ) =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
+        );
+        const existing = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+
+        const checkoutOrphaned = existing.checkoutRunId
+          ? await isTerminalOrMissingHeartbeatRun(existing.checkoutRunId, tx)
+          : false;
+        const executionOrphaned = existing.executionRunId
+          ? await isTerminalOrMissingHeartbeatRun(existing.executionRunId, tx)
+          : false;
+
+        let updatedRow = existing;
+        if (checkoutOrphaned || executionOrphaned) {
+          const patch: Partial<typeof issues.$inferInsert> = { updatedAt: new Date() };
+          if (checkoutOrphaned) patch.checkoutRunId = null;
+          if (executionOrphaned) {
+            patch.executionRunId = null;
+            patch.executionAgentNameKey = null;
+            patch.executionLockedAt = null;
+          }
+          updatedRow = await tx
+            .update(issues)
+            .set(patch)
+            .where(eq(issues.id, id))
+            .returning()
+            .then((rows) => rows[0] ?? existing);
+        }
+
+        const clearedParts = [
+          ...(checkoutOrphaned ? ["checkoutRunId"] : []),
+          ...(executionOrphaned ? ["executionRunId"] : []),
+        ];
+        const auditBody = clearedParts.length
+          ? `Reconciled stale run ownership: cleared orphaned ${clearedParts.join(" and ")} (dead run pointers) so this issue can transition at closeout. Assignee and status were preserved.`
+          : "Run-ownership reconcile requested, but no orphaned pointers were found (all run references are still live). No change was made.";
+
+        await tx.insert(issueComments).values({
+          companyId: existing.companyId,
+          issueId: id,
+          authorType: "system",
+          createdByRunId: actor.runId ?? null,
+          body: [
+            auditBody,
+            "",
+            `Reconciled by: ${actor.label}.`,
+            `Previous checkoutRunId: ${existing.checkoutRunId ?? "null"}.`,
+            `Previous executionRunId: ${existing.executionRunId ?? "null"}.`,
+          ].join("\n"),
+          metadata: {
+            version: 1,
+            sections: [{
+              title: "Run ownership reconcile",
+              rows: [
+                { type: "key_value", label: "Cleared checkoutRunId", value: String(checkoutOrphaned) },
+                { type: "key_value", label: "Cleared executionRunId", value: String(executionOrphaned) },
+              ],
+            }],
+          },
+        });
+
+        const [enriched] = await withIssueLabels(tx, [updatedRow]);
+        return {
+          issue: enriched,
+          previous: {
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          },
+          reconciled: {
+            checkoutRunId: checkoutOrphaned,
+            executionRunId: executionOrphaned,
+          },
+        };
+      }),
+
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),
 
