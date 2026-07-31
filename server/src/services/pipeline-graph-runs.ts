@@ -5,6 +5,7 @@ import {
   heartbeatRuns,
   issues,
   pipelineCases,
+  pipelineGraphEffectAttempts,
   pipelineAutomationExecutions,
   pipelineCaseIssueLinks,
   pipelineGraphRunEvents,
@@ -605,6 +606,7 @@ export function pipelineGraphRunService(
       outcome: string;
       checkpoint: Record<string, unknown>;
       leaseToken?: string | null;
+      effectAttemptId?: string | null;
       reason?: string | null;
       actor: PipelineGraphVersionActor;
     }) {
@@ -615,6 +617,7 @@ export function pipelineGraphRunService(
         outcome: input.outcome,
         checkpoint: input.checkpoint,
         leaseToken: input.leaseToken ?? null,
+        effectAttemptId: input.effectAttemptId ?? null,
         reason: input.reason ?? null,
         actor: actorEnvelope(input.actor),
       });
@@ -721,6 +724,73 @@ export function pipelineGraphRunService(
             code: "graph_run_node_missing",
             currentNodeKey: run.currentNodeKey,
           });
+        }
+        const requiredEffectType =
+          typeof currentNode.config.requiredEffectType === "string"
+            ? currentNode.config.requiredEffectType.trim()
+            : "";
+        const requiredEffectOutcomes = Array.isArray(currentNode.config.requiredEffectOutcomes)
+          ? currentNode.config.requiredEffectOutcomes.filter(
+              (outcome): outcome is string => typeof outcome === "string" && outcome.trim() !== "",
+            )
+          : [];
+        const effectRequiredForOutcome = Boolean(requiredEffectType)
+          && (
+            requiredEffectOutcomes.length === 0
+            || requiredEffectOutcomes.includes(input.outcome)
+          );
+        let effectReceipt: {
+          effectAttemptId: string;
+          effectType: string;
+          subjectHash: string;
+          providerReceipt: Record<string, unknown>;
+        } | null = null;
+        if (input.effectAttemptId || effectRequiredForOutcome) {
+          if (!input.effectAttemptId) {
+            throw unprocessable("This graph node requires a durable effect receipt before transition", {
+              code: "graph_effect_receipt_required",
+              requiredEffectType,
+            });
+          }
+          const effect = await tx
+            .select()
+            .from(pipelineGraphEffectAttempts)
+            .where(and(
+              eq(pipelineGraphEffectAttempts.companyId, input.companyId),
+              eq(pipelineGraphEffectAttempts.id, input.effectAttemptId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (
+            !effect
+            || effect.runId !== run.id
+            || effect.nodeKey !== run.currentNodeKey
+            || effect.runRevision !== run.revision
+          ) {
+            throw forbidden("Effect receipt is not bound to the current graph node revision", {
+              code: "graph_effect_binding_mismatch",
+              effectAttemptId: input.effectAttemptId,
+            });
+          }
+          if (requiredEffectType && effect.effectType !== requiredEffectType) {
+            throw unprocessable("Effect receipt has the wrong effect type", {
+              code: "graph_effect_type_mismatch",
+              requiredEffectType,
+              effectType: effect.effectType,
+            });
+          }
+          if (effect.status !== "succeeded" || !effect.providerReceipt) {
+            throw conflict("Effect has not committed a durable provider receipt", {
+              code: "graph_effect_not_succeeded",
+              effectAttemptId: effect.id,
+              status: effect.status,
+            });
+          }
+          effectReceipt = {
+            effectAttemptId: effect.id,
+            effectType: effect.effectType,
+            subjectHash: effect.subjectHash,
+            providerReceipt: effect.providerReceipt,
+          };
         }
         const assignedAgentId =
           typeof currentNode.config.targetAgentId === "string"
@@ -963,6 +1033,7 @@ export function pipelineGraphRunService(
               toNodeKey: targetNode.key,
               status: updated!.status,
               caseVersion: caseTransition.case.version,
+              ...(effectReceipt ? { effectReceipt } : {}),
             },
           })
           .returning();

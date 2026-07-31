@@ -19,6 +19,7 @@ import {
   pipelineCases,
   pipelineDocuments,
   pipelineGraphRuns,
+  pipelineGraphEffectAttempts,
   pipelineStages,
   pipelineTransitions,
   pipelines,
@@ -70,6 +71,7 @@ import {
   type PipelineCaseLiveness,
   type PipelineHealthFailedAutomationInput,
   type PipelineHealthStageInput,
+  PIPELINE_GRAPH_EFFECT_REQUEST_SCHEMA_VERSION,
 } from "@paperclipai/shared";
 import { documentAnnotationService } from "../services/document-annotations.js";
 import { logActivity } from "../services/activity-log.js";
@@ -92,6 +94,7 @@ import {
   pipelineGraphRunService,
 } from "../services/pipeline-graph-runs.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { pipelineGraphEffectService } from "../services/pipeline-graph-effects.js";
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
 const STAGE_INSTRUCTIONS_PREFIX = "stage-instructions:";
@@ -183,6 +186,64 @@ const startGraphRunSchema = z.object({
   idempotencyKey: z.string().trim().min(1).max(512),
   checkpoint: jsonObjectSchema.optional(),
 }).strict();
+const requestGraphEffectSchema = z.object({
+  schemaVersion: z.literal(PIPELINE_GRAPH_EFFECT_REQUEST_SCHEMA_VERSION),
+  expectedRevision: z.number().int().positive(),
+  effectType: z.string().trim().min(1).max(120),
+  targetRef: jsonObjectSchema,
+  payloadHash: z.string().regex(/^[0-9a-f]{64}$/),
+  authorityReceipt: jsonObjectSchema,
+  executorAttestation: z.object({
+    keyId: z.string().trim().min(1).max(120),
+    controllerBuildId: z.string().regex(/^git:[0-9a-f]{40}$/),
+    subjectHash: z.string().regex(/^[0-9a-f]{64}$/),
+    action: z.literal("request"),
+    actionHash: z.string().regex(/^[0-9a-f]{64}$/),
+    signature: z.string().min(40).max(1_024),
+  }).strict(),
+  idempotencyKey: z.string().trim().min(1).max(512),
+  retryPolicy: z.object({ maxAttempts: z.number().int().min(1).max(10) }).strict(),
+}).strict();
+const claimGraphEffectSchema = z.object({
+  leaseSeconds: z.number().int().min(5).max(900).default(120),
+  retryReconciliation: z.object({
+    subjectHash: z.string().regex(/^[0-9a-f]{64}$/),
+    outcome: z.enum(["not_applied", "applied"]),
+    checkedAt: z.string().datetime(),
+  }).strict().optional(),
+  executorAttestation: z.object({
+    keyId: z.string().trim().min(1).max(120),
+    controllerBuildId: z.string().regex(/^git:[0-9a-f]{40}$/),
+    subjectHash: z.string().regex(/^[0-9a-f]{64}$/),
+    action: z.literal("claim"),
+    actionHash: z.string().regex(/^[0-9a-f]{64}$/),
+    signature: z.string().min(40).max(1_024),
+  }).strict(),
+}).strict();
+const completeGraphEffectSchema = z.object({
+  leaseToken: z.string().uuid(),
+  providerReceipt: jsonObjectSchema,
+  executorAttestation: z.object({
+    keyId: z.string().trim().min(1).max(120),
+    controllerBuildId: z.string().regex(/^git:[0-9a-f]{40}$/),
+    subjectHash: z.string().regex(/^[0-9a-f]{64}$/),
+    action: z.literal("complete"),
+    actionHash: z.string().regex(/^[0-9a-f]{64}$/),
+    signature: z.string().min(40).max(1_024),
+  }).strict(),
+}).strict();
+const failGraphEffectSchema = z.object({
+  leaseToken: z.string().uuid(),
+  failureEvidence: jsonObjectSchema,
+  executorAttestation: z.object({
+    keyId: z.string().trim().min(1).max(120),
+    controllerBuildId: z.string().regex(/^git:[0-9a-f]{40}$/),
+    subjectHash: z.string().regex(/^[0-9a-f]{64}$/),
+    action: z.literal("fail"),
+    actionHash: z.string().regex(/^[0-9a-f]{64}$/),
+    signature: z.string().min(40).max(1_024),
+  }).strict(),
+}).strict();
 const checkpointGraphRunSchema = z.object({
   expectedRevision: z.number().int().positive(),
   idempotencyKey: z.string().trim().min(1).max(512),
@@ -194,6 +255,7 @@ const transitionGraphRunSchema = z.object({
   outcome: z.string().trim().min(1).max(120),
   checkpoint: jsonObjectSchema,
   leaseToken: z.string().uuid().nullable().optional(),
+  effectAttemptId: z.string().uuid().nullable().optional(),
   reason: z.string().trim().min(1).max(2_000).nullable().optional(),
 }).strict();
 const graphRunLifecycleSchema = z.object({
@@ -928,6 +990,7 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
       suppressImmediateRecovery: true,
     }),
   });
+  const graphEffects = pipelineGraphEffectService(db);
   const outputsSvc = pipelineCaseOutputsService(db);
   const access = accessService(db);
   const issuesSvc = issueService(db);
@@ -1747,6 +1810,20 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
     return row;
   }
 
+  async function graphEffectAccess(req: Request, effectAttemptId: string) {
+    const row = await db
+      .select({
+        companyId: pipelineGraphEffectAttempts.companyId,
+        runId: pipelineGraphEffectAttempts.runId,
+      })
+      .from(pipelineGraphEffectAttempts)
+      .where(eq(pipelineGraphEffectAttempts.id, effectAttemptId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) throw notFound("Effect attempt not found");
+    const runScope = await graphRunAccess(req, row.runId);
+    return { ...row, pipelineId: runScope.pipelineId };
+  }
+
   router.get("/graph-runs/:runId", async (req, res) => {
     const runId = z.string().uuid().safeParse(req.params.runId);
     if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
@@ -1857,11 +1934,121 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
         outcome: req.body.outcome,
         checkpoint: req.body.checkpoint,
         leaseToken: req.body.leaseToken,
+        effectAttemptId: req.body.effectAttemptId,
         reason: req.body.reason,
         actor,
       }));
     },
   );
+
+  router.post(
+    "/graph-runs/:runId/effect-attempts",
+    validate(requestGraphEffectSchema),
+    async (req, res) => {
+      const runId = z.string().uuid().safeParse(req.params.runId);
+      if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
+      const scope = await graphRunAccess(req, runId.data);
+      await assertPipelineWriteAccess(req, {
+        access,
+        companyId: scope.companyId,
+        pipelineId: scope.pipelineId,
+      });
+      const actor = actorForMutation(req);
+      if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      const result = await graphEffects.request({
+        companyId: scope.companyId,
+        runId: runId.data,
+        ...req.body,
+        actor,
+      });
+      if (result.created) {
+        res.location(`/api/effect-attempts/${result.effectAttempt.id}`);
+      }
+      res.status(result.created ? 201 : 200).json(result);
+    },
+  );
+
+  router.get("/effect-attempts/:effectAttemptId", async (req, res) => {
+    const effectAttemptId = z.string().uuid().safeParse(req.params.effectAttemptId);
+    if (!effectAttemptId.success) throw badRequest("Invalid effect attempt id", { code: "validation" });
+    const scope = await graphEffectAccess(req, effectAttemptId.data);
+    res.json(await graphEffects.get({
+      companyId: scope.companyId,
+      effectAttemptId: effectAttemptId.data,
+    }));
+  });
+
+  router.post(
+    "/effect-attempts/:effectAttemptId/claim",
+    validate(claimGraphEffectSchema),
+    async (req, res) => {
+      const effectAttemptId = z.string().uuid().safeParse(req.params.effectAttemptId);
+      if (!effectAttemptId.success) throw badRequest("Invalid effect attempt id", { code: "validation" });
+      const scope = await graphEffectAccess(req, effectAttemptId.data);
+      await assertPipelineWriteAccess(req, {
+        access,
+        companyId: scope.companyId,
+        pipelineId: scope.pipelineId,
+      });
+      const actor = actorForMutation(req);
+      res.json(await graphEffects.claim({
+        companyId: scope.companyId,
+        effectAttemptId: effectAttemptId.data,
+        executorType: actor.type,
+        executorId: actor.type === "system"
+          ? "system"
+          : actor.type === "user" ? actor.userId : actor.agentId,
+        leaseSeconds: req.body.leaseSeconds,
+        retryReconciliation: req.body.retryReconciliation,
+        executorAttestation: req.body.executorAttestation,
+      }));
+    },
+  );
+
+  for (const [path, schema, outcome] of [
+    ["complete", completeGraphEffectSchema, "complete"],
+    ["fail", failGraphEffectSchema, "fail"],
+  ] as const) {
+    router.post(
+      `/effect-attempts/:effectAttemptId/${path}`,
+      validate(schema),
+      async (req, res) => {
+        const effectAttemptId = z.string().uuid().safeParse(req.params.effectAttemptId);
+        if (!effectAttemptId.success) throw badRequest("Invalid effect attempt id", { code: "validation" });
+        const scope = await graphEffectAccess(req, effectAttemptId.data);
+        await assertPipelineWriteAccess(req, {
+          access,
+          companyId: scope.companyId,
+          pipelineId: scope.pipelineId,
+        });
+        const actor = actorForMutation(req);
+        const executor = {
+          executorType: actor.type,
+          executorId: actor.type === "system"
+            ? "system"
+            : actor.type === "user" ? actor.userId : actor.agentId,
+        };
+        const result = outcome === "complete"
+          ? await graphEffects.complete({
+            companyId: scope.companyId,
+            effectAttemptId: effectAttemptId.data,
+            leaseToken: req.body.leaseToken,
+            providerReceipt: req.body.providerReceipt,
+            executorAttestation: req.body.executorAttestation,
+            ...executor,
+          })
+          : await graphEffects.fail({
+            companyId: scope.companyId,
+            effectAttemptId: effectAttemptId.data,
+            leaseToken: req.body.leaseToken,
+            failureEvidence: req.body.failureEvidence,
+            executorAttestation: req.body.executorAttestation,
+            ...executor,
+          });
+        res.json(result);
+      },
+    );
+  }
 
   router.post(
     "/graph-runs/:runId/catch-up",

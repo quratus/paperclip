@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
@@ -14,6 +14,7 @@ import {
   pipelineCaseIssueLinks,
   pipelineCaseEvents,
   pipelineGraphAdoptions,
+  pipelineGraphEffectAttempts,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
   pipelineGraphWakeOutbox,
@@ -34,6 +35,13 @@ import {
   pipelineGraphRunService,
 } from "../services/pipeline-graph-runs.js";
 import { pipelineGraphOutboxService } from "../services/pipeline-graph-outbox.js";
+import {
+  pipelineGraphEffectService,
+  pipelineGraphEffectActionHash,
+  pipelineGraphExecutorAttestationMessage,
+  pipelineGraphEffectSubjectHash,
+  pipelineGraphEffectTargetRefHash,
+} from "../services/pipeline-graph-effects.js";
 import { pipelineService } from "../services/pipelines.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -56,6 +64,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(pipelineGraphWakeOutbox);
+    await db.delete(pipelineGraphEffectAttempts);
     await db.delete(pipelineGraphRunEvents);
     await db.delete(pipelineGraphRuns);
     await db.delete(pipelineCaseIssueLinks);
@@ -1175,6 +1184,467 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       [1, "run_started", { attempt: 0 }],
       [2, "checkpoint_saved", { attempt: 1, proof: "reviewed" }],
     ]);
+  });
+
+  it("executes one exact-subject effect and fences graph transition on its durable receipt", async () => {
+    const fixture = await seedLinearPipeline();
+    const [effectExecutor] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Trusted effect executor",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    await db
+      .update(pipelineTransitions)
+      .set({ label: "merged" })
+      .where(eq(pipelineTransitions.pipelineId, fixture.pipeline.id));
+    const [cancelledStage] = await db.insert(pipelineStages).values({
+      pipelineId: fixture.pipeline.id,
+      key: "cancelled",
+      name: "Cancelled",
+      kind: "cancelled",
+      position: 300,
+    }).returning();
+    await db.insert(pipelineTransitions).values({
+      pipelineId: fixture.pipeline.id,
+      fromStageId: fixture.stages.find((stage) => stage.key === "work")!.id,
+      toStageId: cancelledStage!.id,
+      label: "head_changed",
+    });
+    const keyId = "botinsky.github-merge.v1";
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    process.env.PAPERCLIP_EFFECT_EXECUTOR_KEYS_JSON = JSON.stringify({
+      [keyId]: {
+        publicKey: publicKey.export({ type: "spki", format: "pem" }).toString(),
+        controllerBuildIds: [`git:${"e".repeat(40)}`],
+      },
+    });
+    const attest = (
+      action: "request" | "claim" | "complete" | "fail",
+      subjectHash: string,
+      actionHash: string,
+    ) => {
+      const body = {
+        keyId,
+        controllerBuildId: `git:${"e".repeat(40)}`,
+        subjectHash,
+        action,
+        actionHash,
+      };
+      return {
+        ...body,
+        signature: sign(
+          null,
+          Buffer.from(pipelineGraphExecutorAttestationMessage(body)),
+          privateKey,
+        ).toString("base64"),
+      };
+    };
+    await db
+      .update(pipelineStages)
+      .set({
+        config: {
+          requiredEffectType: "github.merge",
+          requiredEffectOutcomes: ["merged"],
+          requiredAuthorityClass: "none",
+          effectExecutorType: "user",
+          effectExecutorId: "board-user",
+        },
+      })
+      .where(eq(pipelineStages.id, fixture.stages.find((stage) => stage.key === "work")!.id));
+    await expect(pipelineGraphVersionService(db).createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "pipeline_graph_effect_policy_invalid" },
+    });
+    await db
+      .update(pipelineStages)
+      .set({
+        config: {
+          requiredEffectType: "github.merge",
+          requiredEffectOutcomes: ["merged"],
+          requiredAuthorityClass: "merge.exact_sha",
+          effectExecutorType: "agent",
+          effectExecutorId: effectExecutor!.id,
+          effectExecutorKeyId: keyId,
+          targetAgentId: effectExecutor!.id,
+        },
+      })
+      .where(eq(pipelineStages.id, fixture.stages.find((stage) => stage.key === "work")!.id));
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "effect-case",
+      title: "Effect case",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const started = await runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start:effect-case",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const effects = pipelineGraphEffectService(db);
+    const subject = {
+      effectType: "github.merge",
+      targetRef: { repository: "quratus/meteorapp", headSha: "a".repeat(40) },
+      payloadHash: "b".repeat(64),
+    };
+    const subjectHash = pipelineGraphEffectSubjectHash(subject);
+    const requestInput = {
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      ...subject,
+      authorityReceipt: {
+        kind: "actor",
+        subjectHash,
+        decidedByUserId: "board-user",
+      },
+      executorAttestation: attest(
+        "request",
+        subjectHash,
+        pipelineGraphEffectActionHash({ subjectHash }),
+      ),
+      idempotencyKey: "merge:exact-head",
+      retryPolicy: { maxAttempts: 2 },
+      actor: { type: "user" as const, userId: "board-user" },
+    };
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+      };
+      next();
+    });
+    app.use("/api", pipelineRoutes(db, { heartbeat: { wakeup: async () => null } }));
+    app.use(errorHandler);
+    await expect(effects.request({
+      ...requestInput,
+      idempotencyKey: "merge:authority-bypass",
+      authorityReceipt: { kind: "none", subjectHash },
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "effect_authority_receipt_invalid" },
+    });
+    await expect(effects.request({
+      ...requestInput,
+      idempotencyKey: "merge:unsigned-controller",
+      executorAttestation: {
+        ...requestInput.executorAttestation,
+        signature: Buffer.from("not the private controller").toString("base64"),
+      },
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "effect_executor_attestation_invalid" },
+    });
+    const wrongBuildBody = {
+      ...requestInput.executorAttestation,
+      controllerBuildId: `git:${"f".repeat(40)}`,
+      signature: "",
+    };
+    const { signature: _ignored, ...wrongBuildUnsigned } = wrongBuildBody;
+    await expect(effects.request({
+      ...requestInput,
+      idempotencyKey: "merge:unapproved-controller-build",
+      executorAttestation: {
+        ...wrongBuildUnsigned,
+        signature: sign(
+          null,
+          Buffer.from(pipelineGraphExecutorAttestationMessage(wrongBuildUnsigned)),
+          privateKey,
+        ).toString("base64"),
+      },
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "effect_executor_attestation_invalid" },
+    });
+    const created = await request(app)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: requestInput.expectedRevision,
+        effectType: requestInput.effectType,
+        targetRef: requestInput.targetRef,
+        payloadHash: requestInput.payloadHash,
+        authorityReceipt: requestInput.authorityReceipt,
+        executorAttestation: requestInput.executorAttestation,
+        idempotencyKey: requestInput.idempotencyKey,
+        retryPolicy: requestInput.retryPolicy,
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    expect(created.headers.location).toBe(`/api/effect-attempts/${created.body.effectAttempt.id}`);
+    const requested = created.body as Awaited<ReturnType<typeof effects.request>>;
+    const replay = await effects.request(requestInput);
+    expect(replay.created).toBe(false);
+    expect(replay.effectAttempt.id).toBe(requested.effectAttempt.id);
+    const sameSubject = await effects.request({
+      ...requestInput,
+      idempotencyKey: "merge:duplicate-key",
+    });
+    expect(sameSubject.effectAttempt.id).toBe(requested.effectAttempt.id);
+    const concurrent = await Promise.all([
+      effects.request({ ...requestInput, idempotencyKey: "merge:concurrent-a" }),
+      effects.request({ ...requestInput, idempotencyKey: "merge:concurrent-b" }),
+    ]);
+    expect(concurrent.map((result) => result.effectAttempt.id)).toEqual([
+      requested.effectAttempt.id,
+      requested.effectAttempt.id,
+    ]);
+    const staleSubject = {
+      ...subject,
+      payloadHash: "d".repeat(64),
+    };
+    const staleSubjectHash = pipelineGraphEffectSubjectHash(staleSubject);
+    const staleAttempt = await effects.request({
+      ...requestInput,
+      ...staleSubject,
+      authorityReceipt: {
+        kind: "actor",
+        subjectHash: staleSubjectHash,
+        decidedByUserId: "board-user",
+      },
+      executorAttestation: attest(
+        "request",
+        staleSubjectHash,
+        pipelineGraphEffectActionHash({ subjectHash: staleSubjectHash }),
+      ),
+      idempotencyKey: "merge:stale-boundary",
+    });
+
+    await expect(runs.transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "transition:premature",
+      outcome: "merged",
+      checkpoint: {},
+      actor: { type: "user", userId: "board-user" },
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "graph_effect_receipt_required" },
+    });
+
+    const claimed = await effects.claim({
+      companyId: fixture.companyId,
+      effectAttemptId: requested.effectAttempt.id,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      leaseSeconds: 120,
+      executorAttestation: attest(
+        "claim",
+        subjectHash,
+        pipelineGraphEffectActionHash({ leaseSeconds: 120, retryReconciliation: null }),
+      ),
+    });
+    await expect(effects.claim({
+      companyId: fixture.companyId,
+      effectAttemptId: requested.effectAttempt.id,
+      executorType: "agent",
+      executorId: "untrusted-agent",
+      leaseSeconds: 120,
+      executorAttestation: attest(
+        "claim",
+        subjectHash,
+        pipelineGraphEffectActionHash({ leaseSeconds: 120, retryReconciliation: null }),
+      ),
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "effect_executor_mismatch" },
+    });
+    const providerReceipt = {
+      subjectHash,
+      effectType: subject.effectType,
+      payloadHash: subject.payloadHash,
+      targetRefHash: pipelineGraphEffectTargetRefHash(subject.targetRef),
+      providerOperationId: "github:merge:c",
+      mergeCommitSha: "c".repeat(40),
+    };
+    await expect(effects.complete({
+      companyId: fixture.companyId,
+      effectAttemptId: claimed.id,
+      leaseToken: randomUUID(),
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      providerReceipt,
+      executorAttestation: attest(
+        "complete",
+        subjectHash,
+        pipelineGraphEffectActionHash(providerReceipt),
+      ),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "effect_lease_fenced" },
+    });
+    const failureEvidence = { reason: "transient provider timeout" };
+    await effects.fail({
+      companyId: fixture.companyId,
+      effectAttemptId: claimed.id,
+      leaseToken: claimed.leaseToken!,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      failureEvidence,
+      executorAttestation: attest(
+        "fail",
+        subjectHash,
+        pipelineGraphEffectActionHash(failureEvidence),
+      ),
+    });
+    await expect(effects.claim({
+      companyId: fixture.companyId,
+      effectAttemptId: claimed.id,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      leaseSeconds: 120,
+      executorAttestation: attest(
+        "claim",
+        subjectHash,
+        pipelineGraphEffectActionHash({ leaseSeconds: 120, retryReconciliation: null }),
+      ),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "effect_retry_reconciliation_required" },
+    });
+    const retryReconciliation = {
+      subjectHash,
+      outcome: "not_applied" as const,
+      checkedAt: new Date().toISOString(),
+    };
+    const reclaimed = await effects.claim({
+      companyId: fixture.companyId,
+      effectAttemptId: claimed.id,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      leaseSeconds: 120,
+      retryReconciliation,
+      executorAttestation: attest(
+        "claim",
+        subjectHash,
+        pipelineGraphEffectActionHash({ leaseSeconds: 120, retryReconciliation }),
+      ),
+    });
+    await expect(effects.complete({
+      companyId: fixture.companyId,
+      effectAttemptId: reclaimed.id,
+      leaseToken: reclaimed.leaseToken!,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      providerReceipt: { providerOperationId: "forged" },
+      executorAttestation: attest(
+        "complete",
+        subjectHash,
+        pipelineGraphEffectActionHash({ providerOperationId: "forged" }),
+      ),
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "effect_provider_receipt_invalid" },
+    });
+    const completed = await effects.complete({
+      companyId: fixture.companyId,
+      effectAttemptId: reclaimed.id,
+      leaseToken: reclaimed.leaseToken!,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      providerReceipt,
+      executorAttestation: attest(
+        "complete",
+        subjectHash,
+        pipelineGraphEffectActionHash(providerReceipt),
+      ),
+    });
+    expect(completed.status).toBe("succeeded");
+
+    const transitionedResponse = await request(app)
+      .post(`/api/graph-runs/${started.run.id}/transitions`)
+      .send({
+        expectedRevision: 1,
+        idempotencyKey: "transition:after-effect",
+        outcome: "merged",
+        checkpoint: {},
+        effectAttemptId: completed.id,
+      });
+    expect(transitionedResponse.status, JSON.stringify(transitionedResponse.body)).toBe(200);
+    const transitioned = transitionedResponse.body as Awaited<ReturnType<typeof runs.transition>>;
+    expect(transitioned.run.status).toBe("succeeded");
+    await expect(effects.claim({
+      companyId: fixture.companyId,
+      effectAttemptId: staleAttempt.effectAttempt.id,
+      executorType: "agent",
+      executorId: effectExecutor!.id,
+      leaseSeconds: 120,
+      executorAttestation: attest(
+        "claim",
+        staleSubjectHash,
+        pipelineGraphEffectActionHash({ leaseSeconds: 120, retryReconciliation: null }),
+      ),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "effect_graph_boundary_stale" },
+    });
+    expect(transitioned.event.payload).toMatchObject({
+      effectReceipt: {
+        effectAttemptId: completed.id,
+        effectType: "github.merge",
+        subjectHash,
+        providerReceipt: {
+          subjectHash,
+          effectType: "github.merge",
+          payloadHash: subject.payloadHash,
+          targetRefHash: pipelineGraphEffectTargetRefHash(subject.targetRef),
+          providerOperationId: "github:merge:c",
+          mergeCommitSha: "c".repeat(40),
+        },
+      },
+    });
+    const redirectedCase = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "effect-head-changed",
+      title: "Changed head",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const redirectedRun = await runs.start({
+      companyId: fixture.companyId,
+      caseId: redirectedCase.case.id,
+      idempotencyKey: "start:effect-head-changed",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const redirected = await runs.transition({
+      companyId: fixture.companyId,
+      runId: redirectedRun.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "transition:head-changed",
+      outcome: "head_changed",
+      checkpoint: { reason: "provider head moved" },
+      actor: { type: "user", userId: "board-user" },
+    });
+    expect(redirected.run.status).toBe("cancelled");
   });
 
   it("enforces graph-run tenant foreign keys and route UUID validation", async () => {
