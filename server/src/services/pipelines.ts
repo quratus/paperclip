@@ -4068,6 +4068,19 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             tx.select().from(pipelineTransitions).where(eq(pipelineTransitions.pipelineId, input.pipelineId)),
           ]);
           const stageKeyById = new Map(liveStages.map((stage) => [stage.id, stage.key]));
+          const liveTransitionPairs = new Set(liveTransitions.map((transition) =>
+            `${stageKeyById.get(transition.fromStageId) ?? transition.fromStageId}\u0000${stageKeyById.get(transition.toStageId) ?? transition.toStageId}`
+          ));
+          const versionTransitionPairs = new Set(activeGraphVersion.definition.edges.map((edge) =>
+            `${edge.fromNodeKey}\u0000${edge.toNodeKey}`
+          ));
+          const transitionPairsMatch = liveTransitionPairs.size === versionTransitionPairs.size
+            && [...liveTransitionPairs].every((pair) => versionTransitionPairs.has(pair));
+
+          // The legacy transition projection stores one row per node pair, while an
+          // immutable graph can route multiple outcomes across that same pair. The
+          // pinned graph owns outcome semantics; the live projection must still
+          // match every executable pair and every node/configuration exactly.
           const compiled = compilePipelineGraph({
             entryNodeKey: activeGraphVersion.definition.entryNodeKey,
             nodes: liveStages.map((stage) => ({
@@ -4077,14 +4090,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               position: stage.position,
               config: stage.config,
             })),
-            edges: liveTransitions.map((transition) => ({
-              fromNodeKey: stageKeyById.get(transition.fromStageId) ?? transition.fromStageId,
-              toNodeKey: stageKeyById.get(transition.toStageId) ?? transition.toStageId,
-              outcome: transition.label,
-            })),
+            edges: activeGraphVersion.definition.edges,
             cycleContracts: activeGraphVersion.definition.cycleContracts,
           });
-          if (!compiled.ok || !isDeepStrictEqual(compiled.definition, activeGraphVersion.definition)) {
+          if (
+            !transitionPairsMatch
+            || !compiled.ok
+            || !isDeepStrictEqual(compiled.definition, activeGraphVersion.definition)
+          ) {
             throw conflict("Live pipeline topology differs from the active graph version", {
               code: "pipeline_graph_activation_stale",
               graphVersionId: activeGraphVersion.id,

@@ -875,6 +875,71 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     ).resolves.toBeDefined();
   });
 
+  it("pins outcome-rich graphs when the live topology represents each node pair once", async () => {
+    const fixture = await seedLinearPipeline();
+    const actor = { type: "user" as const, userId: "board-user" };
+    await db.update(pipelines)
+      .set({ enforceTransitions: true })
+      .where(eq(pipelines.id, fixture.pipeline.id));
+    const adopted = await pipelineGraphVersionService(db).adoptDefinition({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      definition: {
+        ...linearDefinition,
+        edges: [
+          { fromNodeKey: "work", toNodeKey: "done", outcome: "capacity_restored" },
+          { fromNodeKey: "work", toNodeKey: "done", outcome: "capacity_unavailable" },
+        ],
+      },
+      expectedActiveVersionId: null,
+      expectedActiveDefinitionHash: null,
+      idempotencyKey: "adopt-outcome-rich-pair",
+      actor,
+    });
+
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "outcome-rich-case",
+      title: "Outcome-rich case",
+      actor,
+    });
+    expect(ingested.case.graphVersionId).toBe(adopted.version.id);
+
+    const started = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start-outcome-rich-case",
+      actor,
+    });
+    const completed = await pipelineGraphRunService(db).transition({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      idempotencyKey: "complete-outcome-rich-case",
+      outcome: "capacity_unavailable",
+      checkpoint: { reason: "capacity remained unavailable" },
+      actor,
+    });
+    expect(completed.run.status).toBe("succeeded");
+    const [completedCase] = await db.select().from(pipelineCases)
+      .where(eq(pipelineCases.id, ingested.case.id));
+    expect(completedCase!.terminalKind).toBe("done");
+
+    await db.delete(pipelineTransitions)
+      .where(eq(pipelineTransitions.pipelineId, fixture.pipeline.id));
+    await expect(pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "missing-live-pair-case",
+      title: "Missing live pair case",
+      actor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "pipeline_graph_activation_stale" },
+    });
+  });
+
   it("exposes preview, idempotent persist, bounded list, and immutable get routes", async () => {
     const fixture = await seedLinearPipeline();
     const app = express();
