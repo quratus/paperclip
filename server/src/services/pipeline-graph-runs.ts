@@ -244,6 +244,134 @@ function graphWakeRouting(input: {
   };
 }
 
+/** Heartbeat run statuses that still represent a live, in-progress attempt. */
+const ACTIVE_HEARTBEAT_RUN_STATUSES = new Set(["queued", "running", "scheduled_retry"]);
+
+export type GraphAssignmentAuthorizationDecision =
+  | { authorized: true }
+  | { authorized: false; code: string };
+
+/**
+ * `assignment_authorized`: narrow, fail-closed authority for an agent to submit
+ * ONE transition for its EXACT current graph assignment, derived only from
+ * durably persisted graph run / heartbeat state — never from caller-supplied
+ * `targetAgentId`, node, or outcome. Used by the transitions route to decide
+ * whether broad `pipelines:write` may be bypassed; it never itself commits a
+ * mutation. The transactional CAS inside `transition()` remains the sole
+ * authoritative enforcement of every one of these bindings.
+ */
+export async function resolveGraphTransitionAssignmentAuthorization(
+  db: Db,
+  input: {
+    companyId: string;
+    runId: string;
+    expectedRevision: number;
+    idempotencyKey: string;
+    outcome: string;
+    checkpoint: Record<string, unknown>;
+    leaseToken?: string | null;
+    effectAttemptId?: string | null;
+    reason?: string | null;
+    actor: PipelineGraphVersionActor;
+  },
+): Promise<GraphAssignmentAuthorizationDecision> {
+  if (input.actor.type !== "agent") {
+    return { authorized: false, code: "graph_assignment_actor_not_agent" };
+  }
+  // A prior commit or in-flight replay of this exact request is always
+  // safe to admit: the persisted request hash binds the actor envelope, so
+  // a hash match proves this is the same agent replaying its own committed
+  // (or in-flight) transition, independent of current run/node state.
+  const hash = requestHash({
+    operation: "transition",
+    runId: input.runId,
+    expectedRevision: input.expectedRevision,
+    outcome: input.outcome,
+    checkpoint: input.checkpoint,
+    leaseToken: input.leaseToken ?? null,
+    effectAttemptId: input.effectAttemptId ?? null,
+    reason: input.reason ?? null,
+    actor: actorEnvelope(input.actor),
+  });
+  const replay = await db
+    .select({ requestHash: pipelineGraphRunEvents.requestHash })
+    .from(pipelineGraphRunEvents)
+    .where(and(
+      eq(pipelineGraphRunEvents.companyId, input.companyId),
+      eq(pipelineGraphRunEvents.runId, input.runId),
+      eq(pipelineGraphRunEvents.idempotencyKey, input.idempotencyKey),
+    ))
+    .then((rows) => rows[0] ?? null);
+  if (replay) {
+    return replay.requestHash === hash
+      ? { authorized: true }
+      : { authorized: false, code: "graph_event_idempotency_conflict" };
+  }
+
+  const row = await db
+    .select({ run: pipelineGraphRuns, graphVersion: pipelineGraphVersions })
+    .from(pipelineGraphRuns)
+    .innerJoin(
+      pipelineGraphVersions,
+      and(
+        eq(pipelineGraphVersions.companyId, pipelineGraphRuns.companyId),
+        eq(pipelineGraphVersions.pipelineId, pipelineGraphRuns.pipelineId),
+        eq(pipelineGraphVersions.id, pipelineGraphRuns.graphVersionId),
+      ),
+    )
+    .where(and(
+      eq(pipelineGraphRuns.companyId, input.companyId),
+      eq(pipelineGraphRuns.id, input.runId),
+    ))
+    .then((rows) => rows[0] ?? null);
+  if (!row) return { authorized: false, code: "graph_run_not_found" };
+  const { run, graphVersion } = row;
+  if (run.status !== "running") return { authorized: false, code: "graph_run_not_running" };
+  if (run.revision !== input.expectedRevision) {
+    return { authorized: false, code: "graph_run_revision_conflict" };
+  }
+  const currentNode = graphVersion.definition.nodes.find((node) => node.key === run.currentNodeKey);
+  if (!currentNode) return { authorized: false, code: "graph_run_node_missing" };
+  const assignedAgentId = typeof currentNode.config.targetAgentId === "string"
+    ? currentNode.config.targetAgentId.trim()
+    : "";
+  if (currentNode.config.dispatchEnabled !== true || !assignedAgentId) {
+    return { authorized: false, code: "graph_assignment_not_dispatchable" };
+  }
+  if (input.actor.agentId !== assignedAgentId) {
+    return { authorized: false, code: "graph_assignment_agent_mismatch" };
+  }
+  const attempt = await db
+    .select({
+      agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+    })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.id, input.actor.runId),
+    ))
+    .then((rows) => rows[0] ?? null);
+  const attemptContext = objectValue(attempt?.contextSnapshot);
+  const assignment = objectValue(attemptContext.graphAssignment);
+  if (
+    !attempt
+    || !ACTIVE_HEARTBEAT_RUN_STATUSES.has(attempt.status)
+    || attempt.agentId !== input.actor.agentId
+    || attemptContext.graphRunId !== run.id
+    || attemptContext.targetNodeKey !== run.currentNodeKey
+    || attemptContext.graphRunRevision !== input.expectedRevision
+    || assignment.id !== `${run.id}:${input.expectedRevision}:${run.currentNodeKey}`
+  ) {
+    return { authorized: false, code: "graph_assignment_attempt_mismatch" };
+  }
+  const edge = graphVersion.definition.edges.find((candidate) =>
+    candidate.fromNodeKey === run.currentNodeKey && candidate.outcome === input.outcome);
+  if (!edge) return { authorized: false, code: "graph_transition_not_allowed" };
+  return { authorized: true };
+}
+
 export function pipelineGraphRunService(
   db: Db,
   deps: {
