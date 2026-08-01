@@ -37,6 +37,12 @@ import {
   issueTreeHolds,
   issueWorkProducts,
   issues,
+  pipelineCaseIssueLinks,
+  pipelineCases,
+  pipelineGraphRuns,
+  pipelineGraphVersions,
+  pipelines,
+  pipelineStages,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -4947,6 +4953,91 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       if (retryRun?.id) {
         await waitForRunToSettle(heartbeat, retryRun.id);
       }
+    },
+  );
+
+  it.each(["running", "paused"] as const)(
+    "does not requeue legacy continuation while a linked graph run is %s",
+    async (graphStatus) => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "process_lost",
+      });
+      const [pipeline] = await db.insert(pipelines).values({
+        companyId,
+        key: `recovery-guard-${randomUUID()}`,
+        name: "Recovery guard",
+      }).returning();
+      const [stage] = await db.insert(pipelineStages).values({
+        pipelineId: pipeline!.id,
+        key: "implement",
+        name: "Implement",
+        kind: "working",
+        position: 100,
+      }).returning();
+      const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+        companyId,
+        pipelineId: pipeline!.id,
+        version: 1,
+        definitionHash: "a".repeat(64),
+        schemaVersion: 1,
+        definition: {
+          schemaVersion: 1,
+          entryNodeKey: "implement",
+          nodes: [{
+            key: "implement",
+            kind: "working",
+            name: "Implement",
+            config: { targetAgentId: agentId },
+          }],
+          edges: [],
+        },
+        status: "active",
+        createdByType: "user",
+        createdById: "board-user",
+        activatedByType: "user",
+        activatedById: "board-user",
+        activatedAt: new Date(),
+      }).returning();
+      const [pipelineCase] = await db.insert(pipelineCases).values({
+        companyId,
+        pipelineId: pipeline!.id,
+        graphVersionId: graphVersion!.id,
+        stageId: stage!.id,
+        caseKey: `recovery-guard-${randomUUID()}`,
+        title: "Graph-owned issue",
+      }).returning();
+      await db.insert(pipelineGraphRuns).values({
+        companyId,
+        pipelineId: pipeline!.id,
+        graphVersionId: graphVersion!.id,
+        caseId: pipelineCase!.id,
+        startIdempotencyKey: `recovery-guard-${randomUUID()}`,
+        status: graphStatus,
+        currentNodeKey: "implement",
+        startedByType: "user",
+        startedById: "board-user",
+        pausedAt: graphStatus === "paused" ? new Date() : null,
+      });
+      await db.insert(pipelineCaseIssueLinks).values({
+        companyId,
+        caseId: pipelineCase!.id,
+        issueId,
+        role: "work",
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBeGreaterThanOrEqual(1);
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
     },
   );
 
