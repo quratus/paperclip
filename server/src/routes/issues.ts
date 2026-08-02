@@ -9736,21 +9736,17 @@ export function issueRoutes(
   // never cleared; every call is audited.
   router.post("/issues/:id/admin/reconcile-run-ownership", async (req, res) => {
     const id = req.params.id as string;
-    const raw = await svc.getById(id);
-    if (!raw) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
+    // getAccessibleResource enforces company scope for both agent and board
+    // actors (including the unassigned-issue case) and rejects viewer-role
+    // board memberships on this mutating method, before any business-logic
+    // authorization below runs.
+    const raw = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!raw) return;
 
     let authorized = false;
     if (req.actor.type === "board") {
       if (!req.actor.userId) {
         throw forbidden("Board user context required");
-      }
-      // Outside board users must not learn the issue exists.
-      if (!(await actorCanReadCompanyScope(req, raw.companyId))) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
       }
       authorized = true;
     } else if (req.actor.type === "agent") {

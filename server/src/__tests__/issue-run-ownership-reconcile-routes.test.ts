@@ -496,6 +496,78 @@ describeEmbeddedPostgres("issue run-ownership reconcile routes (SQN-4980)", () =
     expect(row).toEqual({ assigneeAgentId: assignee, checkoutRunId: null, executionRunId: null });
   });
 
+  // ── Security regression (independent review, 2026-08-02) ───────────────
+  // An agent from a different company must not be able to reach an
+  // unassigned issue in another tenant just because assigneeAgentId is null.
+  it("cross-tenant: an agent in a different company cannot reconcile another company's unassigned issue", async () => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const outsideAgent = await seedAgent(otherCompanyId, { name: "Outsider" });
+    const outsideRun = await seedRun(otherCompanyId, outsideAgent, "running");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unassigned issue in a different company",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const res = await request(createApp(agentActor(otherCompanyId, outsideAgent, outsideRun)))
+      .post(`/api/issues/${issueId}/admin/reconcile-run-ownership`)
+      .send();
+
+    // Cross-tenant lookup must fail closed as a 404 (existence hiding), never
+    // a 200 authorized:true fallthrough for the unassigned-issue branch.
+    expect(res.status).toBe(404);
+  });
+
+  // A board viewer membership is read-only; this endpoint mutates issue state
+  // and writes an audit trail, so it must be excluded like every other
+  // mutating admin route.
+  it("a board viewer cannot force-reconcile (mutating action requires write access)", async () => {
+    const companyId = await seedCompany();
+    const assignee = await seedAgent(companyId, { name: "Implementer" });
+    const deadRun = await seedRun(companyId, assignee, "failed");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Viewer cannot reconcile",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: assignee,
+      checkoutRunId: deadRun,
+      executionRunId: deadRun,
+      executionAgentNameKey: "implementer",
+      executionLockedAt: new Date(),
+    });
+
+    const viewerActor: Express.Request["actor"] = {
+      type: "board",
+      userId: "viewer-user",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "viewer", status: "active" }],
+      isInstanceAdmin: false,
+      source: "session",
+    };
+
+    const res = await request(createApp(viewerActor))
+      .post(`/api/issues/${issueId}/admin/reconcile-run-ownership`)
+      .send();
+
+    expect(res.status).toBe(403);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: deadRun, executionRunId: deadRun });
+  });
+
   // ── AC4 ────────────────────────────────────────────────────────────────
   // Existing valid ownership protection is preserved: a live competing run can
   // neither steal an active checkout via PATCH nor via force-reconcile.
