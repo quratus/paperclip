@@ -137,6 +137,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { graphRecoveryOwnershipLockKey } from "./pipeline-graph-ownership.js";
 import { pipelineGraphRunService } from "./pipeline-graph-runs.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -322,6 +323,8 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+const GRAPH_OWNERSHIP_FINALIZATION_RETRY_ATTEMPTS = 80;
+const GRAPH_OWNERSHIP_FINALIZATION_RETRY_DELAY_MS = 25;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -14835,7 +14838,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; ownershipRetryAttempt?: number } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -14852,6 +14855,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
+      // The finalizer is itself a legacy ownership transition: it may promote a
+      // deferred wake or create an immediate recovery run. Acquire the same
+      // issue-scoped seam as graph activation before row locks, otherwise the
+      // two transactions can each miss the other's uncommitted successor.
+      const ownershipIssueIds = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, run.companyId),
+            contextIssueId
+              ? or(
+                  eq(issues.id, contextIssueId),
+                  eq(issues.executionRunId, run.id),
+                  eq(issues.checkoutRunId, run.id),
+                )
+              : or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
+          ),
+        )
+        .then((rows) => [...new Set(rows.map((row) => row.id))].sort());
+      for (const issueId of ownershipIssueIds) {
+        const lockResult = await tx.execute(sql`
+          select pg_try_advisory_xact_lock(
+            hashtextextended(${graphRecoveryOwnershipLockKey(run.companyId, issueId)}, 0)
+          ) as acquired
+        `);
+        if (!(lockResult as unknown as Array<{ acquired: boolean }>)[0]?.acquired) {
+          return { kind: "ownership_busy" as const };
+        }
+      }
+
       // Lock the context issue (if any) AND every issue that still references this run.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
@@ -14903,6 +14937,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
         .orderBy(asc(issues.id));
 
+      const activeGraphOwnershipRows = candidateIssues.length === 0
+        ? []
+        : await tx
+          .select({ issueId: pipelineCaseIssueLinks.issueId, graphRunId: pipelineGraphRuns.id })
+          .from(pipelineCaseIssueLinks)
+          .innerJoin(
+            pipelineGraphRuns,
+            and(
+              eq(pipelineGraphRuns.companyId, pipelineCaseIssueLinks.companyId),
+              eq(pipelineGraphRuns.caseId, pipelineCaseIssueLinks.caseId),
+            ),
+          )
+          .where(and(
+            eq(pipelineCaseIssueLinks.companyId, run.companyId),
+            inArray(pipelineCaseIssueLinks.issueId, candidateIssues.map((candidate) => candidate.id)),
+            inArray(pipelineCaseIssueLinks.role, ["origin", "work"]),
+            isNull(pipelineCaseIssueLinks.retiredAt),
+            inArray(pipelineGraphRuns.status, ["running", "paused"]),
+          ));
+      const activeGraphRunIdsByIssue = new Map<string, Set<string>>();
+      for (const ownership of activeGraphOwnershipRows) {
+        const runIds = activeGraphRunIdsByIssue.get(ownership.issueId) ?? new Set<string>();
+        runIds.add(ownership.graphRunId);
+        activeGraphRunIdsByIssue.set(ownership.issueId, runIds);
+      }
+
       // Clear orphaned execution-lock columns that still point at this finalizing
       // run, across every sibling issue in one statement so it scales with N
       // orphans without N round-trips. Rows are already held under FOR UPDATE from
@@ -14951,7 +15011,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
-      if (run.status === "failed" && run.errorCode === "capacity_exhausted" && issue.status !== "done" && issue.status !== "cancelled") {
+      const activeGraphRunIds = activeGraphRunIdsByIssue.get(issue.id) ?? new Set<string>();
+      const graphRunId = readNonEmptyString(runContext.graphRunId);
+      const isOwningGraphWake = runContext.pipelineGraphWake === true
+        && graphRunId !== null
+        && activeGraphRunIds.has(graphRunId);
+      const isActivelyGraphOwned = activeGraphRunIds.size > 0;
+
+      if (isActivelyGraphOwned) {
+        const activeGraphRunId = [...activeGraphRunIds].sort()[0]!;
+        const now = new Date();
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: `Responsibility redirected to active pipeline graph run ${activeGraphRunId}`,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(agentWakeupRequests.companyId, issue.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+          ));
+      }
+
+      // Clearing the terminal run's stale lock is safe and already happened for
+      // every sibling. Creating or escalating a legacy successor is not: an
+      // active graph now owns this issue and carries the next responsibility.
+      // A wake emitted by that exact graph remains its own legitimate recovery
+      // path and keeps the full graph assignment envelope below.
+      if (isActivelyGraphOwned && !isOwningGraphWake) {
+        return { kind: "released" as const };
+      }
+
+      if (!isActivelyGraphOwned && run.status === "failed" && run.errorCode === "capacity_exhausted" && issue.status !== "done" && issue.status !== "cancelled") {
         await tx
           .update(issues)
           .set({
@@ -15005,7 +15099,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
-      while (true) {
+      while (!isActivelyGraphOwned) {
         const deferred = await tx
           .select()
           .from(agentWakeupRequests)
@@ -15304,6 +15398,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? executionState.currentParticipant
         : null;
       const issueNeedsReviewParticipantRecovery =
+        !isActivelyGraphOwned &&
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
         currentParticipant?.type === "agent" &&
@@ -15599,6 +15694,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run: queuedRun,
       };
     });
+
+    if (promotionResult?.kind === "ownership_busy") {
+      const attempt = options.ownershipRetryAttempt ?? 0;
+      if (attempt + 1 < GRAPH_OWNERSHIP_FINALIZATION_RETRY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, GRAPH_OWNERSHIP_FINALIZATION_RETRY_DELAY_MS));
+        return releaseIssueExecutionAndPromote(run, {
+          ...options,
+          ownershipRetryAttempt: attempt + 1,
+        });
+      }
+      logger.warn(
+        { runId: run.id, issueId: contextIssueId, attempts: GRAPH_OWNERSHIP_FINALIZATION_RETRY_ATTEMPTS },
+        "heartbeat finalization deferred to durable stale-lock recovery after graph ownership contention",
+      );
+      return;
+    }
 
     if (promotionResult?.kind === "blocked") {
       await recovery.escalateStrandedAssignedIssue({

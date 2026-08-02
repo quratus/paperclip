@@ -21,7 +21,13 @@ import {
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { PipelineGraphVersionActor } from "./pipeline-graph-versions.js";
+import { graphCaseLockKey, graphRecoveryOwnershipLockKey } from "./pipeline-graph-ownership.js";
 import { pipelineService } from "./pipelines.js";
+
+class GraphRecoveryOwnershipBusy extends Error {}
+
+const GRAPH_RECOVERY_OWNERSHIP_RETRY_ATTEMPTS = 80;
+const GRAPH_RECOVERY_OWNERSHIP_RETRY_DELAY_MS = 25;
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -417,15 +423,23 @@ export function pipelineGraphRunService(
         checkpoint: input.checkpoint ?? {},
         actor: actorEnvelope(input.actor),
       });
-      return db.transaction(async (tx) => {
-        await tx.execute(
-          sql`select pg_advisory_xact_lock(hashtextextended(${
+      const attemptStart = () => db.transaction(async (tx) => {
+        const startKeyLock = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${
             "pipeline-graph-run:start-key:" + input.companyId + ":" + input.idempotencyKey
-          }, 0))`,
+          }, 0)) as acquired`,
         );
-        await tx.execute(
-          sql`select pg_advisory_xact_lock(hashtextextended(${"pipeline-graph-run:case:" + input.caseId}, 0))`,
+        if (!(startKeyLock as unknown as Array<{ acquired: boolean }>)[0]?.acquired) {
+          throw new GraphRecoveryOwnershipBusy();
+        }
+        const caseLock = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(
+            hashtextextended(${graphCaseLockKey(input.caseId)}, 0)
+          ) as acquired`,
         );
+        if (!(caseLock as unknown as Array<{ acquired: boolean }>)[0]?.acquired) {
+          throw new GraphRecoveryOwnershipBusy();
+        }
         const replay = await tx
           .select()
           .from(pipelineGraphRuns)
@@ -491,6 +505,72 @@ export function pipelineGraphRunService(
           throw unprocessable("Terminal pipeline cases cannot start graph runs", {
             code: "graph_run_case_terminal",
           });
+        }
+        const ownershipIssueIds = await tx
+          .select({ issueId: pipelineCaseIssueLinks.issueId })
+          .from(pipelineCaseIssueLinks)
+          .where(and(
+            eq(pipelineCaseIssueLinks.companyId, input.companyId),
+            eq(pipelineCaseIssueLinks.caseId, input.caseId),
+            inArray(pipelineCaseIssueLinks.role, ["origin", "work"]),
+            isNull(pipelineCaseIssueLinks.retiredAt),
+          ))
+          .then((links) => [...new Set(links.map((link) => link.issueId))].sort());
+        for (const issueId of ownershipIssueIds) {
+          const lockResult = await tx.execute(sql`
+            select pg_try_advisory_xact_lock(
+              hashtextextended(${graphRecoveryOwnershipLockKey(input.companyId, issueId)}, 0)
+            ) as acquired
+          `);
+          const lockRows = lockResult as unknown as Array<{ acquired: boolean }>;
+          if (!lockRows[0]?.acquired) throw new GraphRecoveryOwnershipBusy();
+        }
+        if (ownershipIssueIds.length > 0) {
+          const [activeCompanyRuns, linkedIssueRuns] = await Promise.all([
+            tx
+              .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+              .from(heartbeatRuns)
+              .where(and(
+                eq(heartbeatRuns.companyId, input.companyId),
+                inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+              )),
+            tx
+              .select({
+                issueId: issues.id,
+                executionRunId: issues.executionRunId,
+                checkoutRunId: issues.checkoutRunId,
+              })
+              .from(issues)
+              .where(and(
+                eq(issues.companyId, input.companyId),
+                inArray(issues.id, ownershipIssueIds),
+              )),
+          ]);
+          const ownershipIssueIdSet = new Set(ownershipIssueIds);
+          const linkedLegacyRunIds = new Set(
+            linkedIssueRuns
+              .flatMap((issue) => [issue.executionRunId, issue.checkoutRunId])
+              .filter((runId): runId is string => Boolean(runId)),
+          );
+          const legacyRun = activeCompanyRuns.find((run) => {
+            const context = run.contextSnapshot && typeof run.contextSnapshot === "object"
+              ? run.contextSnapshot as Record<string, unknown>
+              : {};
+            if (context.pipelineGraphWake === true) return false;
+            const issueId = typeof context.issueId === "string" ? context.issueId : null;
+            const taskId = typeof context.taskId === "string" ? context.taskId : null;
+            return linkedLegacyRunIds.has(run.id)
+              || (issueId !== null && ownershipIssueIdSet.has(issueId))
+              || (taskId !== null && ownershipIssueIdSet.has(taskId));
+          });
+          if (legacyRun) {
+            throw conflict("Graph activation is waiting for the issue's existing execution owner", {
+              code: "graph_run_legacy_issue_owner_active",
+              retryable: true,
+              legacyRunId: legacyRun.id,
+              issueIds: ownershipIssueIds,
+            });
+          }
         }
         if (!row.graphVersion.definition.nodes.some((node) => node.key === row.stageKey)) {
           throw unprocessable("Case stage is not present in its pinned graph version", {
@@ -623,6 +703,18 @@ export function pipelineGraphRunService(
             checkpoint: input.checkpoint ?? {},
           },
         };
+      });
+      for (let attempt = 0; attempt < GRAPH_RECOVERY_OWNERSHIP_RETRY_ATTEMPTS; attempt += 1) {
+        try {
+          return await attemptStart();
+        } catch (error) {
+          if (!(error instanceof GraphRecoveryOwnershipBusy)) throw error;
+          await new Promise((resolve) => setTimeout(resolve, GRAPH_RECOVERY_OWNERSHIP_RETRY_DELAY_MS));
+        }
+      }
+      throw conflict("Graph ownership is temporarily busy; retry the idempotent start request", {
+        code: "graph_run_recovery_ownership_busy",
+        retryable: true,
       });
     },
 

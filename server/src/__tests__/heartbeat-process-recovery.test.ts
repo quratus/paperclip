@@ -124,6 +124,8 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
+import { graphRecoveryOwnershipLockKey } from "../services/pipeline-graph-ownership.ts";
+import { pipelineGraphRunService } from "../services/pipeline-graph-runs.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -848,6 +850,76 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
 
     return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
+  }
+
+  async function seedActiveGraphOwnership(input: {
+    companyId: string;
+    issueId: string;
+    targetAgentId: string;
+    role?: "origin" | "work";
+  }) {
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId: input.companyId,
+      key: `active-ownership-${randomUUID()}`,
+      name: "Active graph ownership",
+    }).returning();
+    const [stage] = await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "implement",
+      name: "Implement",
+      kind: "working",
+      position: 100,
+    }).returning();
+    const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+      companyId: input.companyId,
+      pipelineId: pipeline!.id,
+      version: 1,
+      definitionHash: "c".repeat(64),
+      schemaVersion: 1,
+      definition: {
+        schemaVersion: 1,
+        entryNodeKey: "implement",
+        nodes: [{
+          key: "implement",
+          kind: "working",
+          name: "Implement",
+          config: { targetAgentId: input.targetAgentId },
+        }],
+        edges: [],
+      },
+      status: "active",
+      createdByType: "user",
+      createdById: "board-user",
+      activatedByType: "user",
+      activatedById: "board-user",
+      activatedAt: new Date(),
+    }).returning();
+    const [pipelineCase] = await db.insert(pipelineCases).values({
+      companyId: input.companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      stageId: stage!.id,
+      caseKey: `active-ownership-${randomUUID()}`,
+      title: "Active ownership case",
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId: input.companyId,
+      caseId: pipelineCase!.id,
+      issueId: input.issueId,
+      role: input.role ?? "work",
+    });
+    const [run] = await db.insert(pipelineGraphRuns).values({
+      companyId: input.companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      caseId: pipelineCase!.id,
+      startIdempotencyKey: `active-ownership-${randomUUID()}`,
+      status: "running",
+      currentNodeKey: "implement",
+      startedByType: "user",
+      startedById: "board-user",
+    }).returning();
+    return { pipeline: pipeline!, stage: stage!, graphVersion: graphVersion!, pipelineCase: pipelineCase!, run: run! };
   }
 
   async function seedInReviewParticipantRunFixture(input?: {
@@ -5041,6 +5113,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it("rechecks graph ownership after waiting for a concurrent graph activation", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+    });
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId,
+      key: `recovery-race-${randomUUID()}`,
+      name: "Recovery race",
+    }).returning();
+    const [stage] = await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "implement",
+      name: "Implement",
+      kind: "working",
+      position: 100,
+    }).returning();
+    const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      version: 1,
+      definitionHash: "b".repeat(64),
+      schemaVersion: 1,
+      definition: {
+        schemaVersion: 1,
+        entryNodeKey: "implement",
+        nodes: [{
+          key: "implement",
+          kind: "working",
+          name: "Implement",
+          config: { targetAgentId: agentId },
+        }],
+        edges: [],
+      },
+      status: "active",
+      createdByType: "user",
+      createdById: "board-user",
+      activatedByType: "user",
+      activatedById: "board-user",
+      activatedAt: new Date(),
+    }).returning();
+    const [pipelineCase] = await db.insert(pipelineCases).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      stageId: stage!.id,
+      caseKey: `recovery-race-${randomUUID()}`,
+      title: "Graph activation wins recovery race",
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId,
+      caseId: pipelineCase!.id,
+      issueId,
+      role: "work",
+    });
+
+    let markFenceHeld!: () => void;
+    const fenceHeld = new Promise<void>((resolve) => { markFenceHeld = resolve; });
+    let releaseFence!: () => void;
+    const fenceMayRelease = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const fence = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${graphRecoveryOwnershipLockKey(companyId, issueId)}, 0))`,
+      );
+      markFenceHeld();
+      await fenceMayRelease;
+    });
+    await fenceHeld;
+
+    let activationSettled = false;
+    const activation = pipelineGraphRunService(db).start({
+      companyId,
+      caseId: pipelineCase!.id,
+      idempotencyKey: `recovery-race-${randomUUID()}`,
+      actor: { type: "user", userId: "board-user" },
+    }).finally(() => {
+      activationSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(activationSettled).toBe(false);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    releaseFence();
+    await fence;
+    const started = await activation;
+    expect(started.run).toMatchObject({
+        companyId,
+        pipelineId: pipeline!.id,
+        graphVersionId: graphVersion!.id,
+        caseId: pipelineCase!.id,
+        status: "running",
+    });
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+  });
+
   it.each([
     "wake_assignee",
     "wake_assignee_on_accept",
@@ -5658,6 +5834,46 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("does not let an orphaned deferred wake mask stranded recovery", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "comment",
+      triggerDetail: "mention",
+      reason: "issue_execution_deferred",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.dispatchRequeued).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.id} <> ${runId}`,
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+      issueId,
+      retryReason: "assignment_recovery",
+    });
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
   it("blocks assigned todo work after the one automatic dispatch recovery was already used", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
@@ -5772,7 +5988,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Next action:");
   });
 
-  it("assigns open unassigned blockers back to their creator agent", async () => {
+  it.each([false, true])(
+    "assigns open unassigned blockers back to their creator agent (graphOwned=%s)",
+    async (graphOwned) => {
     const companyId = randomUUID();
     const creatorAgentId = randomUUID();
     const blockedAssigneeAgentId = randomUUID();
@@ -5841,40 +6059,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       type: "blocks",
       createdByAgentId: creatorAgentId,
     });
+    if (graphOwned) {
+      await seedActiveGraphOwnership({
+        companyId,
+        issueId: blockerIssueId,
+        targetAgentId: creatorAgentId,
+      });
+    }
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
-    expect(result.orphanBlockersAssigned).toBe(1);
-    expect(result.issueIds).toContain(blockerIssueId);
+    expect(result.orphanBlockersAssigned).toBe(graphOwned ? 0 : 1);
+    expect(result.issueIds.includes(blockerIssueId)).toBe(!graphOwned);
 
     const blocker = await db
       .select()
       .from(issues)
       .where(eq(issues.id, blockerIssueId))
       .then((rows) => rows[0] ?? null);
-    expect(blocker?.assigneeAgentId).toBe(creatorAgentId);
+    expect(blocker?.assigneeAgentId).toBe(graphOwned ? null : creatorAgentId);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
-    expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
-    expect(comments[0]?.body).toContain(`[${issuePrefix}-2](/${issuePrefix}/issues/${issuePrefix}-2)`);
+    if (graphOwned) {
+      expect(comments).toHaveLength(0);
+    } else {
+      expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
+      expect(comments[0]?.body).toContain(`[${issuePrefix}-2](/${issuePrefix}/issues/${issuePrefix}-2)`);
+    }
 
     const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
-    expect(wakeups).toEqual([
-      expect.objectContaining({
-        reason: "issue_assigned",
-        payload: expect.objectContaining({
-          issueId: blockerIssueId,
-          mutation: "unassigned_blocker_recovery",
+    if (graphOwned) {
+      expect(wakeups).toHaveLength(0);
+    } else {
+      expect(wakeups).toEqual([
+        expect.objectContaining({
+          reason: "issue_assigned",
+          payload: expect.objectContaining({
+            issueId: blockerIssueId,
+            mutation: "unassigned_blocker_recovery",
+          }),
         }),
-      }),
-    ]);
+      ]);
+    }
 
     const runId = wakeups[0]?.runId;
     if (runId) {
       await waitForRunToSettle(heartbeat, runId);
     }
-  });
+    },
+  );
 
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
