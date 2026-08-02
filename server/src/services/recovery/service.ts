@@ -24,6 +24,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  pipelineCaseIssueLinks,
+  pipelineGraphRuns,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -3858,7 +3860,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       admissionRedirectWakes,
     };
 
+    const activeGraphOwnedIssueIds = new Set(
+      candidates.length === 0
+        ? []
+        : await db
+            .selectDistinct({ issueId: pipelineCaseIssueLinks.issueId })
+            .from(pipelineCaseIssueLinks)
+            .innerJoin(
+              pipelineGraphRuns,
+              and(
+                eq(pipelineGraphRuns.companyId, pipelineCaseIssueLinks.companyId),
+                eq(pipelineGraphRuns.caseId, pipelineCaseIssueLinks.caseId),
+              ),
+            )
+            .where(and(
+              inArray(pipelineCaseIssueLinks.issueId, candidates.map((issue) => issue.id)),
+              inArray(pipelineCaseIssueLinks.role, ["origin", "work"]),
+              isNull(pipelineCaseIssueLinks.retiredAt),
+              inArray(pipelineGraphRuns.status, ["running", "paused"]),
+            ))
+            .then((rows) => rows.map((row) => row.issueId)),
+    );
+
     for (const issue of candidates) {
+      if (activeGraphOwnedIssueIds.has(issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
