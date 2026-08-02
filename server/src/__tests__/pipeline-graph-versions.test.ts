@@ -2859,6 +2859,77 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     }
   });
 
+  it("redirects graph activation to an existing legacy execution owner", async () => {
+    const fixture = await seedLinearPipeline();
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "legacy-owner-active",
+      title: "Legacy owner active",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [agent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Legacy owner",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    const [issue] = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      title: "Already executing",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agent!.id,
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      issueId: issue!.id,
+      role: "work",
+    });
+    const [legacyRun] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: agent!.id,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { issueId: issue!.id, taskId: issue!.id, source: "legacy_recovery" },
+    }).returning();
+
+    await expect(pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start:legacy-owner-active",
+      actor: { type: "user", userId: "board-user" },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: expect.objectContaining({
+        code: "graph_run_legacy_issue_owner_active",
+        legacyRunId: legacyRun!.id,
+      }),
+    });
+    await expect(db.select().from(pipelineGraphRuns)
+      .where(eq(pipelineGraphRuns.caseId, ingested.case.id))).resolves.toHaveLength(0);
+  });
+
   it("redirects cycle exhaustion and fences wake delivery receipts", async () => {
     const fixture = await seedLinearPipeline();
     const [reviewStage] = await db.insert(pipelineStages).values({

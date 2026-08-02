@@ -31,6 +31,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { pipelineGraphRunService } from "../services/pipeline-graph-runs.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -94,6 +95,8 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
   for (let attempt = 0; attempt < 10; attempt += 1) {
     try {
       await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS paperclip_test_block_promoted_run ON "heartbeat_runs";
+        DROP FUNCTION IF EXISTS paperclip_test_block_promoted_run();
         DROP TRIGGER IF EXISTS paperclip_test_reassign_after_claim ON "heartbeat_runs";
         DROP FUNCTION IF EXISTS paperclip_test_reassign_after_claim();
         TRUNCATE TABLE
@@ -190,7 +193,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 20_000);
 
   async function seedCompanyAndAgent(opts: SeedOptions = {}): Promise<SeedResult> {
     const companyId = randomUUID();
@@ -1247,6 +1250,378 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(deferred?.status).not.toBe("deferred_issue_execution");
     expect(promotedRun?.agentId).toBe(peerAgentId);
   });
+
+  it("serializes real deferred-wake promotion against graph activation", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: { maxDailyRuns: 1 },
+    });
+    const peerAgentId = randomUUID();
+    const issueId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const queuedRunId = randomUUID();
+    const deferredWakeupId = randomUUID();
+    await db.insert(agents).values({
+      id: peerAgentId,
+      companyId,
+      name: "DeferredPeer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "succeeded",
+      createdAt: new Date(),
+      startedAt: new Date(),
+      finishedAt: new Date(),
+      contextSnapshot: {},
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "manual",
+      payload: { issueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: { issueId },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Deferred promotion race",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: peerAgentId,
+      executionRunId: queuedRunId,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupId,
+      companyId,
+      agentId: peerAgentId,
+      source: "comment",
+      triggerDetail: "mention",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_mention" },
+      },
+      status: "deferred_issue_execution",
+    });
+    await db.update(agentWakeupRequests)
+      .set({ runId: queuedRunId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId,
+      key: `promotion-race-${randomUUID()}`,
+      name: "Promotion race",
+    }).returning();
+    const [stage] = await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "work",
+      name: "Work",
+      kind: "working",
+      position: 100,
+    }).returning();
+    const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      version: 1,
+      definitionHash: "c".repeat(64),
+      schemaVersion: 1,
+      definition: {
+        schemaVersion: 1,
+        entryNodeKey: "work",
+        nodes: [{ key: "work", kind: "working", name: "Work", config: {} }],
+        edges: [],
+      },
+      status: "active",
+      createdByType: "user",
+      createdById: "board-user",
+      activatedByType: "user",
+      activatedById: "board-user",
+      activatedAt: new Date(),
+    }).returning();
+    const [pipelineCase] = await db.insert(pipelineCases).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      stageId: stage!.id,
+      caseKey: `promotion-race-${randomUUID()}`,
+      title: "Promotion race",
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId,
+      caseId: pipelineCase!.id,
+      issueId,
+      role: "work",
+    });
+
+    const barrierKey = `paperclip-test-promotion:${randomUUID()}`;
+    await db.execute(sql.raw(`
+      CREATE OR REPLACE FUNCTION paperclip_test_block_promoted_run()
+      RETURNS trigger AS $$
+      BEGIN
+        IF NEW.wakeup_request_id::text = '${deferredWakeupId}' THEN
+          PERFORM pg_advisory_xact_lock(hashtextextended('${barrierKey}', 0));
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER paperclip_test_block_promoted_run
+      BEFORE INSERT ON heartbeat_runs
+      FOR EACH ROW EXECUTE FUNCTION paperclip_test_block_promoted_run();
+    `));
+
+    let releaseBarrier!: () => void;
+    const barrierMayRelease = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+    let markBarrierHeld!: () => void;
+    const barrierHeld = new Promise<void>((resolve) => { markBarrierHeld = resolve; });
+    const barrier = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${barrierKey}, 0))`);
+      markBarrierHeld();
+      await barrierMayRelease;
+    });
+    await barrierHeld;
+
+    let releasePeerExecution!: () => void;
+    const peerMayFinish = new Promise<void>((resolve) => { releasePeerExecution = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await peerMayFinish;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Deferred owner completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const promotion = heartbeat.resumeQueuedRuns();
+    const promotionWaiting = await waitForCondition(async () => {
+      const result = await db.execute(sql`
+        select exists (
+          select 1 from pg_locks
+          where locktype = 'advisory'
+            and not granted
+            and classid = (((hashtextextended(${barrierKey}, 0) >> 32) & 4294967295)::oid)
+            and objid = ((hashtextextended(${barrierKey}, 0) & 4294967295)::oid)
+        ) as waiting
+      `) as unknown as Array<{ waiting: boolean }>;
+      return result[0]?.waiting === true;
+    });
+    expect(promotionWaiting).toBe(true);
+
+    let activationSettled = false;
+    const activation = pipelineGraphRunService(db).start({
+      companyId,
+      caseId: pipelineCase!.id,
+      idempotencyKey: `promotion-race-${randomUUID()}`,
+      actor: { type: "user", userId: "board-user" },
+    }).then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    ).finally(() => { activationSettled = true; });
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      expect(activationSettled).toBe(false);
+      releaseBarrier();
+      await barrier;
+      const activationResult = await activation;
+      expect(activationResult.ok).toBe(false);
+      if (activationResult.ok) throw new Error("Expected graph activation to redirect");
+      expect(activationResult.error).toMatchObject({
+        status: 409,
+        details: expect.objectContaining({ code: "graph_run_legacy_issue_owner_active" }),
+      });
+      expect(await db.select().from(pipelineGraphRuns)
+        .where(eq(pipelineGraphRuns.caseId, pipelineCase!.id))).toHaveLength(0);
+      const [deferred] = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeupId));
+      expect(deferred?.status).not.toBe("deferred_issue_execution");
+      expect(deferred?.runId).toBeTruthy();
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      releasePeerExecution();
+      await promotion;
+      const peerSettled = await waitForCondition(async () => {
+        if (!deferred?.runId) return true;
+        const [run] = await db.select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, deferred.runId));
+        return !run || ["succeeded", "failed", "cancelled", "timed_out"].includes(run.status);
+      });
+      expect(peerSettled).toBe(true);
+    } finally {
+      releaseBarrier();
+      releasePeerExecution();
+      await barrier.catch(() => undefined);
+    }
+
+    await db.execute(sql.raw(`
+      DROP TRIGGER IF EXISTS paperclip_test_block_promoted_run ON heartbeat_runs;
+      DROP FUNCTION IF EXISTS paperclip_test_block_promoted_run();
+    `));
+  }, 20_000);
+
+  it("redirects deferred responsibility when the graph already owns the issue", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Graph-owned deferred wake",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const [pipeline] = await db.insert(pipelines).values({
+      companyId,
+      key: `graph-wins-${randomUUID()}`,
+      name: "Graph wins",
+    }).returning();
+    const [stage] = await db.insert(pipelineStages).values({
+      pipelineId: pipeline!.id,
+      key: "work",
+      name: "Work",
+      kind: "working",
+      position: 100,
+    }).returning();
+    const [graphVersion] = await db.insert(pipelineGraphVersions).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      version: 1,
+      definitionHash: "d".repeat(64),
+      schemaVersion: 1,
+      definition: {
+        schemaVersion: 1,
+        entryNodeKey: "work",
+        nodes: [{ key: "work", kind: "working", name: "Work", config: {} }],
+        edges: [],
+      },
+      status: "active",
+      createdByType: "user",
+      createdById: "board-user",
+      activatedByType: "user",
+      activatedById: "board-user",
+      activatedAt: new Date(),
+    }).returning();
+    const [pipelineCase] = await db.insert(pipelineCases).values({
+      companyId,
+      pipelineId: pipeline!.id,
+      graphVersionId: graphVersion!.id,
+      stageId: stage!.id,
+      caseKey: `graph-wins-${randomUUID()}`,
+      title: "Graph wins",
+    }).returning();
+    await db.insert(pipelineCaseIssueLinks).values({
+      companyId,
+      caseId: pipelineCase!.id,
+      issueId,
+      role: "work",
+    });
+    const graphOwner = await pipelineGraphRunService(db).start({
+      companyId,
+      caseId: pipelineCase!.id,
+      idempotencyKey: `graph-wins-${randomUUID()}`,
+      actor: { type: "user", userId: "board-user" },
+    });
+
+    const secondWakeupRequestId = randomUUID();
+    const secondQueuedRunId = randomUUID();
+    const secondDeferredWakeupId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: secondWakeupRequestId,
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "manual",
+      payload: {
+        issueId,
+        pipelineGraphWake: true,
+        graphRunId: graphOwner.run.id,
+        graphRunRevision: graphOwner.run.revision,
+      },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: secondQueuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "queued",
+      wakeupRequestId: secondWakeupRequestId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        pipelineGraphWake: true,
+        graphRunId: graphOwner.run.id,
+        graphRunRevision: graphOwner.run.revision,
+        targetNodeKey: graphOwner.run.currentNodeKey,
+      },
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: secondDeferredWakeupId,
+      companyId,
+      agentId,
+      source: "comment",
+      triggerDetail: "mention",
+      reason: "issue_execution_deferred",
+      payload: { issueId, _paperclipWakeContext: { issueId, wakeReason: "issue_mention" } },
+      status: "deferred_issue_execution",
+    });
+    await db.update(agentWakeupRequests)
+      .set({ runId: secondQueuedRunId })
+      .where(eq(agentWakeupRequests.id, secondWakeupRequestId));
+    await db.update(issues).set({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      executionRunId: secondQueuedRunId,
+      executionAgentNameKey: null,
+      executionLockedAt: new Date(),
+    }).where(eq(issues.id, issueId));
+
+    await heartbeat.cancelRun(secondQueuedRunId, "Graph wake finalizer proof", {
+      suppressImmediateRecovery: true,
+    });
+    const [redirectedDeferred] = await db.select({
+      status: agentWakeupRequests.status,
+      error: agentWakeupRequests.error,
+      runId: agentWakeupRequests.runId,
+    }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, secondDeferredWakeupId));
+    expect(redirectedDeferred).toMatchObject({
+      status: "cancelled",
+      runId: null,
+      error: expect.stringContaining(`Responsibility redirected to active pipeline graph run ${graphOwner.run.id}`),
+    });
+    expect(await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.wakeupRequestId, secondDeferredWakeupId))).toHaveLength(0);
+  }, 15_000);
 
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OriginalCoder" });

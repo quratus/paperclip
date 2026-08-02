@@ -39,6 +39,7 @@ import {
   type PipelineStageConfig,
   type PipelineStageKind,
 } from "../services/pipelines.js";
+import { graphCaseLockKey, graphRecoveryOwnershipLockKey } from "../services/pipeline-graph-ownership.js";
 import {
   COMPANY_CASE_EVENTS_DEFAULT_LIMIT,
   COMPANY_CASE_EVENTS_MAX_LIMIT,
@@ -2786,6 +2787,46 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
     await assertIssueLinkMutationAllowed(req, { access, issuesSvc, issue: targetIssue });
     try {
       const link = await db.transaction(async (tx) => {
+        const caseLock = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(
+            hashtextextended(${graphCaseLockKey(caseId)}, 0)
+          ) as acquired`,
+        );
+        if (!(caseLock as unknown as Array<{ acquired: boolean }>)[0]?.acquired) {
+          throw conflict("Pipeline case ownership is changing; retry adding this link", {
+            code: "pipeline_case_ownership_busy",
+            retryable: true,
+          });
+        }
+        if (req.body.role === "origin" || req.body.role === "work") {
+          const activeRun = await tx
+            .select({ id: pipelineGraphRuns.id })
+            .from(pipelineGraphRuns)
+            .where(and(
+              eq(pipelineGraphRuns.companyId, companyId),
+              eq(pipelineGraphRuns.caseId, caseId),
+              inArray(pipelineGraphRuns.status, ["running", "paused"]),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (activeRun) {
+            throw conflict("Active graph ownership links cannot change until the run reaches a terminal state", {
+              code: "pipeline_graph_active_ownership_link",
+              graphRunId: activeRun.id,
+            });
+          }
+          const lockResult = await tx.execute(sql`
+            select pg_try_advisory_xact_lock(
+              hashtextextended(${graphRecoveryOwnershipLockKey(companyId, req.body.issueId)}, 0)
+            ) as acquired
+          `);
+          const lockRows = lockResult as unknown as Array<{ acquired: boolean }>;
+          if (!lockRows[0]?.acquired) {
+            throw conflict("Issue ownership is changing; retry this link request", {
+              code: "pipeline_issue_ownership_busy",
+              retryable: true,
+            });
+          }
+        }
         const [created] = await tx.insert(pipelineCaseIssueLinks).values({
           companyId,
           caseId,
@@ -2814,7 +2855,7 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
     const companyId = await assertCaseAccess(db, req, caseId);
     const actor = actorForMutation(req);
     const existingLink = await db
-      .select({ issueId: pipelineCaseIssueLinks.issueId })
+      .select({ issueId: pipelineCaseIssueLinks.issueId, role: pipelineCaseIssueLinks.role })
       .from(pipelineCaseIssueLinks)
       .where(and(
         eq(pipelineCaseIssueLinks.id, linkId),
@@ -2828,6 +2869,46 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
     if (!targetIssue) throw notFound("Issue not found");
     await assertIssueLinkMutationAllowed(req, { access, issuesSvc, issue: targetIssue });
     const deleted = await db.transaction(async (tx) => {
+      const caseLock = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(
+          hashtextextended(${graphCaseLockKey(caseId)}, 0)
+        ) as acquired`,
+      );
+      if (!(caseLock as unknown as Array<{ acquired: boolean }>)[0]?.acquired) {
+        throw conflict("Pipeline case ownership is changing; retry removing this link", {
+          code: "pipeline_case_ownership_busy",
+          retryable: true,
+        });
+      }
+      if (existingLink.role === "origin" || existingLink.role === "work") {
+        const activeRun = await tx
+          .select({ id: pipelineGraphRuns.id })
+          .from(pipelineGraphRuns)
+          .where(and(
+            eq(pipelineGraphRuns.companyId, companyId),
+            eq(pipelineGraphRuns.caseId, caseId),
+            inArray(pipelineGraphRuns.status, ["running", "paused"]),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (activeRun) {
+          throw conflict("Active graph ownership links cannot change until the run reaches a terminal state", {
+            code: "pipeline_graph_active_ownership_link",
+            graphRunId: activeRun.id,
+          });
+        }
+        const lockResult = await tx.execute(sql`
+          select pg_try_advisory_xact_lock(
+            hashtextextended(${graphRecoveryOwnershipLockKey(companyId, existingLink.issueId)}, 0)
+          ) as acquired
+        `);
+        const lockRows = lockResult as unknown as Array<{ acquired: boolean }>;
+        if (!lockRows[0]?.acquired) {
+          throw conflict("Issue ownership is changing; retry removing this link", {
+            code: "pipeline_issue_ownership_busy",
+            retryable: true,
+          });
+        }
+      }
       const [removed] = await tx
         .delete(pipelineCaseIssueLinks)
         .where(and(
