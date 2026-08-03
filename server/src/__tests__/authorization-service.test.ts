@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -1764,6 +1765,67 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(denied).toMatchObject({
       allowed: false,
       reason: "deny_scope",
+    });
+  });
+
+  it("allows a manager to reassign an issue away from a paused assignee, but not an active one", async () => {
+    const company = await createCompany(db, "ReassignPausedAssignee");
+    const managerAgent = await createAgent(db, company.id);
+    const pausedAssignee = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const activeAssignee = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const outsideAssignee = await createAgent(db, company.id);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, pausedAssignee.id));
+    const issueOnPaused = await createIssue(db, company.id, { assigneeAgentId: pausedAssignee.id });
+    const issueOnActive = await createIssue(db, company.id, { assigneeAgentId: activeAssignee.id });
+    const issueOnOutsidePaused = await createIssue(db, company.id, { assigneeAgentId: outsideAssignee.id });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, outsideAssignee.id));
+    const authz = authorizationService(db);
+    const actor = {
+      type: "agent" as const,
+      agentId: managerAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    await expect(authz.decide({
+      actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issueOnPaused.id,
+        assigneeAgentId: pausedAssignee.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_manager_reassign_paused_assignee",
+    });
+
+    await expect(authz.decide({
+      actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issueOnActive.id,
+        assigneeAgentId: activeAssignee.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+    });
+
+    // Paused alone is not enough -- the actor must actually manage that agent.
+    await expect(authz.decide({
+      actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issueOnOutsidePaused.id,
+        assigneeAgentId: outsideAssignee.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
     });
   });
 
