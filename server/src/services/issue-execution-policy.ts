@@ -760,7 +760,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         };
       }
 
-      if (requestedStatus && requestedStatus !== "in_review") {
+      if (requestedStatus && requestedStatus !== "in_review" && requestedStatus !== "blocked" && requestedStatus !== "cancelled") {
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }
