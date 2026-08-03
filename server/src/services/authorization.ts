@@ -107,6 +107,7 @@ export type AuthorizationDecision = {
     | "allow_company_member"
     | "allow_simple_company_member"
     | "allow_manager_chain"
+    | "allow_manager_reassign_paused_assignee"
     | "inbox_target_user_unresolved"
     | "inbox_management_disabled"
     | "inbox_agent_not_allowed"
@@ -1912,6 +1913,21 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowIssueMentionGrant(input.action);
+      }
+      if (
+        input.action === "issue:mutate" &&
+        resource?.assigneeAgentId &&
+        (await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId))
+      ) {
+        const currentAssignee = await loadAgent(resource.assigneeAgentId);
+        if (currentAssignee?.status === "paused") {
+          return allow({
+            action: input.action,
+            reason: "allow_manager_reassign_paused_assignee",
+            explanation:
+              "Allowed because the current assignee is paused (no active run to protect) and the actor manages that agent in the reporting chain.",
+          });
+        }
       }
     }
     if (
