@@ -336,11 +336,15 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+// Widened 2026-08-03: transient failures on a resource-constrained host (CPU
+// starvation killing a run mid-execution) were retrying back into the same
+// still-overloaded window every ~2 minutes, producing repeated bounces
+// instead of giving load room to actually clear between attempts.
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
-  2 * 60 * 1000,
-  10 * 60 * 1000,
-  30 * 60 * 1000,
-  2 * 60 * 60 * 1000,
+  5 * 60 * 1000,
+  20 * 60 * 1000,
+  45 * 60 * 1000,
+  3 * 60 * 60 * 1000,
 ] as const;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
