@@ -9727,6 +9727,85 @@ export function issueRoutes(
     res.json(result);
   });
 
+  // SQN-4980: authorized force-reconcile of orphaned run ownership. Gives a
+  // control-plane authority a path to clear dead checkoutRunId/executionRunId
+  // pointers on an issue owned by another agent, which the normal issue:mutate
+  // assignee boundary denies. Authority: a board user with company access, or an
+  // agent that holds tasks:manage_active_checkouts over the issue assignee
+  // (manager chain / legacy CEO). Preserves assignee + status; live runs are
+  // never cleared; every call is audited.
+  router.post("/issues/:id/admin/reconcile-run-ownership", async (req, res) => {
+    const id = req.params.id as string;
+    // getAccessibleResource enforces company scope for both agent and board
+    // actors (including the unassigned-issue case) and rejects viewer-role
+    // board memberships on this mutating method, before any business-logic
+    // authorization below runs.
+    const raw = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!raw) return;
+
+    let authorized = false;
+    if (req.actor.type === "board") {
+      if (!req.actor.userId) {
+        throw forbidden("Board user context required");
+      }
+      authorized = true;
+    } else if (req.actor.type === "agent") {
+      const actorAgentId = req.actor.agentId;
+      if (!actorAgentId) {
+        res.status(403).json({ error: "Agent authentication required" });
+        return;
+      }
+      authorized = raw.assigneeAgentId
+        ? await hasActiveCheckoutManagementOverride(actorAgentId, raw.companyId, raw.assigneeAgentId)
+        : true;
+    }
+
+    if (!authorized) {
+      res.status(403).json({
+        error: "Force-reconcile requires control-plane authority over the issue assignee",
+        details: {
+          issueId: raw.id,
+          assigneeAgentId: raw.assigneeAgentId,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const result = await svc.forceReconcileRunOwnership(id, {
+      runId: actor.runId,
+      label: req.actor.type === "board"
+        ? `board user ${req.actor.userId}`
+        : `agent ${actor.agentId}`,
+    });
+    if (!result) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+
+    await logActivity(db, {
+      companyId: result.issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.admin_reconcile_run_ownership",
+      entityType: "issue",
+      entityId: result.issue.id,
+      details: {
+        issueId: result.issue.id,
+        prevCheckoutRunId: result.previous.checkoutRunId,
+        prevExecutionRunId: result.previous.executionRunId,
+        reconciledCheckoutRunId: result.reconciled.checkoutRunId,
+        reconciledExecutionRunId: result.reconciled.executionRunId,
+      },
+    });
+
+    res.json(result);
+  });
+
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");

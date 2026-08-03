@@ -3768,6 +3768,15 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/admin/reconcile-run-ownership",
+  tags: ["issues"],
+  summary: "Force-reconcile orphaned checkout/execution run ownership (admin)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/tree-control/state",
   tags: ["issues"],
