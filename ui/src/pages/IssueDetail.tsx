@@ -119,6 +119,7 @@ import { ScrollToBottom } from "../components/ScrollToBottom";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { ProductivityReviewBadge } from "../components/ProductivityReviewBadge";
+import { RejectApprovalDialog } from "../components/RejectApprovalDialog";
 import { Identity } from "../components/Identity";
 import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
 import { PluginLauncherOutlet } from "@/plugins/launchers";
@@ -1538,6 +1539,7 @@ export function IssueDetail() {
     approvalId: string;
     action: "approve" | "reject";
   } | null>(null);
+  const [rejectApprovalId, setRejectApprovalId] = useState<string | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [galleryOpen, setGalleryOpen] = useState(false);
@@ -2380,11 +2382,19 @@ export function IssueDetail() {
   });
 
   const approvalDecision = useMutation({
-    mutationFn: async ({ approvalId, action }: { approvalId: string; action: "approve" | "reject" }) => {
+    mutationFn: async ({
+      approvalId,
+      action,
+      decisionNote,
+    }: {
+      approvalId: string;
+      action: "approve" | "reject";
+      decisionNote?: string;
+    }) => {
       if (action === "approve") {
         return approvalsApi.approve(approvalId);
       }
-      return approvalsApi.reject(approvalId);
+      return approvalsApi.reject(approvalId, decisionNote);
     },
     onMutate: ({ approvalId, action }) => {
       setPendingApprovalAction({ approvalId, action });
@@ -2401,6 +2411,9 @@ export function IssueDetail() {
         title: variables.action === "approve" ? "Approval approved" : "Approval rejected",
         tone: "success",
       });
+      if (variables.action === "reject") {
+        setRejectApprovalId(null);
+      }
     },
     onError: (err, variables) => {
       pushToast({
@@ -4826,6 +4839,10 @@ export function IssueDetail() {
               pendingApprovalAction={pendingApprovalAction}
               handoffFocusSignal={handoffFocusSignal}
               onApprovalAction={(approvalId, action) => {
+                if (action === "reject") {
+                  setRejectApprovalId(approvalId);
+                  return;
+                }
                 approvalDecision.mutate({ approvalId, action });
               }}
               onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
@@ -5048,6 +5065,18 @@ export function IssueDetail() {
           onPromptOpenChange={setFileViewerPromptOpen}
         />
       ) : null}
+      <RejectApprovalDialog
+        open={rejectApprovalId !== null}
+        pending={approvalDecision.isPending && approvalDecision.variables?.action === "reject"}
+        error={approvalDecision.error instanceof Error ? approvalDecision.error.message : null}
+        onOpenChange={(open) => {
+          if (!open) setRejectApprovalId(null);
+        }}
+        onConfirm={(decisionNote) => {
+          if (!rejectApprovalId) return;
+          approvalDecision.mutate({ approvalId: rejectApprovalId, action: "reject", decisionNote });
+        }}
+      />
       <ScrollToBottom />
     </div>
     </FileViewerProvider>

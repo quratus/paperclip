@@ -76,6 +76,7 @@ import { IssueFiltersPopover } from "../components/IssueFiltersPopover";
 import { IssueRow } from "../components/IssueRow";
 import { BlockedInboxView } from "../components/BlockedInboxView";
 import { SwipeToArchive } from "../components/SwipeToArchive";
+import { RejectApprovalDialog } from "../components/RejectApprovalDialog";
 
 import { StatusIcon } from "../components/StatusIcon";
 import { cn } from "../lib/utils";
@@ -1512,6 +1513,7 @@ export function Inbox() {
     setGroupBy(nextGroupBy);
     saveInboxWorkItemGroupBy(nextGroupBy);
   }, []);
+  const [rejectApprovalId, setRejectApprovalId] = useState<string | null>(null);
 
   const approveMutation = useMutation({
     mutationFn: (id: string) => approvalsApi.approve(id),
@@ -1526,9 +1528,11 @@ export function Inbox() {
   });
 
   const rejectMutation = useMutation({
-    mutationFn: (id: string) => approvalsApi.reject(id),
+    mutationFn: ({ id, decisionNote }: { id: string; decisionNote: string }) =>
+      approvalsApi.reject(id, decisionNote),
     onSuccess: () => {
       setActionError(null);
+      setRejectApprovalId(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(selectedCompanyId!) });
     },
     onError: (err) => {
@@ -2775,7 +2779,7 @@ export function Inbox() {
                           selected={isSelected}
                           requesterName={agentName(item.approval.requestedByAgentId)}
                           onApprove={() => approveMutation.mutate(item.approval.id)}
-                          onReject={() => rejectMutation.mutate(item.approval.id)}
+                          onReject={() => setRejectApprovalId(item.approval.id)}
                           isPending={approveMutation.isPending || rejectMutation.isPending}
                           unreadState={nonIssueUnreadState(approvalKey)}
                           onMarkRead={() => handleMarkNonIssueRead(approvalKey)}
@@ -3026,6 +3030,18 @@ export function Inbox() {
         </>
       )}
 
+      <RejectApprovalDialog
+        open={rejectApprovalId !== null}
+        pending={rejectMutation.isPending}
+        error={rejectMutation.error instanceof Error ? rejectMutation.error.message : null}
+        onOpenChange={(open) => {
+          if (!open) setRejectApprovalId(null);
+        }}
+        onConfirm={(decisionNote) => {
+          if (!rejectApprovalId) return;
+          rejectMutation.mutate({ id: rejectApprovalId, decisionNote });
+        }}
+      />
     </div>
   );
 }

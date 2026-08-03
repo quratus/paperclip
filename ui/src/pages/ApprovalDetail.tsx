@@ -15,6 +15,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { CheckCircle2, ChevronRight, Sparkles } from "lucide-react";
 import type { ApprovalComment } from "@paperclipai/shared";
 import { MarkdownBody } from "../components/MarkdownBody";
+import { RejectApprovalDialog } from "../components/RejectApprovalDialog";
 
 export function ApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -26,6 +27,7 @@ export function ApprovalDetail() {
   const [commentBody, setCommentBody] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [showRawPayload, setShowRawPayload] = useState(false);
+  const [rejectOpen, setRejectOpen] = useState(false);
 
   const { data: approval, isLoading } = useQuery({
     queryKey: queryKeys.approvals.detail(approvalId!),
@@ -95,9 +97,10 @@ export function ApprovalDetail() {
   });
 
   const rejectMutation = useMutation({
-    mutationFn: () => approvalsApi.reject(approvalId!),
+    mutationFn: (decisionNote: string) => approvalsApi.reject(approvalId!, decisionNote),
     onSuccess: () => {
       setError(null);
+      setRejectOpen(false);
       refresh();
     },
     onError: (err) => setError(err instanceof Error ? err.message : "Reject failed"),
@@ -274,7 +277,7 @@ export function ApprovalDetail() {
               <Button
                 variant="destructive"
                 size="sm"
-                onClick={() => rejectMutation.mutate()}
+                onClick={() => setRejectOpen(true)}
                 disabled={rejectMutation.isPending}
               >
                 Reject
@@ -322,6 +325,13 @@ export function ApprovalDetail() {
           )}
         </div>
       </div>
+      <RejectApprovalDialog
+        open={rejectOpen}
+        pending={rejectMutation.isPending}
+        error={rejectMutation.error instanceof Error ? rejectMutation.error.message : null}
+        onOpenChange={setRejectOpen}
+        onConfirm={(decisionNote) => rejectMutation.mutate(decisionNote)}
+      />
 
       <div className="border border-border rounded-lg p-4 space-y-3">
         <h3 className="text-sm font-medium">Comments ({comments?.length ?? 0})</h3>

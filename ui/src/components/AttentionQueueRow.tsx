@@ -41,6 +41,7 @@ import {
 } from "./ui/dropdown-menu";
 import { AttentionInteractionResolver } from "./AttentionInteractionResolver";
 import { ProjectTile } from "./ProjectTile";
+import { RejectApprovalDialog } from "./RejectApprovalDialog";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -392,12 +393,13 @@ function CompactDecisionActions({
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
   const actions = collectCompactActions(item);
+  const [rejectOpen, setRejectOpen] = useState(false);
 
-  const decision = useMutation<unknown, Error, CompactDecisionAction>({
-    mutationFn: (action: CompactDecisionAction) => {
+  const decision = useMutation<unknown, Error, { action: CompactDecisionAction; decisionNote?: string }>({
+    mutationFn: ({ action, decisionNote }) => {
       if (item.sourceKind === "approval") {
         if (action === "approve") return approvalsApi.approve(item.subject.id);
-        if (action === "reject") return approvalsApi.reject(item.subject.id);
+        if (action === "reject") return approvalsApi.reject(item.subject.id, decisionNote);
         return approvalsApi.requestRevision(item.subject.id);
       }
       if (item.sourceKind === "join_request") {
@@ -413,21 +415,24 @@ function CompactDecisionActions({
       }
       throw new Error("This decision must be completed from its detail view.");
     },
-    onSuccess: (_result, action) => {
+    onSuccess: (_result, variables) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.attention(companyId) });
       if (item.sourceKind === "approval") {
         queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId) });
       } else {
         queryClient.invalidateQueries({ queryKey: queryKeys.access.joinRequests(companyId) });
       }
+      if (item.sourceKind === "approval" && variables.action === "reject") {
+        setRejectOpen(false);
+      }
       pushToast({
-        title: compactDecisionSuccessLabel(item.sourceKind, action),
+        title: compactDecisionSuccessLabel(item.sourceKind, variables.action),
         tone: "success",
       });
     },
-    onError: (error, action) => {
+    onError: (error, variables) => {
       pushToast({
-        title: `Could not ${decisionLabel(action)}`,
+        title: `Could not ${decisionLabel(variables.action)}`,
         body: error instanceof Error ? error.message : "Please try again.",
         tone: "error",
       });
@@ -437,29 +442,42 @@ function CompactDecisionActions({
   if (actions.length === 0) return null;
 
   return (
-    <div className="flex w-full flex-wrap items-center gap-2 @xl:w-auto @xl:justify-end @xl:gap-1" aria-label="Decision actions">
-      {actions.map(({ action, id, label }) => (
-        <Button
-          key={id}
-          type="button"
-          variant={decisionVerbVariant({ id, label, description: "" })}
-          size="xs"
-          className={cn(ACTION_BTN, "min-w-0 flex-1 @xl:flex-none")}
-          disabled={decision.isPending}
-          onClick={(event) => {
-            event.stopPropagation();
-            if (item.sourceKind === "issue_thread_interaction" && action === "reject") {
-              onOpen();
-              return;
-            }
-            decision.mutate(action);
-          }}
-        >
-          {decision.isPending && decision.variables === action && <Loader2 className="h-3 w-3 animate-spin" />}
-          {label}
-        </Button>
-      ))}
-    </div>
+    <>
+      <div className="flex w-full flex-wrap items-center gap-2 @xl:w-auto @xl:justify-end @xl:gap-1" aria-label="Decision actions">
+        {actions.map(({ action, id, label }) => (
+          <Button
+            key={id}
+            type="button"
+            variant={decisionVerbVariant({ id, label, description: "" })}
+            size="xs"
+            className={cn(ACTION_BTN, "min-w-0 flex-1 @xl:flex-none")}
+            disabled={decision.isPending}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (item.sourceKind === "approval" && action === "reject") {
+                setRejectOpen(true);
+                return;
+              }
+              if (item.sourceKind === "issue_thread_interaction" && action === "reject") {
+                onOpen();
+                return;
+              }
+              decision.mutate({ action });
+            }}
+          >
+            {decision.isPending && decision.variables?.action === action && <Loader2 className="h-3 w-3 animate-spin" />}
+            {label}
+          </Button>
+        ))}
+      </div>
+      <RejectApprovalDialog
+        open={rejectOpen}
+        pending={decision.isPending && decision.variables?.action === "reject"}
+        error={decision.error instanceof Error ? decision.error.message : null}
+        onOpenChange={setRejectOpen}
+        onConfirm={(decisionNote) => decision.mutate({ action: "reject", decisionNote })}
+      />
+    </>
   );
 }
 
@@ -683,6 +701,8 @@ function InlineResolver({
 function ApprovalResolver({ item, companyId }: { item: AttentionItem; companyId: string }) {
   const queryClient = useQueryClient();
   const [note, setNote] = useState("");
+  const [rejectAttempted, setRejectAttempted] = useState(false);
+  const trimmedNote = note.trim();
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: queryKeys.attention(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId) });
@@ -692,8 +712,11 @@ function ApprovalResolver({ item, companyId }: { item: AttentionItem; companyId:
     onSuccess: invalidate,
   });
   const reject = useMutation({
-    mutationFn: () => approvalsApi.reject(item.subject.id, note.trim() || undefined),
-    onSuccess: invalidate,
+    mutationFn: () => approvalsApi.reject(item.subject.id, trimmedNote),
+    onSuccess: () => {
+      setRejectAttempted(false);
+      invalidate();
+    },
   });
   const revise = useMutation({
     mutationFn: () => approvalsApi.requestRevision(item.subject.id, note.trim() || undefined),
@@ -706,9 +729,13 @@ function ApprovalResolver({ item, companyId }: { item: AttentionItem; companyId:
       <Textarea
         value={note}
         onChange={(e) => setNote(e.target.value)}
-        placeholder="Optional decision note…"
+        placeholder="Decision note; required when rejecting…"
+        aria-invalid={rejectAttempted && !trimmedNote}
         className="min-h-16 text-sm"
       />
+      {rejectAttempted && !trimmedNote && (
+        <p className="text-xs text-destructive">A rejection reason is required.</p>
+      )}
       <div className="flex flex-wrap gap-2">
         <Button size="sm" onClick={() => approve.mutate()} disabled={pending}>
           {approve.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
@@ -718,7 +745,16 @@ function ApprovalResolver({ item, companyId }: { item: AttentionItem; companyId:
           {revise.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
           Request revision
         </Button>
-        <Button size="sm" variant="destructive" onClick={() => reject.mutate()} disabled={pending}>
+        <Button
+          size="sm"
+          variant="destructive"
+          onClick={() => {
+            setRejectAttempted(true);
+            if (!trimmedNote) return;
+            reject.mutate();
+          }}
+          disabled={pending}
+        >
           {reject.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
           Reject
         </Button>
