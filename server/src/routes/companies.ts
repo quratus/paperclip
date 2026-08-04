@@ -29,6 +29,7 @@ import {
   feedbackService,
   logActivity,
   workTimelineService,
+  workflowRoleService,
 } from "../services/index.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
@@ -43,6 +44,7 @@ export function companyRoutes(db: Db, storage?: StorageService) {
   const budgets = budgetService(db);
   const artifacts = companyArtifactsService(db, storage);
   const feedback = feedbackService(db);
+  const workflowRoles = workflowRoleService(db);
   const importJobs = new Map<string, ImportJobRecord>();
   const importJobTerminalRetentionMs = 5 * 60 * 1000;
 
@@ -78,6 +80,13 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     limit: z.string().optional(),
     offset: z.string().optional(),
   }).passthrough();
+
+  const workflowRoleAssignmentsSchema = z.object({
+    assignments: z.array(z.object({
+      agentId: z.string().uuid(),
+      priority: z.number().int().min(0).max(1_000_000).default(100),
+    })).max(100),
+  });
 
   function assertImportTargetAccess(
     req: Request,
@@ -143,6 +152,32 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     assertCompanyAccess(req, companyId);
     const query = companyArtifactsQuerySchema.parse(req.query);
     res.json(await artifacts.list(companyId, query));
+  });
+
+  router.get("/:companyId/workflow-roles", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    res.json(await workflowRoles.list(companyId));
+  });
+
+  router.put("/:companyId/workflow-roles/:roleKey/assignments", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const roleKey = req.params.roleKey as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const body = workflowRoleAssignmentsSchema.parse(req.body);
+    await workflowRoles.replaceAssignments({ companyId, roleKey, assignments: body.assignments });
+    await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "workflow_role.assignments_replaced",
+      entityType: "workflow_role",
+      entityId: roleKey,
+      details: { assignments: body.assignments },
+    });
+    res.json(await workflowRoles.list(companyId));
   });
 
   router.get("/:companyId/timeline", async (req, res) => {

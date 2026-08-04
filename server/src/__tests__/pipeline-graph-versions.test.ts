@@ -18,6 +18,7 @@ import {
   pipelineGraphEffectAttempts,
   pipelineGraphRunEvents,
   pipelineGraphRuns,
+  pipelineGraphRoleBindings,
   pipelineGraphWakeOutbox,
   pipelineGraphVersions,
   pipelineStages,
@@ -37,6 +38,7 @@ import {
   resolveGraphTransitionAssignmentAuthorization,
 } from "../services/pipeline-graph-runs.js";
 import { pipelineGraphOutboxService } from "../services/pipeline-graph-outbox.js";
+import { workflowRoleService } from "../services/workflow-roles.js";
 import {
   pipelineGraphEffectService,
   pipelineGraphEffectActionHash,
@@ -1252,6 +1254,103 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       [1, "run_started", { attempt: 0 }],
       [2, "checkpoint_saved", { attempt: 1, proof: "reviewed" }],
     ]);
+  });
+
+  it("binds company roles deterministically and enforces author-review-delivery separation", async () => {
+    const fixture = await seedLinearPipeline();
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "role-binding-case",
+      title: "Role binding case",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const started = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "start:role-binding-case",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const createdAgents = await db.insert(agents).values([
+      { companyId: fixture.companyId, name: "Author", role: "engineer" },
+      { companyId: fixture.companyId, name: "Reviewer", role: "engineer" },
+      { companyId: fixture.companyId, name: "Delivery", role: "engineer" },
+    ]).returning();
+    const byName = new Map(createdAgents.map((agent) => [agent.name, agent.id]));
+    const roles = workflowRoleService(db);
+    await roles.ensureCompanyDefaults(fixture.companyId);
+    await roles.replaceAssignments({
+      companyId: fixture.companyId,
+      roleKey: "implementer",
+      assignments: [{ agentId: byName.get("Author")!, priority: 0 }],
+    });
+    await roles.replaceAssignments({
+      companyId: fixture.companyId,
+      roleKey: "independent_reviewer",
+      assignments: [
+        { agentId: byName.get("Author")!, priority: 0 },
+        { agentId: byName.get("Reviewer")!, priority: 1 },
+      ],
+    });
+    await roles.replaceAssignments({
+      companyId: fixture.companyId,
+      roleKey: "delivery_owner",
+      assignments: [
+        { agentId: byName.get("Reviewer")!, priority: 0 },
+        { agentId: byName.get("Delivery")!, priority: 1 },
+      ],
+    });
+
+    const implementer = await roles.resolveAndBind({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      runRevision: 1,
+      nodeKey: "implement",
+      roleKey: "implementer",
+    });
+    const reviewer = await roles.resolveAndBind({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      runRevision: 2,
+      nodeKey: "review",
+      roleKey: "independent_reviewer",
+    });
+    const delivery = await roles.resolveAndBind({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      runRevision: 3,
+      nodeKey: "merge",
+      roleKey: "delivery_owner",
+    });
+
+    expect(implementer.agentId).toBe(byName.get("Author"));
+    expect(reviewer.agentId).toBe(byName.get("Reviewer"));
+    expect(delivery.agentId).toBe(byName.get("Delivery"));
+    await expect(roles.resolveAndBind({
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      runRevision: 2,
+      nodeKey: "review",
+      roleKey: "delivery_owner",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "graph_role_binding_conflict" },
+    });
+    expect(await db.select().from(pipelineGraphRoleBindings)).toHaveLength(3);
   });
 
   it("executes one exact-subject effect and fences graph transition on its durable receipt", async () => {

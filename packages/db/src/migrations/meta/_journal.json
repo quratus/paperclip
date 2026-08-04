@@ -1324,6 +1324,13 @@
       "when": 1785837754538,
       "tag": "0191_issue_transition_provenance",
       "breakpoints": true
+    },
+    {
+      "idx": 192,
+      "version": "7",
+      "when": 1785838744514,
+      "tag": "0192_workflow_role_resolution",
+      "breakpoints": true
     }
   ]
 }

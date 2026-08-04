@@ -15,6 +15,8 @@ import { companies } from "./companies.js";
 import { pipelineCases } from "./pipeline_cases.js";
 import { pipelineGraphVersions, pipelines } from "./pipelines.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
+import { agents } from "./agents.js";
+import { agentWorkflowRoleAssignments, workflowRoles } from "./workflow_roles.js";
 
 export const pipelineGraphRuns = pgTable(
   "pipeline_graph_runs",
@@ -237,6 +239,50 @@ export const pipelineGraphWakeOutbox = pgTable(
         )
       )`,
     ),
+  }),
+);
+
+export const pipelineGraphRoleBindings = pgTable(
+  "pipeline_graph_role_bindings",
+  {
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    runId: uuid("run_id").notNull(),
+    runRevision: integer("run_revision").notNull(),
+    nodeKey: text("node_key").notNull(),
+    roleKey: text("role_key").notNull(),
+    agentId: uuid("agent_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    nodeUq: uniqueIndex("pipeline_graph_role_bindings_node_uq")
+      .on(table.companyId, table.runId, table.runRevision, table.nodeKey),
+    roleIdx: index("pipeline_graph_role_bindings_role_idx")
+      .on(table.companyId, table.runId, table.roleKey),
+    runFk: foreignKey({
+      columns: [table.companyId, table.runId],
+      foreignColumns: [pipelineGraphRuns.companyId, pipelineGraphRuns.id],
+      name: "pipeline_graph_role_bindings_run_fk",
+    }).onDelete("cascade"),
+    roleFk: foreignKey({
+      columns: [table.companyId, table.roleKey],
+      foreignColumns: [workflowRoles.companyId, workflowRoles.key],
+      name: "pipeline_graph_role_bindings_role_fk",
+    }).onDelete("restrict"),
+    assignmentFk: foreignKey({
+      columns: [table.companyId, table.roleKey, table.agentId],
+      foreignColumns: [
+        agentWorkflowRoleAssignments.companyId,
+        agentWorkflowRoleAssignments.roleKey,
+        agentWorkflowRoleAssignments.agentId,
+      ],
+      name: "pipeline_graph_role_bindings_assignment_fk",
+    }).onDelete("restrict"),
+    agentFk: foreignKey({
+      columns: [table.companyId, table.agentId],
+      foreignColumns: [agents.companyId, agents.id],
+      name: "pipeline_graph_role_bindings_agent_fk",
+    }).onDelete("restrict"),
+    runRevisionCheck: check("pipeline_graph_role_bindings_run_revision_check", sql`${table.runRevision} > 0`),
   }),
 );
 
