@@ -717,6 +717,50 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("authorizes internal child work only when chat carries its durable orchestration issue", () => {
+    const prompt = renderPaperclipWakePrompt({
+      chat: {
+        sessionId: "chat-1",
+        userMessage: "Prepare the launch brief.",
+        orchestrationIssue: { id: "issue-chat-1", title: "Founder conversation", status: "backlog" },
+      },
+      issue: { id: "issue-chat-1", identifier: "PAP-1", title: "Founder conversation", status: "backlog" },
+    });
+
+    expect(prompt).toContain("Live Chat");
+    expect(prompt).toContain("Create and assign ordinary internal work yourself");
+    expect(prompt).toContain("issue-chat-1");
+    expect(prompt).toContain("external, irreversible, paid, security-sensitive");
+    expect(prompt).not.toContain("check your assigned work");
+  });
+
+  it("renders transition provenance and typed block clearing context", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "source_scoped_recovery_action",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Recover", status: "blocked" },
+      transition: {
+        id: "transition-1",
+        fromStatus: "in_progress",
+        toStatus: "blocked",
+        reason: "recovery_action",
+        actor: { type: "system", id: "recovery", agentId: null, runId: "run-1" },
+        evidenceRef: { type: "recovery_action", id: "recovery-1" },
+        block: { kind: "wait_internal", clearingCondition: "Restore the assigned execution path." },
+        occurredAt: "2026-08-04T10:00:00.000Z",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("transition: in_progress -> blocked");
+    expect(prompt).toContain("transition actor: system recovery");
+    expect(prompt).toContain("transition reason: recovery_action");
+    expect(prompt).toContain("transition evidence: recovery_action:recovery-1");
+    expect(prompt).toContain("block kind: wait_internal");
+    expect(prompt).toContain("clearing condition: Restore the assigned execution path.");
+  });
+
   it("preserves and renders a complete graph assignment contract", () => {
     const graphAssignment = {
       schemaVersion: 1,

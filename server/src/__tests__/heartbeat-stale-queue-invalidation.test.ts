@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRecoveryActions,
   issues,
   pipelineCaseIssueLinks,
   pipelineCases,
@@ -268,7 +269,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     return { runId, wakeupRequestId };
   }
 
-  it.each(["issue_assigned", "issue_commented"] as const)(
+  it.each(["issue_assigned", "issue_commented", "issue_comment_mentioned"] as const)(
     "cancels a %s run reassigned after pre-claim validation but before execution-lock acquisition",
     async (wakeReason) => {
     const { companyId, agentId: formerOwnerId } = await seedCompanyAndAgent({ agentName: "Former Owner" });
@@ -299,7 +300,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       agentId: formerOwnerId,
       issueId,
       wakeReason,
-      contextExtras: wakeReason === "issue_commented"
+      contextExtras: wakeReason === "issue_commented" || wakeReason === "issue_comment_mentioned"
         ? { commentId: wakeCommentId, wakeCommentId }
         : undefined,
     });
@@ -342,6 +343,93 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(issue).toEqual({ assigneeAgentId: currentOwnerId, executionRunId: null });
     },
   );
+
+  it("acquires the issue execution lock for an authorized source-scoped recovery owner", async () => {
+    const { companyId, agentId: sourceOwnerId } = await seedCompanyAndAgent({ agentName: "Source Owner" });
+    const recoveryOwnerId = randomUUID();
+    const issueId = randomUUID();
+    const recoveryActionId = randomUUID();
+    await db.insert(agents).values({
+      id: recoveryOwnerId,
+      companyId,
+      name: "Recovery Owner",
+      role: "operations",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Recover without bypassing ownership",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: sourceOwnerId,
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwnerId,
+      previousOwnerAgentId: sourceOwnerId,
+      returnOwnerAgentId: sourceOwnerId,
+      cause: "process_lost",
+      fingerprint: `process_lost:${issueId}`,
+      evidence: {},
+      nextAction: "Restore the execution path and return ownership.",
+      attemptCount: 1,
+    });
+    const queued = await seedQueuedRun({
+      companyId,
+      agentId: recoveryOwnerId,
+      issueId,
+      wakeReason: "source_scoped_recovery_action",
+      contextExtras: { recoveryActionId },
+    });
+
+    let releaseExecution!: () => void;
+    mockAdapterExecute.mockImplementationOnce(() => new Promise((resolve) => {
+      releaseExecution = () => resolve({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Recovery lock acquired.",
+        provider: "test",
+        model: "test-model",
+      });
+    }));
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForCondition(async () => {
+      const lockAcquired = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.executionRunId === queued.runId);
+      return lockAcquired && countExecuteCallsForRun(queued.runId) === 1;
+    });
+
+    const lockedIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lockedIssue?.executionRunId).toBe(queued.runId);
+    expect(countExecuteCallsForRun(queued.runId)).toBe(1);
+
+    releaseExecution();
+    await waitForCondition(async () => db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queued.runId))
+      .then((rows) => rows[0]?.status === "succeeded"));
+  });
 
   it("cancels a former owner's queued assignment run after reassignment before the current owner proceeds", async () => {
     const { companyId, agentId: formerOwnerId } = await seedCompanyAndAgent({ agentName: "Former Owner" });

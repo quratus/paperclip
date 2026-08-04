@@ -11,6 +11,7 @@ import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import { buildIssueTransitionProvenance } from "./issues.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -371,6 +372,13 @@ export function accessService(db: Db) {
         .set({
           ...assignmentPatch,
           status: "todo",
+          transitionProvenance: buildIssueTransitionProvenance({
+            fromStatus: "in_progress",
+            toStatus: "todo",
+            transition: { reason: "assignment", evidenceRef: { type: "request", id: memberId } },
+            actorType: "system",
+            actorId: "member_archive",
+          }),
           startedAt: null,
           checkoutRunId: null,
           executionRunId: null,

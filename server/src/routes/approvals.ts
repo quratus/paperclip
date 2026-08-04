@@ -325,7 +325,11 @@ export function approvalRoutes(
           action: "approval.blocked_issues_consumed",
           entityType: "approval",
           entityId: approval.id,
-          details: { outcome: "approved", issueIds: consumedIssues.map((issue) => issue.id) },
+          details: {
+            outcome: "approved",
+            issueIds: consumedIssues.map((issue) => issue.id),
+            transitions: consumedIssues.map((issue) => issue.transitionProvenance),
+          },
         });
       }
     }
@@ -380,7 +384,12 @@ export function approvalRoutes(
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
-        details: { type: approval.type, linkedIssueIds, consumedBlockedIssueIds: consumedIssues.map((issue) => issue.id) },
+        details: {
+          type: approval.type,
+          linkedIssueIds,
+          consumedBlockedIssueIds: consumedIssues.map((issue) => issue.id),
+          transitions: consumedIssues.map((issue) => issue.transitionProvenance),
+        },
       });
     }
 

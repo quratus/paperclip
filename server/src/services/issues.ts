@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -52,6 +52,8 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueTransitionInput,
+  IssueTransitionProvenance,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -169,6 +171,72 @@ function assertTransition(from: string, to: string) {
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
   }
+}
+
+export function buildIssueTransitionProvenance(input: {
+  fromStatus: string;
+  toStatus: string;
+  transition?: IssueTransitionInput;
+  actorType?: "agent" | "user" | "system";
+  actorId?: string | null;
+  actorAgentId?: string | null;
+  actorRunId?: string | null;
+  blockedByIssueIds?: string[];
+  blockedByApprovalId?: string | null;
+  blockedByExternal?: unknown;
+}): IssueTransitionProvenance {
+  const id = randomUUID();
+  const actorType = input.actorType ?? (input.actorAgentId ? "agent" : "system");
+  const explicitReason = input.transition?.reason;
+  const reason = explicitReason === "founder_override" && actorType !== "user"
+    ? "manual_update"
+    : explicitReason ?? (
+      actorType === "user" && (input.toStatus === "done" || input.toStatus === "cancelled")
+        ? "founder_override"
+        : input.actorRunId
+          ? "agent_bounce"
+          : "automation"
+    );
+  const external = parseObject(input.blockedByExternal);
+  const block = input.toStatus !== "blocked"
+    ? null
+    : input.transition?.block ?? (
+      input.blockedByApprovalId
+        ? { kind: "needs_user" as const, clearingCondition: `Resolve approval ${input.blockedByApprovalId}.` }
+        : (input.blockedByIssueIds?.length ?? 0) > 0
+          ? {
+              kind: "wait_internal" as const,
+              clearingCondition: `Resolve blocking issue${input.blockedByIssueIds!.length === 1 ? "" : "s"}: ${input.blockedByIssueIds!.join(", ")}.`,
+            }
+          : typeof external.recheckDate === "string"
+            ? {
+                kind: "wait_schedule" as const,
+                clearingCondition: `Recheck the external prerequisite at ${external.recheckDate}.`,
+              }
+            : {
+                kind: "wait_internal" as const,
+                clearingCondition: "Restore a valid internal execution path or record a concrete external prerequisite.",
+              }
+    );
+
+  return {
+    id,
+    fromStatus: input.fromStatus as IssueTransitionProvenance["fromStatus"],
+    toStatus: input.toStatus as IssueTransitionProvenance["toStatus"],
+    actor: {
+      type: actorType,
+      id: input.actorId ?? input.actorAgentId ?? "system",
+      agentId: input.actorAgentId ?? null,
+      runId: input.actorRunId ?? null,
+    },
+    reason,
+    evidenceRef: input.transition?.evidenceRef ?? {
+      type: input.actorRunId ? "run" : "request",
+      id: input.actorRunId ?? id,
+    },
+    block,
+    occurredAt: new Date().toISOString(),
+  };
 }
 
 function applyStatusSideEffects(
@@ -2576,6 +2644,7 @@ const issueListSelect = {
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
   executionPolicy: sql<null>`null`,
   executionState: sql<null>`null`,
+  transitionProvenance: issues.transitionProvenance,
   monitorNextCheckAt: issues.monitorNextCheckAt,
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
@@ -6727,6 +6796,10 @@ export function issueService(db: Db) {
         blockedByApprovalId?: string | null;
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        actorType?: "agent" | "user" | "system";
+        actorId?: string | null;
+        actorRunId?: string | null;
+        transition?: IssueTransitionInput;
         expectedUpdatedAt?: Date;
       },
       dbOrTx: any = db,
@@ -6744,6 +6817,10 @@ export function issueService(db: Db) {
         blockedByApprovalId,
         actorAgentId,
         actorUserId,
+        actorType,
+        actorId,
+        actorRunId,
+        transition,
         expectedUpdatedAt,
         ...issueData
       } = data;
@@ -6764,6 +6841,20 @@ export function issueService(db: Db) {
           ? new Date(Math.max(Date.now(), existing.updatedAt.getTime() + 1))
           : new Date(),
       };
+      if (issueData.status && issueData.status !== existing.status) {
+        patch.transitionProvenance = buildIssueTransitionProvenance({
+          fromStatus: existing.status,
+          toStatus: issueData.status,
+          transition,
+          actorType,
+          actorId,
+          actorAgentId,
+          actorRunId,
+          blockedByIssueIds,
+          blockedByApprovalId,
+          blockedByExternal: issueData.blockedByExternal ?? existing.blockedByExternal,
+        });
+      }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
       }
@@ -7096,6 +7187,18 @@ export function issueService(db: Db) {
           .update(issues)
           .set({
             status: "todo",
+            transitionProvenance: buildIssueTransitionProvenance({
+              fromStatus: issue.status,
+              toStatus: "todo",
+              transition: {
+                reason: "approval_resolved",
+                evidenceRef: { type: "approval", id: approvalId },
+              },
+              actorType: actor.agentId ? "agent" : actor.userId ? "user" : "system",
+              actorId: actor.agentId ?? actor.userId ?? "system",
+              actorAgentId: actor.agentId ?? null,
+              actorRunId: actor.runId ?? null,
+            }),
             assigneeAgentId: nextAssigneeAgentId,
             assigneeUserId: nextAssigneeUserId,
             blockedByApprovalId: null,
@@ -7237,7 +7340,7 @@ export function issueService(db: Db) {
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, status: issues.status })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
@@ -7286,6 +7389,18 @@ export function issueService(db: Db) {
           checkoutRunId,
           executionRunId: checkoutRunId,
           status: "in_progress",
+          transitionProvenance: buildIssueTransitionProvenance({
+            fromStatus: issueCompany.status,
+            toStatus: "in_progress",
+            transition: {
+              reason: "checkout",
+              evidenceRef: { type: checkoutRunId ? "run" : "request", id: checkoutRunId ?? randomUUID() },
+            },
+            actorType: "agent",
+            actorId: agentId,
+            actorAgentId: agentId,
+            actorRunId: checkoutRunId,
+          }),
           startedAt: now,
           updatedAt: now,
         })
@@ -7614,6 +7729,18 @@ export function issueService(db: Db) {
           .update(issues)
           .set({
             status: "todo",
+            transitionProvenance: buildIssueTransitionProvenance({
+              fromStatus: existing.status,
+              toStatus: "todo",
+              transition: {
+                reason: "release",
+                evidenceRef: { type: actorRunId ? "run" : "request", id: actorRunId ?? randomUUID() },
+              },
+              actorType: actorAgentId ? "agent" : "system",
+              actorId: actorAgentId ?? "system",
+              actorAgentId: actorAgentId ?? null,
+              actorRunId: actorRunId ?? null,
+            }),
             assigneeAgentId: null,
             checkoutRunId: null,
             executionRunId: null,

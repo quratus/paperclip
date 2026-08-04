@@ -244,6 +244,37 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
 });
 
+export const issueTransitionReasonSchema = z.enum([
+  "agent_bounce",
+  "changes_requested",
+  "founder_override",
+  "sweeper_side_effect",
+  "recovery_action",
+  "spec_approved",
+  "assignment",
+  "checkout",
+  "release",
+  "approval_resolved",
+  "graph_transition",
+  "comment_reopen",
+  "automation",
+  "manual_update",
+]);
+
+export const issueBlockKindSchema = z.enum(["wait_schedule", "wait_internal", "needs_user"]);
+
+export const issueTransitionInputSchema = z.object({
+  reason: issueTransitionReasonSchema,
+  evidenceRef: z.object({
+    type: z.enum(["comment", "review", "interaction", "run", "approval", "recovery_action", "graph_transition", "request"]),
+    id: z.string().trim().min(1).max(500),
+  }).strict(),
+  block: z.object({
+    kind: issueBlockKindSchema,
+    clearingCondition: z.string().trim().min(1).max(1000),
+  }).strict().optional().nullable(),
+}).strict();
+
 export const issueRecoveryActionReadModelSchema = z.object({
   id: z.string().uuid(),
   companyId: z.string().uuid(),
@@ -500,6 +531,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
   expectedUpdatedAt: z.string().datetime().optional(),
+  transition: issueTransitionInputSchema.optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
