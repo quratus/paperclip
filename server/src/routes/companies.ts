@@ -29,8 +29,8 @@ import {
   feedbackService,
   logActivity,
   workTimelineService,
-  workflowRoleService,
 } from "../services/index.js";
+import { workflowRoleService } from "../services/workflow-roles.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
