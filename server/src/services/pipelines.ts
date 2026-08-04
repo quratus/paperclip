@@ -4873,9 +4873,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
                 'toStatus', 'cancelled',
                 'actor', ${JSON.stringify(issueTransitionActor)}::jsonb,
                 'reason', 'automation',
-                'evidenceRef', jsonb_build_object('type', 'request', 'id', ${ledger.id}),
+                'evidenceRef', jsonb_build_object('type', 'request', 'id', ${ledger.id}::text),
                 'block', null,
-                'occurredAt', ${now.toISOString()}
+                'occurredAt', ${now.toISOString()}::text
               )`,
               updatedAt: now,
             })

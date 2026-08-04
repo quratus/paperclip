@@ -881,15 +881,15 @@ export function issueTreeControlService(db: Db) {
           'fromStatus', ${issues.status},
           'toStatus', 'cancelled',
           'actor', jsonb_build_object(
-            'type', ${hold.createdByActorType},
-            'id', ${actorId},
-            'agentId', ${hold.createdByAgentId},
-            'runId', ${hold.createdByRunId}
+            'type', ${hold.createdByActorType}::text,
+            'id', ${actorId}::text,
+            'agentId', ${hold.createdByAgentId}::text,
+            'runId', ${hold.createdByRunId}::text
           ),
-          'reason', ${hold.createdByActorType === "user" ? "operator_override" : "automation"},
-          'evidenceRef', jsonb_build_object('type', 'request', 'id', ${holdId}),
+          'reason', ${hold.createdByActorType === "user" ? "operator_override" : "automation"}::text,
+          'evidenceRef', jsonb_build_object('type', 'request', 'id', ${holdId}::text),
           'block', null,
-          'occurredAt', ${now.toISOString()}
+          'occurredAt', ${now.toISOString()}::text
         )`,
         cancelledAt: now,
         completedAt: null,
@@ -988,17 +988,17 @@ export function issueTreeControlService(db: Db) {
             transitionProvenance: sql<IssueTransitionProvenance>`jsonb_build_object(
               'id', gen_random_uuid()::text,
               'fromStatus', 'cancelled',
-              'toStatus', ${status},
+              'toStatus', ${status}::text,
               'actor', jsonb_build_object(
-                'type', ${input.actor.actorType},
-                'id', ${restoreActorId},
-                'agentId', ${input.actor.agentId ?? null},
-                'runId', ${input.actor.runId ?? null}
+                'type', ${input.actor.actorType}::text,
+                'id', ${restoreActorId}::text,
+                'agentId', ${input.actor.agentId ?? null}::text,
+                'runId', ${input.actor.runId ?? null}::text
               ),
-              'reason', ${input.actor.actorType === "user" ? "operator_override" : "automation"},
-              'evidenceRef', jsonb_build_object('type', 'request', 'id', ${restoreHoldId}),
+              'reason', ${input.actor.actorType === "user" ? "operator_override" : "automation"}::text,
+              'evidenceRef', jsonb_build_object('type', 'request', 'id', ${restoreHoldId}::text),
               'block', null,
-              'occurredAt', ${now.toISOString()}
+              'occurredAt', ${now.toISOString()}::text
             )`,
             cancelledAt: null,
             completedAt: null,
