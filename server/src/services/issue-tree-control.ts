@@ -11,6 +11,7 @@ import {
 import {
   ISSUE_STATUSES,
   type IssueStatus,
+  type IssueTransitionProvenance,
   type IssueTreeControlMode,
   type IssueTreeControlPreview,
   type IssueTreeHold,
@@ -61,6 +62,7 @@ type TreeStatusUpdateResult = {
     id: string;
     status: IssueStatus;
     assigneeAgentId: string | null;
+    transitionProvenance: IssueTransitionProvenance | null;
   }>;
 };
 type RestoreTreeStatusResult = TreeStatusUpdateResult & {
@@ -869,10 +871,26 @@ export function issueTreeControlService(db: Db) {
     if (issueIds.length === 0) return { updatedIssueIds: [], updatedIssues: [] };
 
     const now = new Date();
+    const actorId = hold.createdByAgentId ?? hold.createdByUserId ?? "issue_tree_hold";
     const updated = await db
       .update(issues)
       .set({
         status: "cancelled",
+        transitionProvenance: sql<IssueTransitionProvenance>`jsonb_build_object(
+          'id', gen_random_uuid()::text,
+          'fromStatus', ${issues.status},
+          'toStatus', 'cancelled',
+          'actor', jsonb_build_object(
+            'type', ${hold.createdByActorType}::text,
+            'id', ${actorId}::text,
+            'agentId', ${hold.createdByAgentId}::text,
+            'runId', ${hold.createdByRunId}::text
+          ),
+          'reason', ${hold.createdByActorType === "user" ? "operator_override" : "automation"}::text,
+          'evidenceRef', jsonb_build_object('type', 'request', 'id', ${holdId}::text),
+          'block', null,
+          'occurredAt', ${now.toISOString()}::text
+        )`,
         cancelledAt: now,
         completedAt: null,
         checkoutRunId: null,
@@ -892,6 +910,7 @@ export function issueTreeControlService(db: Db) {
         id: issues.id,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        transitionProvenance: issues.transitionProvenance,
       });
 
     return {
@@ -900,6 +919,7 @@ export function issueTreeControlService(db: Db) {
         id: issue.id,
         status: coerceIssueStatus(issue.status),
         assigneeAgentId: issue.assigneeAgentId,
+        transitionProvenance: issue.transitionProvenance,
       })),
     };
   }
@@ -955,6 +975,7 @@ export function issueTreeControlService(db: Db) {
     }
 
     const now = new Date();
+    const restoreActorId = input.actor.agentId ?? input.actor.userId ?? input.actor.actorId;
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
     const updatedIssues = await db.transaction(async (tx) => {
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
@@ -964,6 +985,21 @@ export function issueTreeControlService(db: Db) {
           .update(issues)
           .set({
             status,
+            transitionProvenance: sql<IssueTransitionProvenance>`jsonb_build_object(
+              'id', gen_random_uuid()::text,
+              'fromStatus', 'cancelled',
+              'toStatus', ${status}::text,
+              'actor', jsonb_build_object(
+                'type', ${input.actor.actorType}::text,
+                'id', ${restoreActorId}::text,
+                'agentId', ${input.actor.agentId ?? null}::text,
+                'runId', ${input.actor.runId ?? null}::text
+              ),
+              'reason', ${input.actor.actorType === "user" ? "operator_override" : "automation"}::text,
+              'evidenceRef', jsonb_build_object('type', 'request', 'id', ${restoreHoldId}::text),
+              'block', null,
+              'occurredAt', ${now.toISOString()}::text
+            )`,
             cancelledAt: null,
             completedAt: null,
             checkoutRunId: null,
@@ -983,11 +1019,13 @@ export function issueTreeControlService(db: Db) {
             id: issues.id,
             status: issues.status,
             assigneeAgentId: issues.assigneeAgentId,
+            transitionProvenance: issues.transitionProvenance,
           });
         restored.push(...rows.map((issue) => ({
           id: issue.id,
           status: coerceIssueStatus(issue.status),
           assigneeAgentId: issue.assigneeAgentId,
+          transitionProvenance: issue.transitionProvenance,
         })));
       }
 

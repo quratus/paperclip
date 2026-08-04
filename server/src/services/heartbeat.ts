@@ -136,7 +136,7 @@ import {
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
-import { issueService } from "./issues.js";
+import { buildIssueTransitionProvenance, issueService } from "./issues.js";
 import { graphRecoveryOwnershipLockKey } from "./pipeline-graph-ownership.js";
 import { pipelineGraphRunService } from "./pipeline-graph-runs.js";
 import { createToolGatewayService } from "./tool-gateway.js";
@@ -4432,15 +4432,20 @@ export async function buildPaperclipWakePayload(input: {
         workMode: string;
         projectId?: string | null;
         executionPolicy?: unknown;
+        executionState?: unknown;
+        transitionProvenance?: unknown;
       }
     | null;
   exposeLowTrustRaw?: boolean;
 }) {
-  const executionStage = parseObject(input.contextSnapshot.executionStage);
+  let executionStage = parseObject(input.contextSnapshot.executionStage);
   const graphAssignment = parseObject(input.contextSnapshot.graphAssignment);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const chatSession = parseObject(input.contextSnapshot.chatSession);
+  let commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
+  const recoveryActionId = readNonEmptyString(input.contextSnapshot.recoveryActionId);
+  const recoveryCause = readNonEmptyString(input.contextSnapshot.recoveryCause);
   const continuationSummary = input.continuationSummary ?? null;
   const issueSummary =
     input.issueSummary ??
@@ -4453,16 +4458,58 @@ export async function buildPaperclipWakePayload(input: {
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            executionState: issues.executionState,
+            transitionProvenance: issues.transitionProvenance,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
+  const recoveryScoped = Boolean(
+    recoveryActionId ||
+    recoveryCause ||
+    input.contextSnapshot.wakeReason === "source_scoped_recovery_action"
+  );
+  if (recoveryScoped && Object.keys(executionStage).length === 0) {
+    const state = parseIssueExecutionState(issueSummary?.executionState);
+    if (state?.status === "pending" || state?.status === "changes_requested") {
+      executionStage = {
+        wakeRole: state.status === "changes_requested"
+          ? "executor"
+          : state.currentStageType === "approval"
+            ? "approver"
+            : "reviewer",
+        stageId: state.currentStageId,
+        stageType: state.currentStageType,
+        currentParticipant: state.currentParticipant,
+        returnAssignee: state.returnAssignee,
+        reviewRequest: state.reviewRequest ?? null,
+        lastDecisionOutcome: state.lastDecisionOutcome,
+        allowedActions: state.status === "changes_requested"
+          ? ["address_changes", "resubmit"]
+          : ["approve", "request_changes"],
+      };
+    }
+  }
+  if (recoveryScoped && commentIds.length === 0 && issueId) {
+    commentIds = await input.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, input.companyId),
+        eq(issueComments.issueId, issueId),
+        isNull(issueComments.deletedAt),
+      ))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(MAX_INLINE_WAKE_COMMENTS)
+      .then((rows) => rows.map((row) => row.id).reverse());
+  }
   if (
     commentIds.length === 0
     && Object.keys(executionStage).length === 0
     && Object.keys(graphAssignment).length === 0
     && !issueSummary
+    && Object.keys(chatSession).length === 0
   ) return null;
 
   const commentRows =
@@ -4622,8 +4669,6 @@ export async function buildPaperclipWakePayload(input: {
     })
     : null;
   const payloadTruncated = truncated || planReviewContext?.truncated === true;
-  const recoveryActionId = readNonEmptyString(input.contextSnapshot.recoveryActionId);
-  const recoveryCause = readNonEmptyString(input.contextSnapshot.recoveryCause);
   const recoveryAction = recoveryActionId
     ? await input.db
       .select()
@@ -4646,6 +4691,7 @@ export async function buildPaperclipWakePayload(input: {
 
   return {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    transition: parseObject(issueSummary?.transitionProvenance),
     graphAssignment: Object.keys(graphAssignment).length > 0 ? graphAssignment : null,
     recovery: recoveryAction || recoveryCause
       ? {
@@ -4660,6 +4706,17 @@ export async function buildPaperclipWakePayload(input: {
           maxAttempts: recoveryAction?.maxAttempts ?? null,
           nextAction: recoveryAction?.nextAction ?? null,
           routingFallbackReason: readNonEmptyString(recoveryEvidence.routingFallbackReason),
+        }
+      : null,
+    chat: Object.keys(chatSession).length > 0
+      ? {
+          sessionId: readNonEmptyString(chatSession.sessionId),
+          userMessage: typeof chatSession.userMessage === "string" ? chatSession.userMessage : "",
+          compactedContext: readNonEmptyString(chatSession.compactedContext),
+          history: Array.isArray(chatSession.history) ? chatSession.history : [],
+          orchestrationIssue: parseObject(chatSession.orchestrationIssue),
+          conversationStyle: readNonEmptyString(chatSession.conversationStyle),
+          qualityProtocol: readNonEmptyString(chatSession.qualityProtocol),
         }
       : null,
     issue: issueSummary
@@ -5962,6 +6019,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
+        transitionProvenance: issues.transitionProvenance,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
         parentId: issues.parentId,
         createdByUserId: issues.createdByUserId,
@@ -11009,8 +11067,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     const isPipelineGraphWake = claimedContext.pipelineGraphWake === true;
-    if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
+    if (claimedIssueId) {
       const claimedAgent = await getAgent(claimed.agentId);
+      const claimedRecoveryActionId = readNonEmptyString(claimedContext.recoveryActionId);
+      const ownsActiveRecoveryAction = claimedWakeReason === "source_scoped_recovery_action" && claimedRecoveryActionId
+        ? await db
+          .select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.id, claimedRecoveryActionId),
+            eq(issueRecoveryActions.companyId, claimed.companyId),
+            eq(issueRecoveryActions.sourceIssueId, claimedIssueId),
+            eq(issueRecoveryActions.ownerAgentId, claimed.agentId),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          ))
+          .then((rows) => rows.length > 0)
+        : false;
       const issueLock = await db
         .update(issues)
         .set({
@@ -11027,11 +11099,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // target agent. Legacy issue routing may lag that authority, so a
             // current graph assignment can own the execution lock without first
             // rewriting the issue's review participant or assignee projection.
-            isPipelineGraphWake ? undefined : eq(issues.assigneeAgentId, claimed.agentId),
+            isPipelineGraphWake || ownsActiveRecoveryAction
+              ? undefined
+              : eq(issues.assigneeAgentId, claimed.agentId),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
         ).returning({ id: issues.id });
-      if (issueLock.length === 0 && !isExplicitlyTargetedIssueInteractionWake(claimedContext)) {
+      if (issueLock.length === 0) {
         await cancelQueuedRunForStaleIssue(claimed, claimedIssueId, { stale: true, errorCode: "issue_execution_lock_changed", reason: "Cancelled because issue execution ownership changed before lock acquisition; the current owner remains responsible", details: { issueId: claimedIssueId, expectedAssigneeAgentId: claimed.agentId } });
         return null;
       }
@@ -11185,11 +11259,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reviewParticipant = reviewExecutionState?.currentParticipant ?? null;
     const isCurrentReviewParticipant = reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
+    const recoveryActionId = readNonEmptyString(context.recoveryActionId);
+    const isAuthorizedRecoveryOwner = wakeReason === "source_scoped_recovery_action" && recoveryActionId
+      ? await db
+        .select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.id, recoveryActionId),
+          eq(issueRecoveryActions.companyId, run.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.ownerAgentId, run.agentId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ))
+        .then((rows) => rows.length > 0)
+      : false;
 
     if (
       issue.assigneeAgentId !== run.agentId &&
       !isPipelineGraphWake &&
       !isTargetedInteractionWake &&
+      !isAuthorizedRecoveryOwner &&
       !isCurrentReviewParticipant
     ) {
       return {
@@ -12331,6 +12420,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workMode: issueRef.workMode,
             projectId: issueRef.projectId,
             executionPolicy: issueContext?.executionPolicy ?? null,
+            executionState: issueContext?.executionState ?? null,
+            transitionProvenance: issueContext?.transitionProvenance ?? null,
           }
         : null,
       exposeLowTrustRaw,
@@ -14128,6 +14219,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .update(issues)
             .set({
               status: "todo",
+              transitionProvenance: buildIssueTransitionProvenance({
+                fromStatus: "in_progress",
+                toStatus: "todo",
+                transition: { reason: "agent_bounce", evidenceRef: { type: "run", id: run.id } },
+                actorType: "system",
+                actorId: "capacity_recovery",
+                actorAgentId: agent.id,
+                actorRunId: run.id,
+              }),
               executionRunId: null,
               executionAgentNameKey: null,
               executionLockedAt: null,
@@ -14695,7 +14795,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx
         .update(issues)
         .set({
-          ...(!hasNewerOwner ? { status: "todo" as const } : {}),
+          ...(!hasNewerOwner ? {
+            status: "todo" as const,
+            transitionProvenance: buildIssueTransitionProvenance({
+              fromStatus: issue.status,
+              toStatus: "todo",
+              transition: { reason: "recovery_action", evidenceRef: { type: "run", id: run.id } },
+              actorType: "system",
+              actorId: "capacity_recovery",
+              actorAgentId: run.agentId,
+              actorRunId: run.id,
+            }),
+          } : {}),
           ...(ownsExecutionLock
             ? {
                 executionRunId: null,
@@ -15054,6 +15165,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(issues)
           .set({
             status: "todo",
+            transitionProvenance: buildIssueTransitionProvenance({
+              fromStatus: issue.status,
+              toStatus: "todo",
+              transition: { reason: "recovery_action", evidenceRef: { type: "run", id: run.id } },
+              actorType: "system",
+              actorId: "capacity_recovery",
+              actorAgentId: run.agentId,
+              actorRunId: run.id,
+            }),
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
@@ -16552,6 +16672,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .update(issues)
               .set({
                 status: "blocked",
+                transitionProvenance: buildIssueTransitionProvenance({
+                  fromStatus: issue.status,
+                  toStatus: "blocked",
+                  transition: {
+                    reason: "recovery_action",
+                    evidenceRef: { type: "request", id: `workspace_admission:${issue.id}` },
+                    block: {
+                      kind: "wait_internal",
+                      clearingCondition: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+                    },
+                  },
+                  actorType: "system",
+                  actorId: "workspace_admission",
+                  actorAgentId: agentId,
+                  actorRunId: null,
+                }),
                 checkoutRunId: null,
                 executionRunId: null,
                 executionAgentNameKey: null,

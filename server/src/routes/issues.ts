@@ -7933,6 +7933,7 @@ export function issueRoutes(
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
       expectedUpdatedAt: expectedUpdatedAtRaw,
+      transition: transitionInput,
       ...updateFields
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
@@ -8350,6 +8351,10 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              actorRunId: actor.runId,
+              transition: transitionInput,
               expectedUpdatedAt: expectedUpdatedAtRaw ? new Date(expectedUpdatedAtRaw) : undefined,
             },
             tx,
@@ -8388,6 +8393,10 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              actorRunId: actor.runId,
+              transition: transitionInput,
               expectedUpdatedAt: expectedUpdatedAtRaw ? new Date(expectedUpdatedAtRaw) : undefined,
             }, tx);
             if (!updated) return null;
@@ -8406,6 +8415,10 @@ export function issueRoutes(
             ...updateFields,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            actorRunId: actor.runId,
+            transition: transitionInput,
             expectedUpdatedAt: expectedUpdatedAtRaw ? new Date(expectedUpdatedAtRaw) : undefined,
           });
         }
@@ -8644,6 +8657,7 @@ export function issueRoutes(
         ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
         ...(workspaceChange ? { workspaceChange } : {}),
         _previous: hasFieldChanges ? previous : undefined,
+        ...(existing.status !== issue.status ? { transition: issue.transitionProvenance ?? null } : {}),
         ...summarizeIssueReferenceActivityDetails(
           updateReferenceDiff
             ? {
@@ -9623,7 +9637,10 @@ export function issueRoutes(
       action: "issue.checked_out",
       entityType: "issue",
       entityId: issue.id,
-      details: { agentId: req.body.agentId },
+      details: {
+        agentId: req.body.agentId,
+        transition: updated?.transitionProvenance ?? null,
+      },
     });
 
     if (
@@ -9679,6 +9696,7 @@ export function issueRoutes(
       action: "issue.released",
       entityType: "issue",
       entityId: released.id,
+      details: { transition: released.transitionProvenance ?? null },
     });
 
     res.json(released);

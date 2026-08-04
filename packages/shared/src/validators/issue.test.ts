@@ -48,6 +48,38 @@ describe("issue validators", () => {
     expect(parsed.comment).toBe("Done\n\n- Verified the route");
   });
 
+  it("accepts typed transition provenance inputs", () => {
+    const parsed = updateIssueSchema.parse({
+      status: "blocked",
+      transition: {
+        reason: "recovery_action",
+        evidenceRef: { type: "recovery_action", id: "recovery-42" },
+        block: {
+          kind: "wait_internal",
+          clearingCondition: "The recovery owner must restore a runnable workspace.",
+        },
+      },
+    });
+
+    expect(parsed.transition?.block?.kind).toBe("wait_internal");
+  });
+
+  it("rejects person-specific block states", () => {
+    const parsed = updateIssueSchema.safeParse({
+      status: "blocked",
+      transition: {
+        reason: "manual_update",
+        evidenceRef: { type: "request", id: "request-42" },
+        block: {
+          kind: "needs_named_person",
+          clearingCondition: "A named person must respond.",
+        },
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
   it("keeps issue attribution fields create-only", () => {
     const created = createIssueSchema.parse({
       title: "Preserve attribution input for route checks",
