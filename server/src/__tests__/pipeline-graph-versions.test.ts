@@ -2828,13 +2828,20 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     })).resolves.toMatchObject({ authorized: false, code: "graph_event_idempotency_conflict" });
   });
 
-  it("atomically wakes a configured entry-node owner when a graph run starts", async () => {
+  it("dispatches an entry-node wake through its durable responsibility-role binding", async () => {
     const fixture = await seedLinearPipeline();
     const [targetAgent] = await db.insert(agents).values({
       companyId: fixture.companyId,
       name: "Entry graph worker",
       role: "engineer",
     }).returning();
+    const roles = workflowRoleService(db);
+    await roles.ensureCompanyDefaults(fixture.companyId);
+    await roles.replaceAssignments({
+      companyId: fixture.companyId,
+      roleKey: "implementer",
+      assignments: [{ agentId: targetAgent!.id, priority: 0 }],
+    });
     await db.update(pipelineStages)
       .set({
         config: {
@@ -2842,7 +2849,6 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
           responsibilityInstruction: "Implement the linked issue and submit a graph outcome.",
           acceptanceCriteria: ["The changed behavior is verified"],
           dispatchEnabled: true,
-          targetAgentId: targetAgent!.id,
         },
       })
       .where(eq(pipelineStages.id, fixture.stages.find((stage) => stage.key === "work")!.id));
@@ -2885,17 +2891,106 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       payload: {
         reason: "run_started",
         dispatchEnabled: true,
-        targetAgentId: targetAgent!.id,
+        roleResolutionEnabled: true,
         graphAssignment: {
           id: `${started.run.id}:1:work`,
           runRevision: 1,
           nodeKey: "work",
           responsibilityOwner: "implementer",
+          targetAgentId: null,
           acceptanceCriteria: ["The changed behavior is verified"],
           allowedOutcomes: ["complete"],
         },
       },
     });
+
+    const wakeup = vi.fn(async () => ({ id: randomUUID(), wakeupRequestId: randomUUID() }));
+    await expect(pipelineGraphOutboxService(db).dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "role-dispatch-worker",
+      enabled: true,
+      wakeup,
+    })).resolves.toEqual({ claimed: 1, dispatched: 1, retried: 0 });
+    expect(wakeup).toHaveBeenCalledOnce();
+    expect(wakeup.mock.calls[0]![0]).toBe(targetAgent!.id);
+    expect(wakeup.mock.calls[0]![1]).toMatchObject({
+      contextSnapshot: {
+        responsibilityOwner: "implementer",
+        graphAssignment: {
+          runId: started.run.id,
+          runRevision: 1,
+          nodeKey: "work",
+          responsibilityOwner: "implementer",
+          targetAgentId: targetAgent!.id,
+        },
+      },
+    });
+    const [binding] = await db.select().from(pipelineGraphRoleBindings)
+      .where(eq(pipelineGraphRoleBindings.runId, started.run.id));
+    expect(binding).toMatchObject({
+      companyId: fixture.companyId,
+      runRevision: 1,
+      nodeKey: "work",
+      roleKey: "implementer",
+      agentId: targetAgent!.id,
+    });
+  });
+
+  it("fails role dispatch closed when no eligible role holder exists", async () => {
+    const fixture = await seedLinearPipeline();
+    await workflowRoleService(db).ensureCompanyDefaults(fixture.companyId);
+    await db.update(pipelineStages)
+      .set({
+        config: {
+          responsibilityOwner: "implementer",
+          dispatchEnabled: true,
+        },
+      })
+      .where(eq(pipelineStages.id, fixture.stages.find((stage) => stage.key === "work")!.id));
+    const draft = await pipelineGraphVersionService(db).createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await pipelineGraphVersionService(db).activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: "unassigned-role-wake",
+      title: "Unassigned role wake",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const started = await pipelineGraphRunService(db).start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: "unassigned-role-wake:start",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const wakeup = vi.fn();
+    await expect(pipelineGraphOutboxService(db).dispatchPending({
+      companyId: fixture.companyId,
+      workerId: "unassigned-role-worker",
+      enabled: true,
+      retryDelayMs: 60_000,
+      wakeup,
+    })).resolves.toEqual({ claimed: 1, dispatched: 0, retried: 1 });
+    expect(wakeup).not.toHaveBeenCalled();
+    const [wake] = await db.select().from(pipelineGraphWakeOutbox)
+      .where(eq(pipelineGraphWakeOutbox.runId, started.run.id));
+    expect(wake).toMatchObject({
+      status: "pending",
+      lastError: "No eligible agent can satisfy workflow role 'implementer'",
+      dispatchReceipt: null,
+    });
+    expect(await db.select().from(pipelineGraphRoleBindings)
+      .where(eq(pipelineGraphRoleBindings.runId, started.run.id))).toEqual([]);
   });
 
   it("serializes graph start against the legacy case transition authority", async () => {

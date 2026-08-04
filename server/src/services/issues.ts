@@ -7132,6 +7132,7 @@ export function issueService(db: Db) {
         status: string;
         assigneeAgentId: string | null;
         assigneeUserId: string | null;
+        transitionProvenance: IssueTransitionProvenance | null;
       }> = [];
       async function firstAssignableAgentId(companyId: string, candidates: Array<string | null | undefined>) {
         for (const candidate of candidates) {
@@ -7248,6 +7249,7 @@ export function issueService(db: Db) {
           status: updated.status,
           assigneeAgentId: updated.assigneeAgentId,
           assigneeUserId: updated.assigneeUserId,
+          transitionProvenance: updated.transitionProvenance,
         });
       }
 
