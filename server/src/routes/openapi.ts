@@ -1102,6 +1102,12 @@ registry.registerPath({
     503: { description: "Service unavailable", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
+const workflowRoleAssignmentsBodySchema = z.object({
+  assignments: z.array(z.object({
+    agentId: z.string().uuid(),
+    priority: z.number().int().min(0).max(1_000_000).default(100),
+  })).max(100),
+});
 
 registry.registerPath({
   method: "get",
@@ -1194,6 +1200,36 @@ registry.registerPath({
       },
     },
     401: r.unauthorized,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/workflow-roles",
+  tags: ["companies"],
+  summary: "List company workflow roles and assignments",
+  request: { params: z.object({ companyId: z.string().uuid() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/workflow-roles/{roleKey}/assignments",
+  tags: ["companies"],
+  summary: "Replace ordered agent assignments for a workflow role",
+  request: {
+    params: z.object({
+      companyId: z.string().uuid(),
+      roleKey: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/),
+    }),
+    body: jsonBody(workflowRoleAssignmentsBodySchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    422: r.unprocessable,
   },
 });
 
