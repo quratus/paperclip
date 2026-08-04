@@ -742,9 +742,6 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
-  "GET /api/companies/{companyId}/workflow-roles",
-  "PUT /api/companies/{companyId}/workflow-roles",
-  "PUT /api/companies/{companyId}/workflow-roles/{roleKey}/assignments",
   "POST /api/execution-workspaces/{id}/reconcile-branch",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
@@ -5365,47 +5362,6 @@ for (const route of [
     summary: route[2],
   });
 }
-
-const workflowRoleKeySchema = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
-const workflowRoleCatalogOpenApiSchema = z.object({
-  roles: z.array(z.object({
-    key: workflowRoleKeySchema,
-    label: z.string().trim().min(1).max(120),
-  }).strict()).max(100),
-  separationConstraints: z.array(z.object({
-    firstRoleKey: workflowRoleKeySchema,
-    secondRoleKey: workflowRoleKeySchema,
-  }).strict()).max(1_000),
-}).strict();
-const workflowRoleAssignmentsOpenApiSchema = z.object({
-  assignments: z.array(z.object({
-    agentId: z.string().uuid(),
-    priority: z.number().int().min(0).max(1_000_000).default(100),
-  })).max(100),
-}).strict();
-
-registerCurrentRoute({
-  method: "get",
-  path: "/api/companies/{companyId}/workflow-roles",
-  tags: ["companies"],
-  summary: "List a company's workflow role configuration",
-});
-
-registerCurrentRoute({
-  method: "put",
-  path: "/api/companies/{companyId}/workflow-roles",
-  tags: ["companies"],
-  summary: "Configure a company's workflow role catalog",
-  body: workflowRoleCatalogOpenApiSchema,
-});
-
-registerCurrentRoute({
-  method: "put",
-  path: "/api/companies/{companyId}/workflow-roles/{roleKey}/assignments",
-  tags: ["companies"],
-  summary: "Replace assignments for a company workflow role",
-  body: workflowRoleAssignmentsOpenApiSchema,
-});
 
 registerCurrentRoute({
   method: "get",

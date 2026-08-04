@@ -18,7 +18,7 @@ import { heartbeatRuns } from "./heartbeat_runs.js";
 import { projectWorkspaces } from "./project_workspaces.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
 import { approvals } from "./approvals.js";
-import type { IssueTransitionProvenance, SourceTrustMetadata } from "@paperclipai/shared";
+import type { SourceTrustMetadata } from "@paperclipai/shared";
 
 export const issues = pgTable(
   "issues",
@@ -56,7 +56,6 @@ export const issues = pgTable(
     assigneeAdapterOverrides: jsonb("assignee_adapter_overrides").$type<Record<string, unknown>>(),
     executionPolicy: jsonb("execution_policy").$type<Record<string, unknown>>(),
     executionState: jsonb("execution_state").$type<Record<string, unknown>>(),
-    transitionProvenance: jsonb("transition_provenance").$type<IssueTransitionProvenance | null>(),
     monitorNextCheckAt: timestamp("monitor_next_check_at", { withTimezone: true }),
     monitorWakeRequestedAt: timestamp("monitor_wake_requested_at", { withTimezone: true }),
     monitorLastTriggeredAt: timestamp("monitor_last_triggered_at", { withTimezone: true }),

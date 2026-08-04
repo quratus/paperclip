@@ -44,16 +44,6 @@ const mockFeedbackService = vi.hoisted(() => ({
   listFeedbackTraces: vi.fn(),
 }));
 
-const mockWorkTimelineService = vi.hoisted(() => ({
-  list: vi.fn(),
-}));
-
-const mockWorkflowRoleService = vi.hoisted(() => ({
-  list: vi.fn(),
-  configureCatalog: vi.fn(),
-  replaceAssignments: vi.fn(),
-}));
-
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
 function registerCompanyRouteMocks() {
@@ -66,10 +56,6 @@ function registerCompanyRouteMocks() {
     companyService: () => mockCompanyService,
     feedbackService: () => mockFeedbackService,
     logActivity: mockLogActivity,
-    workTimelineService: () => mockWorkTimelineService,
-  }));
-  vi.doMock("../services/workflow-roles.js", () => ({
-    workflowRoleService: () => mockWorkflowRoleService,
   }));
 }
 
@@ -189,13 +175,6 @@ function resetMockDefaults() {
   mockCompanyPortabilityService.previewExport.mockResolvedValue(exportPreviewResult());
   mockCompanyPortabilityService.previewImport.mockResolvedValue({ ok: true });
   mockCompanyPortabilityService.importBundle.mockResolvedValue(importResult());
-  mockWorkflowRoleService.configureCatalog.mockImplementation(async (input: {
-    roles: Array<{ key: string; label: string }>;
-    separationConstraints: Array<{ firstRoleKey: string; secondRoleKey: string }>;
-  }) => ({
-    roles: input.roles.map((role: { key: string; label: string }) => ({ ...role, assignments: [] })),
-    separationConstraints: input.separationConstraints,
-  }));
 }
 
 function assertNoTargetMutationSideEffects() {
@@ -309,51 +288,6 @@ describe.sequential("company route cross-company authorization", () => {
     const remove = await request(app).delete(`/api/companies/${companyAId}`);
     expect(remove.status).toBe(403);
     expect(remove.body.error).toContain("Board access required");
-  });
-
-  it("lets a board member configure a tenant-supplied role catalog without kernel defaults", async () => {
-    const app = await createApp(boardActor({
-      userId: "member",
-      companyIds: [companyBId],
-      memberships: [{ companyId: companyBId, membershipRole: "member", status: "active" }],
-    }));
-    const catalog = {
-      roles: [
-        { key: "author", label: "Author" },
-        { key: "reviewer", label: "Reviewer" },
-      ],
-      separationConstraints: [{ firstRoleKey: "author", secondRoleKey: "reviewer" }],
-    };
-
-    await request(app)
-      .put(`/api/companies/${companyBId}/workflow-roles`)
-      .send(catalog)
-      .expect(200);
-
-    expect(mockWorkflowRoleService.configureCatalog).toHaveBeenCalledWith({
-      companyId: companyBId,
-      ...catalog,
-    });
-    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      companyId: companyBId,
-      action: "workflow_role.catalog_configured",
-      details: {
-        roleKeys: ["author", "reviewer"],
-        separationConstraints: catalog.separationConstraints,
-      },
-    }));
-  });
-
-  it("keeps role catalog configuration board-only", async () => {
-    const app = await createApp(companyACeoActor());
-
-    const response = await request(app)
-      .put(`/api/companies/${companyAId}/workflow-roles`)
-      .send({ roles: [], separationConstraints: [] });
-
-    expect(response.status).toBe(403);
-    expect(response.body.error).toContain("Board access required");
-    expect(mockWorkflowRoleService.configureCatalog).not.toHaveBeenCalled();
   });
 
   it("covers board actor access for non-member, viewer, active member, local trusted board, and instance admin without target membership", async () => {

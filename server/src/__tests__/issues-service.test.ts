@@ -36,7 +36,6 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import { approvalService } from "../services/approvals.ts";
 import {
   clampIssueListLimit,
-  buildIssueTransitionProvenance,
   deriveIssueCommentRunLogAttribution,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
@@ -66,43 +65,6 @@ describe("issue list limit helpers", () => {
     expect(clampIssueListLimit(0)).toBe(1);
     expect(clampIssueListLimit(25.9)).toBe(25);
     expect(clampIssueListLimit(ISSUE_LIST_MAX_LIMIT + 10)).toBe(ISSUE_LIST_MAX_LIMIT);
-  });
-});
-
-describe("buildIssueTransitionProvenance", () => {
-  it("records an unrestricted operator terminal override with request evidence", () => {
-    const transition = buildIssueTransitionProvenance({
-      fromStatus: "in_progress",
-      toStatus: "cancelled",
-      actorType: "user",
-      actorId: "local-board",
-    });
-
-    expect(transition).toMatchObject({
-      fromStatus: "in_progress",
-      toStatus: "cancelled",
-      reason: "operator_override",
-      actor: { type: "user", id: "local-board" },
-      evidenceRef: { type: "request" },
-      block: null,
-    });
-  });
-
-  it("derives client-safe typed block context", () => {
-    const blockerId = randomUUID();
-    const transition = buildIssueTransitionProvenance({
-      fromStatus: "in_progress",
-      toStatus: "blocked",
-      actorType: "system",
-      actorId: "recovery",
-      blockedByIssueIds: [blockerId],
-    });
-
-    expect(transition.block).toEqual({
-      kind: "wait_internal",
-      clearingCondition: `Resolve blocking issue: ${blockerId}.`,
-    });
-    expect(JSON.stringify(transition)).not.toContain("named_person");
   });
 });
 

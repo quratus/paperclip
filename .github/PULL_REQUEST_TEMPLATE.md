@@ -63,20 +63,6 @@
 
 -
 
-## Public Kernel Boundary
-
-<!--
-  This repository is PUBLIC. State why each behavior must live in the generic
-  Paperclip kernel instead of private company/product policy. Confirm the full
-  diff was reviewed against the intended fork base and contains no company role
-  catalogs/defaults, selectors, authored workflows, prompts, rubrics, model/KPI/
-  rollout policy, repository targets, or private controller values.
--->
-
-- Repository visibility: PUBLIC
-- Neutral-kernel justification:
-- Leakage review result:
-
 > For core feature work, check [`ROADMAP.md`](ROADMAP.md) first and discuss it in `#dev` before opening the PR. Feature PRs that overlap with planned core work may need to be redirected — check the roadmap first. See `CONTRIBUTING.md`.
 
 ## Model Used
@@ -107,8 +93,6 @@
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] I verified the repository visibility and completed the Public Kernel Boundary section
-- [ ] Public migrations and runtime defaults contain no company/product-specific policy values
 - [ ] All Paperclip CI gates are green
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge

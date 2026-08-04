@@ -196,7 +196,6 @@ export function issueTreeControlRoutes(db: Db) {
           holdId: result.hold.id,
           cancelledIssueIds: statusUpdate.updatedIssueIds,
           cancelledIssueCount: statusUpdate.updatedIssueIds.length,
-          transitions: statusUpdate.updatedIssues.map((issue) => issue.transitionProvenance),
         },
       });
     }
@@ -240,7 +239,6 @@ export function issueTreeControlRoutes(db: Db) {
           restoredIssueIds: statusUpdate.updatedIssueIds,
           restoredIssueCount: statusUpdate.updatedIssueIds.length,
           releasedCancelHoldIds: statusUpdate.releasedCancelHoldIds,
-          transitions: statusUpdate.updatedIssues.map((issue) => issue.transitionProvenance),
         },
       });
 

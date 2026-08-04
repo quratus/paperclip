@@ -1213,31 +1213,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("projects recovery action metadata into the structured wake payload", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
-    const reviewStageId = randomUUID();
-    const decisionId = randomUUID();
-    const [changeRequestComment] = await db.insert(issueComments).values({
-      companyId,
-      issueId: sourceIssueId,
-      authorType: "agent",
-      authorAgentId: managerId,
-      body: "Changes requested: preserve the execution lock and carry this review context into recovery.",
-    }).returning();
-    await db.update(issues).set({
-      status: "in_progress",
-      executionState: {
-        status: "changes_requested",
-        currentStageId: reviewStageId,
-        currentStageIndex: 0,
-        currentStageType: "review",
-        currentParticipant: { type: "agent", agentId: managerId, userId: null },
-        returnAssignee: { type: "agent", agentId: coderId, userId: null },
-        reviewRequest: { instructions: "Verify the recovery envelope before approval." },
-        completedStageIds: [],
-        lastDecisionId: decisionId,
-        lastDecisionOutcome: "changes_requested",
-        monitor: null,
-      },
-    }).where(eq(issues.id, sourceIssueId));
     const action = await issueRecoveryActionService(db).upsertSourceScoped({
       companyId,
       sourceIssueId,
@@ -1276,53 +1251,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       maxAttempts: 3,
       nextAction: "Repair the worktree, then return the issue to the coder.",
       routingFallbackReason: null,
-    });
-    expect(payload?.executionStage).toMatchObject({
-      wakeRole: "executor",
-      stageId: reviewStageId,
-      stageType: "review",
-      currentParticipant: { type: "agent", agentId: managerId },
-      returnAssignee: { type: "agent", agentId: coderId },
-      lastDecisionOutcome: "changes_requested",
-      allowedActions: ["address_changes", "resubmit"],
-    });
-    expect(payload?.commentIds).toContain(changeRequestComment.id);
-    expect(payload?.comments).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: changeRequestComment.id,
-        body: expect.stringContaining("Changes requested"),
-      }),
-    ]));
-  });
-
-  it("preserves the durable orchestration issue in builder-created chat wakes", async () => {
-    const { companyId, sourceIssueId } = await seedCompany();
-
-    const payload = await buildPaperclipWakePayload({
-      db,
-      companyId,
-      contextSnapshot: {
-        issueId: sourceIssueId,
-        wakeReason: "live_chat_message",
-        chatSession: {
-          sessionId: "chat-42",
-          userMessage: "Prepare the launch brief.",
-          orchestrationIssue: {
-            id: sourceIssueId,
-            title: "Support conversation",
-            status: "backlog",
-          },
-        },
-      },
-    });
-
-    expect(payload?.chat).toMatchObject({
-      sessionId: "chat-42",
-      orchestrationIssue: {
-        id: sourceIssueId,
-        title: "Support conversation",
-        status: "backlog",
-      },
     });
   });
 

@@ -88,51 +88,6 @@ export interface IssueAssigneeAdapterOverrides {
   useProjectWorkspace?: boolean;
 }
 
-export type IssueTransitionReason =
-  | "agent_bounce"
-  | "changes_requested"
-  | "operator_override"
-  | "sweeper_side_effect"
-  | "recovery_action"
-  | "spec_approved"
-  | "assignment"
-  | "checkout"
-  | "release"
-  | "approval_resolved"
-  | "graph_transition"
-  | "comment_reopen"
-  | "automation"
-  | "manual_update";
-
-export type IssueBlockKind = "wait_schedule" | "wait_internal" | "needs_user";
-
-export interface IssueTransitionEvidenceRef {
-  type: "comment" | "review" | "interaction" | "run" | "approval" | "recovery_action" | "graph_transition" | "request";
-  id: string;
-}
-
-export interface IssueTransitionInput {
-  reason: IssueTransitionReason;
-  evidenceRef: IssueTransitionEvidenceRef;
-  block?: {
-    kind: IssueBlockKind;
-    clearingCondition: string;
-  } | null;
-}
-
-export interface IssueTransitionProvenance extends IssueTransitionInput {
-  id: string;
-  fromStatus: IssueStatus;
-  toStatus: IssueStatus;
-  actor: {
-    type: "agent" | "user" | "system";
-    id: string;
-    agentId: string | null;
-    runId: string | null;
-  };
-  occurredAt: string;
-}
-
 export type DocumentFormat = "markdown";
 
 export interface IssueDocumentSummary {
@@ -803,7 +758,6 @@ export interface Issue {
   assigneeAdapterOverrides: IssueAssigneeAdapterOverrides | null;
   executionPolicy?: IssueExecutionPolicy | null;
   executionState?: IssueExecutionState | null;
-  transitionProvenance?: IssueTransitionProvenance | null;
   monitorNextCheckAt?: Date | null;
   monitorLastTriggeredAt?: Date | null;
   monitorAttemptCount?: number;

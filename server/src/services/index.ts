@@ -82,7 +82,6 @@ export { backfillLegacyToolOAuthTokens } from "./tool-oauth-legacy-backfill.js";
 export { toolAccessPolicyService } from "./tool-access-policy.js";
 export { routineService } from "./routines.js";
 export { pipelineGraphOutboxService } from "./pipeline-graph-outbox.js";
-export { workflowRoleService } from "./workflow-roles.js";
 export { costService } from "./costs.js";
 export { financeService } from "./finance.js";
 export { heartbeatService, resolveHeartbeatSchedulingSuppression } from "./heartbeat.js";
