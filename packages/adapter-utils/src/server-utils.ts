@@ -464,25 +464,6 @@ type PaperclipWakeComment = {
   authorId: string | null;
 };
 
-type PaperclipWakeChatMessage = {
-  role: "user" | "agent" | null;
-  body: string;
-  bodyTruncated: boolean;
-};
-
-type PaperclipWakeChat = {
-  sessionId: string | null;
-  userMessage: string;
-  userMessageTruncated: boolean;
-  compactedContext: string | null;
-  compactedContextTruncated: boolean;
-  history: PaperclipWakeChatMessage[];
-  historyTruncated: boolean;
-  orchestrationIssue: { id: string; title: string; status: string } | null;
-  conversationStyle: string | null;
-  qualityProtocol: string | null;
-};
-
 type PaperclipWakePlanReviewAuthor = {
   type: string | null;
   id: string | null;
@@ -656,17 +637,6 @@ type PaperclipWakeRecovery = {
   routingFallbackReason: string | null;
 };
 
-type PaperclipWakeTransition = {
-  id: string | null;
-  fromStatus: string | null;
-  toStatus: string | null;
-  reason: string | null;
-  actor: { type: string | null; id: string | null; agentId: string | null; runId: string | null } | null;
-  evidenceRef: { type: string | null; id: string | null } | null;
-  block: { kind: "wait_schedule" | "wait_internal" | "needs_user"; clearingCondition: string } | null;
-  occurredAt: string | null;
-};
-
 type PaperclipWakeGraphAssignment = {
   schemaVersion: 1;
   id: string;
@@ -691,9 +661,7 @@ type PaperclipWakeGraphAssignment = {
 
 type PaperclipWakePayload = {
   reason: string | null;
-  transition: PaperclipWakeTransition | null;
   recovery: PaperclipWakeRecovery | null;
-  chat: PaperclipWakeChat | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
   dependencyBlockedInteraction: boolean;
@@ -724,44 +692,6 @@ type PaperclipWakePayload = {
   graphAssignment: PaperclipWakeGraphAssignment | null;
 };
 
-function normalizePaperclipWakeTransition(value: unknown): PaperclipWakeTransition | null {
-  const transition = parseObject(value);
-  const actor = parseObject(transition.actor);
-  const evidenceRef = parseObject(transition.evidenceRef);
-  const block = parseObject(transition.block);
-  const blockKind = asString(block.kind, "").trim();
-  const clearingCondition = asString(block.clearingCondition, "").trim();
-  const normalizedBlock: PaperclipWakeTransition["block"] =
-    (blockKind === "wait_schedule" || blockKind === "wait_internal" || blockKind === "needs_user") && clearingCondition
-      ? { kind: blockKind, clearingCondition }
-      : null;
-  const normalized = {
-    id: asString(transition.id, "").trim() || null,
-    fromStatus: asString(transition.fromStatus, "").trim() || null,
-    toStatus: asString(transition.toStatus, "").trim() || null,
-    reason: asString(transition.reason, "").trim() || null,
-    actor: Object.keys(actor).length > 0
-      ? {
-          type: asString(actor.type, "").trim() || null,
-          id: asString(actor.id, "").trim() || null,
-          agentId: asString(actor.agentId, "").trim() || null,
-          runId: asString(actor.runId, "").trim() || null,
-        }
-      : null,
-    evidenceRef: Object.keys(evidenceRef).length > 0
-      ? {
-          type: asString(evidenceRef.type, "").trim() || null,
-          id: asString(evidenceRef.id, "").trim() || null,
-        }
-      : null,
-    block: normalizedBlock,
-    occurredAt: asString(transition.occurredAt, "").trim() || null,
-  };
-  return normalized.id || normalized.fromStatus || normalized.toStatus || normalized.reason || normalized.actor || normalized.evidenceRef || normalized.block
-    ? normalized
-    : null;
-}
-
 function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery | null {
   const recovery = parseObject(value);
   const cause = asString(recovery.cause, "").trim() || null;
@@ -779,62 +709,6 @@ function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery |
     maxAttempts: typeof recovery.maxAttempts === "number" ? recovery.maxAttempts : null,
     nextAction: asString(recovery.nextAction, "").trim() || null,
     routingFallbackReason: asString(recovery.routingFallbackReason, "").trim() || null,
-  };
-}
-
-const MAX_CHAT_MESSAGE_BODY_CHARS = 4_000;
-const MAX_CHAT_HISTORY_MESSAGES = 40;
-const MAX_CHAT_COMPACTED_CONTEXT_CHARS = 4_000;
-
-function normalizePaperclipWakeChatMessage(value: unknown): PaperclipWakeChatMessage | null {
-  const entry = parseObject(value);
-  const roleRaw = asString(entry.role, "").trim();
-  const role = roleRaw === "user" || roleRaw === "agent" ? roleRaw : null;
-  const fullBody = asString(entry.body, "");
-  if (!fullBody.trim()) return null;
-  const body = fullBody.length > MAX_CHAT_MESSAGE_BODY_CHARS
-    ? fullBody.slice(0, MAX_CHAT_MESSAGE_BODY_CHARS)
-    : fullBody;
-  return { role, body, bodyTruncated: body.length < fullBody.length };
-}
-
-function normalizePaperclipWakeChat(value: unknown): PaperclipWakeChat | null {
-  const chat = parseObject(value);
-  const userMessageFull = asString(chat.userMessage, "").trim();
-  if (!userMessageFull) return null;
-  const userMessage = userMessageFull.length > MAX_CHAT_MESSAGE_BODY_CHARS
-    ? userMessageFull.slice(0, MAX_CHAT_MESSAGE_BODY_CHARS)
-    : userMessageFull;
-  const compactedContextFull = asString(chat.compactedContext, "").trim();
-  const compactedContext = (
-    compactedContextFull.length > MAX_CHAT_COMPACTED_CONTEXT_CHARS
-      ? compactedContextFull.slice(0, MAX_CHAT_COMPACTED_CONTEXT_CHARS)
-      : compactedContextFull
-  ) || null;
-  const historyRaw = Array.isArray(chat.history) ? chat.history : [];
-  const history = historyRaw
-    .slice(-MAX_CHAT_HISTORY_MESSAGES)
-    .map((entry) => normalizePaperclipWakeChatMessage(entry))
-    .filter((entry): entry is PaperclipWakeChatMessage => Boolean(entry));
-  const orchestrationIssue = parseObject(chat.orchestrationIssue);
-  const orchestrationIssueId = asString(orchestrationIssue.id, "").trim();
-  return {
-    sessionId: asString(chat.sessionId, "").trim() || null,
-    userMessage,
-    userMessageTruncated: userMessage.length < userMessageFull.length,
-    compactedContext,
-    compactedContextTruncated: Boolean(compactedContext && compactedContext.length < compactedContextFull.length),
-    history,
-    historyTruncated: historyRaw.length > MAX_CHAT_HISTORY_MESSAGES,
-    orchestrationIssue: orchestrationIssueId
-      ? {
-          id: orchestrationIssueId,
-          title: asString(orchestrationIssue.title, "").trim() || "Live conversation",
-          status: asString(orchestrationIssue.status, "").trim() || "backlog",
-        }
-      : null,
-    conversationStyle: asString(chat.conversationStyle, "").trim().slice(0, 4_000) || null,
-    qualityProtocol: asString(chat.qualityProtocol, "").trim().slice(0, 4_000) || null,
   };
 }
 
@@ -1433,7 +1307,6 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(payload.livenessContinuation);
   const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog);
   const recovery = normalizePaperclipWakeRecovery(payload.recovery);
-  const transition = normalizePaperclipWakeTransition(payload.transition);
   const childIssueSummaries = Array.isArray(payload.childIssueSummaries)
     ? payload.childIssueSummaries
         .map((entry) => normalizePaperclipWakeChildIssueSummary(entry))
@@ -1453,16 +1326,13 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const activeTreeHold = normalizePaperclipWakeTreeHoldSummary(payload.activeTreeHold);
   const checkboxSelection = normalizePaperclipWakeCheckboxSelection(payload.checkboxSelection);
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
-  const chat = normalizePaperclipWakeChat(payload.chat);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !recovery && !transition && !chat && !graphAssignment && !normalizePaperclipWakeIssue(payload.issue)) {
+  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !recovery && !graphAssignment && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
   return {
     reason: asString(payload.reason, "").trim() || null,
-    transition,
     recovery,
-    chat,
     issue: normalizePaperclipWakeIssue(payload.issue),
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     dependencyBlockedInteraction: asBoolean(payload.dependencyBlockedInteraction, false),
@@ -1505,21 +1375,6 @@ export function isPaperclipRecoveryWakePayload(value: unknown): boolean {
   return Boolean(normalized?.recovery || normalized?.reason === "source_scoped_recovery_action");
 }
 
-export function isPaperclipChatOnlyWakePayload(value: unknown): boolean {
-  const normalized = normalizePaperclipWakePayload(value);
-  if (!normalized?.chat) return false;
-  const issueIsConversationRoot = !normalized.issue || (
-    normalized.chat.orchestrationIssue !== null &&
-    normalized.issue.id === normalized.chat.orchestrationIssue.id
-  );
-  return issueIsConversationRoot &&
-    normalized.comments.length === 0 &&
-    normalized.commentIds.length === 0 &&
-    !normalized.executionStage &&
-    !normalized.recovery &&
-    !normalized.interactionKind;
-}
-
 export function readPaperclipIssueWorkModeFromContext(value: unknown): string | null {
   const context = parseObject(value);
   const issue = parseObject(context.paperclipIssue);
@@ -1529,44 +1384,12 @@ export function readPaperclipIssueWorkModeFromContext(value: unknown): string | 
   return wake?.issue?.workMode ?? null;
 }
 
-function renderChatOnlyWakePrompt(chat: PaperclipWakeChat): string {
-  const lines = [
-    "## Live Chat — this is not a heartbeat",
-    "",
-    "A person is waiting in a live chat for your reply. Ignore routine heartbeat and task-queue instructions for this wake.",
-  ];
-  if (chat.conversationStyle) lines.push("", "Conversation voice:", chat.conversationStyle);
-  if (chat.qualityProtocol) lines.push("", "Internal quality contract:", chat.qualityProtocol);
-  if (chat.compactedContext) {
-    lines.push("", "Earlier context (summarized):", chat.compactedContext);
-    if (chat.compactedContextTruncated) lines.push("[earlier context truncated]");
-  }
-  if (chat.history.length > 0) {
-    lines.push("", "Recent messages:");
-    for (const message of chat.history) {
-      lines.push(`${message.role === "user" ? "User" : "You"}: ${message.body}${message.bodyTruncated ? " [truncated]" : ""}`);
-    }
-    if (chat.historyTruncated) lines.push("[earlier history truncated]");
-  }
-  lines.push("", `Latest message from the user: ${chat.userMessage}${chat.userMessageTruncated ? " [truncated]" : ""}`, "");
-  if (chat.orchestrationIssue) {
-    lines.push(
-      `Conversation context record: ${chat.orchestrationIssue.id} (${chat.orchestrationIssue.title}; status ${chat.orchestrationIssue.status}).`,
-      "Treat this record only as durable conversation context. Follow the company's supplied instructions for task creation, approvals, evidence, and response style.",
-    );
-  }
-  return lines.join("\n").trim();
-}
-
 export function renderPaperclipWakePrompt(
   value: unknown,
   options: { resumedSession?: boolean; includeExecutionContract?: boolean } = {},
 ): string {
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return "";
-  if (normalized.chat && isPaperclipChatOnlyWakePayload(value)) {
-    return renderChatOnlyWakePrompt(normalized.chat);
-  }
   const resumedSession = options.resumedSession === true;
   // The heartbeat prompt template already carries the execution contract on
   // fresh sessions; only resume deltas (which replace the template) and
@@ -1576,7 +1399,6 @@ export function renderPaperclipWakePrompt(
     normalized.comments.length > 0 || normalized.includedCount > 0 || normalized.requestedCount > 0;
   const executionStage = normalized.executionStage;
   const recovery = normalized.recovery;
-  const transition = normalized.transition;
   const recoveryScoped = Boolean(recovery || normalized.reason === "source_scoped_recovery_action");
   const originalAssigneeLabel = recovery?.originalAssignee?.name ??
     recovery?.originalAssignee?.id ??
@@ -1646,20 +1468,6 @@ export function renderPaperclipWakePrompt(
         ]
       : []),
     `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
-    ...(transition
-      ? [
-          `- transition: ${transition.fromStatus ?? "unknown"} -> ${transition.toStatus ?? "unknown"}`,
-          `- transition actor: ${transition.actor?.type ?? "unknown"} ${transition.actor?.id ?? "unknown"}`,
-          `- transition reason: ${transition.reason ?? "unknown"}`,
-          `- transition evidence: ${transition.evidenceRef?.type ?? "unknown"}:${transition.evidenceRef?.id ?? "unknown"}`,
-          ...(transition.block
-            ? [
-                `- block kind: ${transition.block.kind}`,
-                `- clearing condition: ${transition.block.clearingCondition}`,
-              ]
-            : []),
-        ]
-      : []),
     ...(recoveryScoped
       ? [
           `- recovery cause: ${recovery?.cause ?? "unknown"}`,

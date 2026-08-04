@@ -5,7 +5,6 @@ import {
   approvals,
   heartbeatRuns,
   pipelineGraphEffectAttempts,
-  pipelineGraphRoleBindings,
   pipelineGraphRuns,
   pipelineGraphVersions,
 } from "@paperclipai/db";
@@ -361,6 +360,18 @@ export function pipelineGraphEffectService(db: Db) {
         }
 
         if (input.actor.type === "agent") {
+          const version = await tx
+            .select({ definition: pipelineGraphVersions.definition })
+            .from(pipelineGraphVersions)
+            .where(and(
+              eq(pipelineGraphVersions.companyId, input.companyId),
+              eq(pipelineGraphVersions.id, run.graphVersionId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          const node = version?.definition.nodes.find((candidate) => candidate.key === run.currentNodeKey);
+          const targetAgentId = typeof node?.config.targetAgentId === "string"
+            ? node.config.targetAgentId.trim()
+            : "";
           const nativeRun = await tx
             .select({
               agentId: heartbeatRuns.agentId,
@@ -373,9 +384,9 @@ export function pipelineGraphEffectService(db: Db) {
             ))
             .then((rows) => rows[0] ?? null);
           const context = objectValue(nativeRun?.contextSnapshot);
-          const assignment = objectValue(context.graphAssignment);
           if (
-            assignment.targetAgentId !== input.actor.agentId
+            !targetAgentId
+            || targetAgentId !== input.actor.agentId
             || nativeRun?.agentId !== input.actor.agentId
             || context.graphRunId !== run.id
             || context.graphRunRevision !== run.revision
@@ -488,20 +499,9 @@ export function pipelineGraphEffectService(db: Db) {
         const requiredExecutorType = typeof policyNode?.config.effectExecutorType === "string"
           ? policyNode.config.effectExecutorType.trim()
           : "";
-        let requiredExecutorId = typeof policyNode?.config.effectExecutorId === "string"
+        const requiredExecutorId = typeof policyNode?.config.effectExecutorId === "string"
           ? policyNode.config.effectExecutorId.trim()
           : "";
-        if (requiredExecutorId === "$roleBinding") {
-          requiredExecutorId = await tx.select({ agentId: pipelineGraphRoleBindings.agentId })
-            .from(pipelineGraphRoleBindings)
-            .where(and(
-              eq(pipelineGraphRoleBindings.companyId, input.companyId),
-              eq(pipelineGraphRoleBindings.runId, attempt.runId),
-              eq(pipelineGraphRoleBindings.runRevision, attempt.runRevision),
-              eq(pipelineGraphRoleBindings.nodeKey, attempt.nodeKey),
-            ))
-            .then((rows) => rows[0]?.agentId ?? "");
-        }
         const requiredExecutorKeyId = typeof policyNode?.config.effectExecutorKeyId === "string"
           ? policyNode.config.effectExecutorKeyId.trim()
           : "";

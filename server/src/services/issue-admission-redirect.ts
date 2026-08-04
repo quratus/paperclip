@@ -12,7 +12,6 @@ import {
   evaluateIssueAdmission,
   type IssueAdmissionDisposition,
 } from "./issue-admission.js";
-import { buildIssueTransitionProvenance } from "./issues.js";
 
 const ACTIVE_RECOVERY_STATUSES = ["active", "escalated"] as const;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -282,15 +281,6 @@ export async function redirectIssueAdmission(
       .update(issues)
       .set({
         status: "backlog",
-        transitionProvenance: buildIssueTransitionProvenance({
-          fromStatus: issue.status,
-          toStatus: "backlog",
-          transition: { reason: "recovery_action", evidenceRef: { type: "recovery_action", id: action.id } },
-          actorType: input.requestedByActorType === "agent" ? "agent" : input.requestedByActorType === "user" ? "user" : "system",
-          actorId: input.requestedByActorId ?? "admission_redirect",
-          actorAgentId: input.requestedByActorType === "agent" ? input.requestedByActorId : null,
-          actorRunId: input.checkoutRunId ?? null,
-        }),
         assigneeAgentId: owner?.id ?? null,
         assigneeUserId: null,
         blockedByApprovalId: null,
@@ -420,15 +410,6 @@ export async function handBackCompletedAdmissionRedirectInTransaction(
     .update(issues)
     .set({
       status: "todo",
-      transitionProvenance: buildIssueTransitionProvenance({
-        fromStatus: issue.status,
-        toStatus: "todo",
-        transition: { reason: "recovery_action", evidenceRef: { type: "recovery_action", id: action.id } },
-        actorType: input.requestedByActorType === "agent" ? "agent" : input.requestedByActorType === "user" ? "user" : "system",
-        actorId: input.requestedByActorId ?? "admission_handoff",
-        actorAgentId: input.requestedByAgentId ?? null,
-        actorRunId: input.actorRunId ?? null,
-      }),
       assigneeAgentId: returnOwner.id,
       assigneeUserId: null,
       blockedByExternal: null,

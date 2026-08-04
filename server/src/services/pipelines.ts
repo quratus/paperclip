@@ -39,7 +39,6 @@ import {
   type PipelineCaseConversationSourceReason,
   type ExecutionWorkspaceMode,
   type IssueExecutionWorkspaceSettings,
-  type IssueTransitionProvenance,
   type PipelineStageAutomation,
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
@@ -4858,27 +4857,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           ? effects.linkedAutomationIssueIds
           : [];
         if (issueIdsToCancel.length > 0) {
-          const issueTransitionActor = input.actor.type === "agent"
-            ? { type: "agent", id: input.actor.agentId, agentId: input.actor.agentId, runId: input.actor.runId }
-            : input.actor.type === "user"
-              ? { type: "user", id: input.actor.userId, agentId: null, runId: null }
-              : { type: "system", id: "pipeline_automation_retry", agentId: null, runId: null };
           await tx
             .update(issues)
-            .set({
-              status: "cancelled",
-              transitionProvenance: sql<IssueTransitionProvenance>`jsonb_build_object(
-                'id', gen_random_uuid()::text,
-                'fromStatus', ${issues.status},
-                'toStatus', 'cancelled',
-                'actor', ${JSON.stringify(issueTransitionActor)}::jsonb,
-                'reason', 'automation',
-                'evidenceRef', jsonb_build_object('type', 'request', 'id', ${ledger.id}::text),
-                'block', null,
-                'occurredAt', ${now.toISOString()}::text
-              )`,
-              updatedAt: now,
-            })
+            .set({ status: "cancelled", updatedAt: now })
             .where(and(
               eq(issues.companyId, input.companyId),
               inArray(issues.id, issueIdsToCancel),

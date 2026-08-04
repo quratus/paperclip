@@ -243,8 +243,6 @@ function graphWakeRouting(input: {
   };
   return {
     responsibilityOwner,
-    roleResolutionEnabled:
-      typeof config.responsibilityOwner === "string" && config.responsibilityOwner.trim().length > 0,
     dispatchEnabled: config.dispatchEnabled === true,
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(responsibilityInstruction ? { responsibilityInstruction } : {}),
@@ -340,8 +338,14 @@ export async function resolveGraphTransitionAssignmentAuthorization(
   }
   const currentNode = graphVersion.definition.nodes.find((node) => node.key === run.currentNodeKey);
   if (!currentNode) return { authorized: false, code: "graph_run_node_missing" };
-  if (currentNode.config.dispatchEnabled !== true) {
+  const assignedAgentId = typeof currentNode.config.targetAgentId === "string"
+    ? currentNode.config.targetAgentId.trim()
+    : "";
+  if (currentNode.config.dispatchEnabled !== true || !assignedAgentId) {
     return { authorized: false, code: "graph_assignment_not_dispatchable" };
+  }
+  if (input.actor.agentId !== assignedAgentId) {
+    return { authorized: false, code: "graph_assignment_agent_mismatch" };
   }
   const attempt = await db
     .select({
@@ -357,9 +361,6 @@ export async function resolveGraphTransitionAssignmentAuthorization(
     .then((rows) => rows[0] ?? null);
   const attemptContext = objectValue(attempt?.contextSnapshot);
   const assignment = objectValue(attemptContext.graphAssignment);
-  if (assignment.targetAgentId !== input.actor.agentId) {
-    return { authorized: false, code: "graph_assignment_agent_mismatch" };
-  }
   if (
     !attempt
     || !ACTIVE_HEARTBEAT_RUN_STATUSES.has(attempt.status)
@@ -633,10 +634,7 @@ export function pipelineGraphRunService(
           typeof entryNode.config.targetAgentId === "string"
             ? entryNode.config.targetAgentId.trim()
             : "";
-        const responsibilityOwner = typeof entryNode.config.responsibilityOwner === "string"
-          ? entryNode.config.responsibilityOwner.trim()
-          : "";
-        if (entryNode.config.dispatchEnabled === true && (responsibilityOwner || targetAgentId)) {
+        if (entryNode.config.dispatchEnabled === true && targetAgentId) {
           const wakeRouting = graphWakeRouting({
             definition: row.graphVersion.definition,
             node: entryNode,
@@ -1047,10 +1045,23 @@ export function pipelineGraphRunService(
             providerReceipt: effect.providerReceipt,
           };
         }
+        const assignedAgentId =
+          typeof currentNode.config.targetAgentId === "string"
+            ? currentNode.config.targetAgentId.trim()
+            : "";
         if (
           input.actor.type === "agent"
           && currentNode.config.dispatchEnabled === true
+          && assignedAgentId
         ) {
+          if (input.actor.agentId !== assignedAgentId) {
+            throw forbidden("Only the agent assigned to this graph node can submit its outcome", {
+              code: "graph_assignment_agent_mismatch",
+              assignedAgentId,
+              actorAgentId: input.actor.agentId,
+              currentNodeKey: run.currentNodeKey,
+            });
+          }
           const attempt = await tx
             .select({
               agentId: heartbeatRuns.agentId,
@@ -1064,14 +1075,6 @@ export function pipelineGraphRunService(
             .then((rows) => rows[0] ?? null);
           const attemptContext = objectValue(attempt?.contextSnapshot);
           const assignment = objectValue(attemptContext.graphAssignment);
-          if (assignment.targetAgentId !== input.actor.agentId) {
-            throw forbidden("Only the agent assigned to this graph node can submit its outcome", {
-              code: "graph_assignment_agent_mismatch",
-              assignedAgentId: assignment.targetAgentId,
-              actorAgentId: input.actor.agentId,
-              currentNodeKey: run.currentNodeKey,
-            });
-          }
           if (
             !attempt
             || attempt.agentId !== input.actor.agentId
