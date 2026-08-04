@@ -91,7 +91,7 @@ export interface IssueAssigneeAdapterOverrides {
 export type IssueTransitionReason =
   | "agent_bounce"
   | "changes_requested"
-  | "founder_override"
+  | "operator_override"
   | "sweeper_side_effect"
   | "recovery_action"
   | "spec_approved"

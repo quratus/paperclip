@@ -9,25 +9,9 @@ import {
 } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 
-export const STANDARD_WORKFLOW_ROLES = [
-  ["conversation", "Conversation owner"],
-  ["refiner", "Request refiner"],
-  ["implementer", "Implementer"],
-  ["independent_reviewer", "Independent reviewer"],
-  ["delivery_owner", "Delivery owner"],
-  ["capacity_recovery_owner", "Capacity recovery owner"],
-  ["designer", "Designer"],
-] as const;
-
-export const STANDARD_WORKFLOW_ROLE_SEPARATION = [
-  ["delivery_owner", "independent_reviewer"],
-  ["implementer", "independent_reviewer"],
-] as const;
-
 export function workflowRoleService(db: Db) {
   return {
     async list(companyId: string) {
-      await this.ensureCompanyDefaults(companyId);
       const [roles, assignments, constraints] = await Promise.all([
         db.select().from(workflowRoles).where(eq(workflowRoles.companyId, companyId))
           .orderBy(asc(workflowRoles.key)),
@@ -69,7 +53,6 @@ export function workflowRoleService(db: Db) {
       roleKey: string;
       assignments: Array<{ agentId: string; priority: number }>;
     }) {
-      await this.ensureCompanyDefaults(input.companyId);
       return db.transaction(async (tx) => {
         const role = await tx.select({ key: workflowRoles.key }).from(workflowRoles).where(and(
           eq(workflowRoles.companyId, input.companyId),
@@ -113,19 +96,64 @@ export function workflowRoleService(db: Db) {
       });
     },
 
-    async ensureCompanyDefaults(companyId: string) {
+    async configureCatalog(input: {
+      companyId: string;
+      roles: Array<{ key: string; label: string }>;
+      separationConstraints: Array<{ firstRoleKey: string; secondRoleKey: string }>;
+    }) {
+      const roleKeys = input.roles.map((role) => role.key);
+      if (new Set(roleKeys).size !== roleKeys.length) {
+        throw unprocessable("Workflow role catalog contains duplicate role keys", {
+          code: "workflow_role_catalog_duplicate",
+        });
+      }
+      const configuredRoleKeys = new Set(roleKeys);
+      const constraintKeys = input.separationConstraints.map((constraint) =>
+        `${constraint.firstRoleKey}:${constraint.secondRoleKey}`,
+      );
+      if (new Set(constraintKeys).size !== constraintKeys.length) {
+        throw unprocessable("Workflow role catalog contains duplicate separation constraints", {
+          code: "workflow_role_constraint_duplicate",
+        });
+      }
+      for (const constraint of input.separationConstraints) {
+        if (
+          constraint.firstRoleKey >= constraint.secondRoleKey
+          || !configuredRoleKeys.has(constraint.firstRoleKey)
+          || !configuredRoleKeys.has(constraint.secondRoleKey)
+        ) {
+          throw unprocessable("Workflow role separation constraints must be ordered and reference configured roles", {
+            code: "workflow_role_constraint_invalid",
+            constraint,
+          });
+        }
+      }
+
       await db.transaction(async (tx) => {
-        await tx.insert(workflowRoles).values(
-          STANDARD_WORKFLOW_ROLES.map(([key, label]) => ({ companyId, key, label })),
-        ).onConflictDoNothing();
-        await tx.insert(workflowRoleSeparationConstraints).values(
-          STANDARD_WORKFLOW_ROLE_SEPARATION.map(([firstRoleKey, secondRoleKey]) => ({
-            companyId,
-            firstRoleKey,
-            secondRoleKey,
-          })),
-        ).onConflictDoNothing();
+        if (input.roles.length > 0) {
+          for (const role of input.roles) {
+            await tx.insert(workflowRoles).values({
+              companyId: input.companyId,
+              ...role,
+            }).onConflictDoUpdate({
+              target: [workflowRoles.companyId, workflowRoles.key],
+              set: { label: role.label, updatedAt: new Date() },
+            });
+          }
+        }
+        await tx.delete(workflowRoleSeparationConstraints).where(
+          eq(workflowRoleSeparationConstraints.companyId, input.companyId),
+        );
+        if (input.separationConstraints.length > 0) {
+          await tx.insert(workflowRoleSeparationConstraints).values(
+            input.separationConstraints.map((constraint) => ({
+              companyId: input.companyId,
+              ...constraint,
+            })),
+          );
+        }
       });
+      return this.list(input.companyId);
     },
 
     async resolveAndBind(input: {

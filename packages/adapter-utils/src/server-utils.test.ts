@@ -717,20 +717,22 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
-  it("authorizes internal child work only when chat carries its durable orchestration issue", () => {
+  it("renders durable chat context without injecting company operating policy", () => {
     const prompt = renderPaperclipWakePrompt({
       chat: {
         sessionId: "chat-1",
         userMessage: "Prepare the launch brief.",
-        orchestrationIssue: { id: "issue-chat-1", title: "Founder conversation", status: "backlog" },
+        orchestrationIssue: { id: "issue-chat-1", title: "Support conversation", status: "backlog" },
       },
-      issue: { id: "issue-chat-1", identifier: "PAP-1", title: "Founder conversation", status: "backlog" },
+      issue: { id: "issue-chat-1", identifier: "PAP-1", title: "Support conversation", status: "backlog" },
     });
 
     expect(prompt).toContain("Live Chat");
-    expect(prompt).toContain("Create and assign ordinary internal work yourself");
     expect(prompt).toContain("issue-chat-1");
-    expect(prompt).toContain("external, irreversible, paid, security-sensitive");
+    expect(prompt).toContain("Follow the company's supplied instructions");
+    expect(prompt).not.toContain("Create and assign ordinary internal work yourself");
+    expect(prompt).not.toContain("Create child work items before execution");
+    expect(prompt).not.toContain("Company-specific response policy");
     expect(prompt).not.toContain("check your assigned work");
   });
 
@@ -772,7 +774,7 @@ describe("renderPaperclipWakePrompt", () => {
       issueId: "issue-1",
       nodeKey: "review",
       nodeKind: "review",
-      responsibilityOwner: "independent_reviewer",
+      responsibilityOwner: "reviewer",
       targetAgentId: "agent-1",
       instruction: "Review the change against the evidence.",
       acceptanceCriteria: ["Tests prove the changed behavior", "No unresolved critical findings"],

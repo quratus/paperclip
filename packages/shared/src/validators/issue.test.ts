@@ -71,7 +71,7 @@ describe("issue validators", () => {
         reason: "manual_update",
         evidenceRef: { type: "request", id: "request-42" },
         block: {
-          kind: "needs_founder",
+          kind: "needs_named_person",
           clearingCondition: "A named person must respond.",
         },
       },

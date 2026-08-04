@@ -247,7 +247,7 @@ export const issueExecutionStateSchema = z.object({
 export const issueTransitionReasonSchema = z.enum([
   "agent_bounce",
   "changes_requested",
-  "founder_override",
+  "operator_override",
   "sweeper_side_effect",
   "recovery_action",
   "spec_approved",

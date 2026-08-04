@@ -87,6 +87,16 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       priority: z.number().int().min(0).max(1_000_000).default(100),
     })).max(100),
   });
+  const workflowRoleCatalogSchema = z.object({
+    roles: z.array(z.object({
+      key: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/),
+      label: z.string().trim().min(1).max(120),
+    }).strict()).max(100),
+    separationConstraints: z.array(z.object({
+      firstRoleKey: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/),
+      secondRoleKey: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/),
+    }).strict()).max(1_000),
+  }).strict();
 
   function assertImportTargetAccess(
     req: Request,
@@ -159,6 +169,27 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     assertCompanyAccess(req, companyId);
     assertBoard(req);
     res.json(await workflowRoles.list(companyId));
+  });
+
+  router.put("/:companyId/workflow-roles", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const body = workflowRoleCatalogSchema.parse(req.body);
+    const result = await workflowRoles.configureCatalog({ companyId, ...body });
+    await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "workflow_role.catalog_configured",
+      entityType: "company",
+      entityId: companyId,
+      details: {
+        roleKeys: body.roles.map((role) => role.key),
+        separationConstraints: body.separationConstraints,
+      },
+    });
+    res.json(result);
   });
 
   router.put("/:companyId/workflow-roles/:roleKey/assignments", async (req, res) => {

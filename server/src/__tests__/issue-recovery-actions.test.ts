@@ -1309,7 +1309,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           userMessage: "Prepare the launch brief.",
           orchestrationIssue: {
             id: sourceIssueId,
-            title: "Founder conversation",
+            title: "Support conversation",
             status: "backlog",
           },
         },
@@ -1320,7 +1320,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       sessionId: "chat-42",
       orchestrationIssue: {
         id: sourceIssueId,
-        title: "Founder conversation",
+        title: "Support conversation",
         status: "backlog",
       },
     });

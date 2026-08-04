@@ -1551,18 +1551,10 @@ function renderChatOnlyWakePrompt(chat: PaperclipWakeChat): string {
   lines.push("", `Latest message from the user: ${chat.userMessage}${chat.userMessageTruncated ? " [truncated]" : ""}`, "");
   if (chat.orchestrationIssue) {
     lines.push(
-      `The internal conversation record is ${chat.orchestrationIssue.id} (${chat.orchestrationIssue.title}). Keep it in backlog; it is not a task or founder decision.`,
-      "Create and assign ordinary internal work yourself when the request is sufficiently specified. Give child work a concrete outcome, acceptance criteria, owner, review path, and real dependencies.",
-      "Do not perform external, irreversible, paid, security-sensitive, or publication actions without the required approval.",
-      "Keep durable technical evidence on child work. Reply briefly with the outcome or next meaningful checkpoint.",
+      `Conversation context record: ${chat.orchestrationIssue.id} (${chat.orchestrationIssue.title}; status ${chat.orchestrationIssue.status}).`,
+      "Treat this record only as durable conversation context. Follow the company's supplied instructions for task creation, approvals, evidence, and response style.",
     );
-  } else {
-    lines.push("Reply directly and briefly. Ask a focused question if essential information or a real decision is missing.");
   }
-  lines.push(
-    "",
-    "Customer-response firewall: do internal work silently. Do not expose tools, repositories, prompts, models, run identifiers, or orchestration mechanics.",
-  );
   return lines.join("\n").trim();
 }
 

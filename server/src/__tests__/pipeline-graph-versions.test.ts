@@ -1292,15 +1292,41 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     ]).returning();
     const byName = new Map(createdAgents.map((agent) => [agent.name, agent.id]));
     const roles = workflowRoleService(db);
-    await roles.ensureCompanyDefaults(fixture.companyId);
+    await expect(roles.list(fixture.companyId)).resolves.toEqual({
+      roles: [],
+      separationConstraints: [],
+    });
+    await roles.configureCatalog({
+      companyId: fixture.companyId,
+      roles: [
+        { key: "author", label: "Author" },
+        { key: "reviewer", label: "Reviewer" },
+        { key: "publisher", label: "Publisher" },
+      ],
+      separationConstraints: [
+        { firstRoleKey: "publisher", secondRoleKey: "reviewer" },
+        { firstRoleKey: "author", secondRoleKey: "reviewer" },
+      ],
+    });
+    await expect(roles.configureCatalog({
+      companyId: fixture.companyId,
+      roles: [{ key: "author", label: "Author" }],
+      separationConstraints: [{
+        firstRoleKey: "author",
+        secondRoleKey: "reviewer",
+      }],
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "workflow_role_constraint_invalid" },
+    });
     await roles.replaceAssignments({
       companyId: fixture.companyId,
-      roleKey: "implementer",
+      roleKey: "author",
       assignments: [{ agentId: byName.get("Author")!, priority: 0 }],
     });
     await roles.replaceAssignments({
       companyId: fixture.companyId,
-      roleKey: "independent_reviewer",
+      roleKey: "reviewer",
       assignments: [
         { agentId: byName.get("Author")!, priority: 0 },
         { agentId: byName.get("Reviewer")!, priority: 1 },
@@ -1308,36 +1334,36 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     });
     await roles.replaceAssignments({
       companyId: fixture.companyId,
-      roleKey: "delivery_owner",
+      roleKey: "publisher",
       assignments: [
         { agentId: byName.get("Reviewer")!, priority: 0 },
         { agentId: byName.get("Delivery")!, priority: 1 },
       ],
     });
 
-    const implementer = await roles.resolveAndBind({
+    const author = await roles.resolveAndBind({
       companyId: fixture.companyId,
       runId: started.run.id,
       runRevision: 1,
       nodeKey: "implement",
-      roleKey: "implementer",
+      roleKey: "author",
     });
     const reviewer = await roles.resolveAndBind({
       companyId: fixture.companyId,
       runId: started.run.id,
       runRevision: 2,
       nodeKey: "review",
-      roleKey: "independent_reviewer",
+      roleKey: "reviewer",
     });
     const delivery = await roles.resolveAndBind({
       companyId: fixture.companyId,
       runId: started.run.id,
       runRevision: 3,
       nodeKey: "merge",
-      roleKey: "delivery_owner",
+      roleKey: "publisher",
     });
 
-    expect(implementer.agentId).toBe(byName.get("Author"));
+    expect(author.agentId).toBe(byName.get("Author"));
     expect(reviewer.agentId).toBe(byName.get("Reviewer"));
     expect(delivery.agentId).toBe(byName.get("Delivery"));
     await expect(roles.resolveAndBind({
@@ -1345,7 +1371,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       runId: started.run.id,
       runRevision: 2,
       nodeKey: "review",
-      roleKey: "delivery_owner",
+      roleKey: "publisher",
     })).rejects.toMatchObject({
       status: 422,
       details: { code: "graph_role_binding_conflict" },
@@ -1381,7 +1407,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       toStageId: cancelledStage!.id,
       label: "head_changed",
     });
-    const keyId = "botinsky.github-merge.v1";
+    const keyId = "example.github-merge.v1";
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");
     process.env.PAPERCLIP_EFFECT_EXECUTOR_KEYS_JSON = JSON.stringify({
       [keyId]: {
@@ -1476,7 +1502,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     const effects = pipelineGraphEffectService(db);
     const subject = {
       effectType: "github.merge",
-      targetRef: { repository: "quratus/meteorapp", headSha: "a".repeat(40) },
+      targetRef: { repository: "example/project", headSha: "a".repeat(40) },
       payloadHash: "b".repeat(64),
     };
     const subjectHash = pipelineGraphEffectSubjectHash(subject);
@@ -2153,7 +2179,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       kind: "review",
       position: 150,
       config: {
-        responsibilityOwner: "independent_reviewer",
+        responsibilityOwner: "reviewer",
         responsibilityInstruction: "Review the linked issue and commit an explicit graph outcome.",
         dispatchEnabled: true,
         targetAgentId,
@@ -2240,7 +2266,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       expect(wake).toMatchObject({
         targetNodeKey: "review",
         payload: {
-          responsibilityOwner: "independent_reviewer",
+          responsibilityOwner: "reviewer",
           responsibilityInstruction: "Review the linked issue and commit an explicit graph outcome.",
           dispatchEnabled: true,
           targetAgentId,
@@ -2251,7 +2277,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
             caseId: ingested.case.id,
             nodeKey: "review",
             nodeKind: "review",
-            responsibilityOwner: "independent_reviewer",
+            responsibilityOwner: "reviewer",
             targetAgentId,
             instruction: "Review the linked issue and commit an explicit graph outcome.",
             allowedOutcomes: ["approve"],
@@ -2362,7 +2388,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       kind: "review",
       position: 150,
       config: {
-        responsibilityOwner: "independent_reviewer",
+        responsibilityOwner: "reviewer",
         dispatchEnabled: true,
         targetAgentId,
         requireApproval: false,
@@ -2836,16 +2862,20 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       role: "engineer",
     }).returning();
     const roles = workflowRoleService(db);
-    await roles.ensureCompanyDefaults(fixture.companyId);
+    await roles.configureCatalog({
+      companyId: fixture.companyId,
+      roles: [{ key: "worker", label: "Worker" }],
+      separationConstraints: [],
+    });
     await roles.replaceAssignments({
       companyId: fixture.companyId,
-      roleKey: "implementer",
+      roleKey: "worker",
       assignments: [{ agentId: targetAgent!.id, priority: 0 }],
     });
     await db.update(pipelineStages)
       .set({
         config: {
-          responsibilityOwner: "implementer",
+          responsibilityOwner: "worker",
           responsibilityInstruction: "Implement the linked issue and submit a graph outcome.",
           acceptanceCriteria: ["The changed behavior is verified"],
           dispatchEnabled: true,
@@ -2896,7 +2926,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
           id: `${started.run.id}:1:work`,
           runRevision: 1,
           nodeKey: "work",
-          responsibilityOwner: "implementer",
+          responsibilityOwner: "worker",
           targetAgentId: null,
           acceptanceCriteria: ["The changed behavior is verified"],
           allowedOutcomes: ["complete"],
@@ -2915,12 +2945,12 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     expect(wakeup.mock.calls[0]![0]).toBe(targetAgent!.id);
     expect(wakeup.mock.calls[0]![1]).toMatchObject({
       contextSnapshot: {
-        responsibilityOwner: "implementer",
+        responsibilityOwner: "worker",
         graphAssignment: {
           runId: started.run.id,
           runRevision: 1,
           nodeKey: "work",
-          responsibilityOwner: "implementer",
+          responsibilityOwner: "worker",
           targetAgentId: targetAgent!.id,
         },
       },
@@ -2931,18 +2961,22 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       companyId: fixture.companyId,
       runRevision: 1,
       nodeKey: "work",
-      roleKey: "implementer",
+      roleKey: "worker",
       agentId: targetAgent!.id,
     });
   });
 
   it("fails role dispatch closed when no eligible role holder exists", async () => {
     const fixture = await seedLinearPipeline();
-    await workflowRoleService(db).ensureCompanyDefaults(fixture.companyId);
+    await workflowRoleService(db).configureCatalog({
+      companyId: fixture.companyId,
+      roles: [{ key: "worker", label: "Worker" }],
+      separationConstraints: [],
+    });
     await db.update(pipelineStages)
       .set({
         config: {
-          responsibilityOwner: "implementer",
+          responsibilityOwner: "worker",
           dispatchEnabled: true,
         },
       })
@@ -2986,7 +3020,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       .where(eq(pipelineGraphWakeOutbox.runId, started.run.id));
     expect(wake).toMatchObject({
       status: "pending",
-      lastError: "No eligible agent can satisfy workflow role 'implementer'",
+      lastError: "No eligible agent can satisfy workflow role 'worker'",
       dispatchReceipt: null,
     });
     expect(await db.select().from(pipelineGraphRoleBindings)

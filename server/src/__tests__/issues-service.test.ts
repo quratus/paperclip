@@ -70,7 +70,7 @@ describe("issue list limit helpers", () => {
 });
 
 describe("buildIssueTransitionProvenance", () => {
-  it("records an unrestricted founder terminal override with request evidence", () => {
+  it("records an unrestricted operator terminal override with request evidence", () => {
     const transition = buildIssueTransitionProvenance({
       fromStatus: "in_progress",
       toStatus: "cancelled",
@@ -81,7 +81,7 @@ describe("buildIssueTransitionProvenance", () => {
     expect(transition).toMatchObject({
       fromStatus: "in_progress",
       toStatus: "cancelled",
-      reason: "founder_override",
+      reason: "operator_override",
       actor: { type: "user", id: "local-board" },
       evidenceRef: { type: "request" },
       block: null,
@@ -102,7 +102,7 @@ describe("buildIssueTransitionProvenance", () => {
       kind: "wait_internal",
       clearingCondition: `Resolve blocking issue: ${blockerId}.`,
     });
-    expect(JSON.stringify(transition)).not.toContain("julius");
+    expect(JSON.stringify(transition)).not.toContain("named_person");
   });
 });
 

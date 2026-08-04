@@ -17,6 +17,8 @@ import {
   principalPermissionGrants,
   routines,
   routineTriggers,
+  workflowRoles,
+  workflowRoleSeparationConstraints,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -85,6 +87,10 @@ describeEmbeddedPostgres("companyService", () => {
     const created = await companyService(db).create({
       name: "Fresh Company",
     });
+
+    expect(await db.select().from(workflowRoles).where(eq(workflowRoles.companyId, created.id))).toEqual([]);
+    expect(await db.select().from(workflowRoleSeparationConstraints)
+      .where(eq(workflowRoleSeparationConstraints.companyId, created.id))).toEqual([]);
 
     const agentRows = await db.select().from(agents).where(eq(agents.companyId, created.id));
     const reflectionRows = agentRows.filter((row) => readBuiltInAgentMarker(row.metadata)?.key === "reflection-coach");

@@ -886,7 +886,7 @@ export function issueTreeControlService(db: Db) {
             'agentId', ${hold.createdByAgentId},
             'runId', ${hold.createdByRunId}
           ),
-          'reason', ${hold.createdByActorType === "user" ? "founder_override" : "automation"},
+          'reason', ${hold.createdByActorType === "user" ? "operator_override" : "automation"},
           'evidenceRef', jsonb_build_object('type', 'request', 'id', ${holdId}),
           'block', null,
           'occurredAt', ${now.toISOString()}
@@ -995,7 +995,7 @@ export function issueTreeControlService(db: Db) {
                 'agentId', ${input.actor.agentId ?? null},
                 'runId', ${input.actor.runId ?? null}
               ),
-              'reason', ${input.actor.actorType === "user" ? "founder_override" : "automation"},
+              'reason', ${input.actor.actorType === "user" ? "operator_override" : "automation"},
               'evidenceRef', jsonb_build_object('type', 'request', 'id', ${restoreHoldId}),
               'block', null,
               'occurredAt', ${now.toISOString()}

@@ -188,11 +188,11 @@ export function buildIssueTransitionProvenance(input: {
   const id = randomUUID();
   const actorType = input.actorType ?? (input.actorAgentId ? "agent" : "system");
   const explicitReason = input.transition?.reason;
-  const reason = explicitReason === "founder_override" && actorType !== "user"
+  const reason = explicitReason === "operator_override" && actorType !== "user"
     ? "manual_update"
     : explicitReason ?? (
       actorType === "user" && (input.toStatus === "done" || input.toStatus === "cancelled")
-        ? "founder_override"
+        ? "operator_override"
         : input.actorRunId
           ? "agent_bounce"
           : "automation"

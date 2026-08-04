@@ -68,33 +68,10 @@ CREATE INDEX "pipeline_graph_role_bindings_role_idx"
   ON "pipeline_graph_role_bindings" USING btree ("company_id", "run_id", "role_key");
 --> statement-breakpoint
 INSERT INTO "workflow_roles" ("company_id", "key", "label")
-SELECT c."id", role."key", role."label"
-FROM "companies" c
-CROSS JOIN (VALUES
-  ('conversation', 'Conversation owner'),
-  ('refiner', 'Request refiner'),
-  ('implementer', 'Implementer'),
-  ('independent_reviewer', 'Independent reviewer'),
-  ('delivery_owner', 'Delivery owner'),
-  ('capacity_recovery_owner', 'Capacity recovery owner'),
-  ('designer', 'Designer')
-) AS role("key", "label")
-ON CONFLICT DO NOTHING;
---> statement-breakpoint
-INSERT INTO "workflow_roles" ("company_id", "key", "label")
 SELECT DISTINCT v."company_id", node->'config'->>'responsibilityOwner', initcap(replace(node->'config'->>'responsibilityOwner', '_', ' '))
 FROM "pipeline_graph_versions" v
 CROSS JOIN LATERAL jsonb_array_elements(v."definition"->'nodes') AS node
 WHERE node->'config'->>'responsibilityOwner' ~ '^[a-z][a-z0-9_]{0,63}$'
-ON CONFLICT DO NOTHING;
---> statement-breakpoint
-INSERT INTO "workflow_role_separation_constraints" ("company_id", "first_role_key", "second_role_key")
-SELECT c."id", pair."first_role_key", pair."second_role_key"
-FROM "companies" c
-CROSS JOIN (VALUES
-  ('delivery_owner', 'independent_reviewer'),
-  ('implementer', 'independent_reviewer')
-) AS pair("first_role_key", "second_role_key")
 ON CONFLICT DO NOTHING;
 --> statement-breakpoint
 INSERT INTO "agent_workflow_role_assignments" ("company_id", "role_key", "agent_id")
