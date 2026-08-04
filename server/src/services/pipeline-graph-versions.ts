@@ -89,16 +89,21 @@ async function assertDefinitionTargets(
       ? node.config.requiredEffectType.trim()
       : "";
     if (!effectType) continue;
+    const hasRoleOwner = typeof node.config?.responsibilityOwner === "string"
+      && node.config.responsibilityOwner.trim().length > 0;
+    const executorIdMatchesBoundary = hasRoleOwner
+      ? node.config?.effectExecutorId === "$roleBinding"
+      : node.config?.effectExecutorId === node.config?.targetAgentId;
     if (
       actor.type !== "user"
-      || effectType !== "github.merge"
-      || node.config?.requiredAuthorityClass !== "merge.exact_sha"
+      || typeof node.config?.requiredAuthorityClass !== "string"
+      || !node.config.requiredAuthorityClass.trim()
       || node.config?.effectExecutorType !== "agent"
-      || node.config?.effectExecutorId !== node.config?.targetAgentId
-      || node.config?.effectExecutorKeyId !== "botinsky.github-merge.v1"
+      || !executorIdMatchesBoundary
+      || typeof node.config?.effectExecutorKeyId !== "string"
+      || !node.config.effectExecutorKeyId.trim()
       || !Array.isArray(node.config?.requiredEffectOutcomes)
-      || node.config.requiredEffectOutcomes.length !== 1
-      || node.config.requiredEffectOutcomes[0] !== "merged"
+      || node.config.requiredEffectOutcomes.length === 0
     ) {
       throw unprocessable("Pipeline graph effect policy is not kernel-authorized", {
         code: "pipeline_graph_effect_policy_invalid",
@@ -108,6 +113,9 @@ async function assertDefinitionTargets(
     }
   }
   const targetAgentIds = [...new Set(definition.nodes.flatMap((node) => {
+    if (typeof node.config?.responsibilityOwner === "string" && node.config.responsibilityOwner.trim()) {
+      return [];
+    }
     const targetAgentId = node.config?.targetAgentId;
     if (targetAgentId === undefined) return [];
     if (

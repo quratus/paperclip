@@ -10,6 +10,7 @@ import {
   pipelineGraphWakeOutbox,
 } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { workflowRoleService } from "./workflow-roles.js";
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -20,6 +21,7 @@ function stableStringify(value: unknown): string {
 }
 
 export function pipelineGraphOutboxService(db: Db) {
+  const roles = workflowRoleService(db);
   return {
     async claim(input: {
       companyId: string;
@@ -186,13 +188,40 @@ export function pipelineGraphOutboxService(db: Db) {
           });
           continue;
         }
-        const targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId : null;
+        const roleKey = typeof payload.responsibilityOwner === "string"
+          && payload.responsibilityOwner.trim()
+          ? payload.responsibilityOwner.trim()
+          : null;
+        let targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId : null;
+        if (payload.dispatchEnabled === true && payload.roleResolutionEnabled === true && roleKey) {
+          try {
+            const binding = await roles.resolveAndBind({
+              companyId: input.companyId,
+              runId: row.runId,
+              runRevision: expectedRevision,
+              nodeKey: row.targetNodeKey,
+              roleKey,
+            });
+            targetAgentId = binding.agentId;
+          } catch (error) {
+            await this.release({
+              companyId: input.companyId,
+              outboxId: row.id,
+              claimToken: row.claimToken!,
+              error: error instanceof Error ? error.message : "Workflow role resolution failed",
+              retryAt: new Date((input.now ?? new Date()).getTime() + retryDelayMs),
+              now: input.now,
+            });
+            retried += 1;
+            continue;
+          }
+        }
         if (payload.dispatchEnabled !== true || !targetAgentId) {
           await this.release({
             companyId: input.companyId,
             outboxId: row.id,
             claimToken: row.claimToken!,
-            error: "Graph wake dispatch requires dispatchEnabled=true and payload.targetAgentId",
+            error: "Graph wake dispatch requires dispatchEnabled=true and a resolvable responsibilityOwner",
             terminal: true,
             now: input.now,
           });
