@@ -61,6 +61,16 @@ pnpm dev
 
 ## 5. Core Engineering Rules
 
+### Public-kernel boundary
+
+This repository (`quratus/paperclip`) is **PUBLIC**. Before editing or publishing, verify repository visibility explicitly; do not infer privacy from fork ownership.
+
+- Changes here must be irreducible, tenant-neutral Paperclip mechanisms. Prefer generic storage, fencing, idempotency, transport, audit, and tenant-supplied configuration contracts.
+- Tenant role catalogs/defaults, agent selectors or precedence, company initialization policy, authored graphs, routing/loop/model/KPI/rollout rules, product instructions, customer prompts, and quality rubrics belong in the tenant's private repository.
+- Public migrations may create generic schema or backfill already-persisted tenant data; they must not seed tenant names, roles, constraints, or operating defaults.
+- Before every public branch/PR push, compare the complete diff with the intended fork base and run a leakage review for product/company names, prompts, defaults, repository references, and policy constants. If the mechanism cannot be explained without tenant-specific values, move it private.
+- A green test suite does not authorize merge while boundary leakage remains unresolved.
+
 1. Keep changes company-scoped.
 Every domain entity should be scoped to a company and company boundaries must be enforced in routes/services.
 
