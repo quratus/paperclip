@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { PipelineGraphVersionActor } from "./pipeline-graph-versions.js";
+import { ACTIVE_HEARTBEAT_RUN_STATUSES } from "./pipeline-graph-runs.js";
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -125,6 +126,100 @@ export function pipelineGraphExecutorAttestationMessage(
   attestation: Omit<ExecutorAttestation, "signature">,
 ) {
   return stableStringify(attestation);
+}
+
+export type GraphEffectAttemptAssignmentAuthorizationDecision =
+  | { authorized: true }
+  | { authorized: false; code: string };
+
+/**
+ * `assignment_authorized`: narrow, fail-closed authority for the exact agent
+ * currently graph-pinned to a node to POST that node's one required effect
+ * attempt, derived only from durably persisted graph run / heartbeat state —
+ * never from caller-supplied `targetRef`, `authorityReceipt`, or other
+ * request-body fields. Used by the effect-attempts route to decide whether
+ * broad `pipelines:write` may be bypassed; it never itself records a
+ * mutation. `pipelineGraphEffectService(db).request()` re-derives and
+ * re-enforces the identical agent/targetAgentId/heartbeat binding
+ * transactionally (see its `effect_assignment_attempt_mismatch` check), so
+ * this predicate grants no authority beyond what `request()` already
+ * independently verifies — it only decides who may reach that gate without
+ * holding broad `pipelines:write`. Mirrors
+ * `resolveGraphTransitionAssignmentAuthorization` in pipeline-graph-runs.ts.
+ */
+export async function resolveGraphEffectAttemptAssignmentAuthorization(
+  db: Db,
+  input: {
+    companyId: string;
+    runId: string;
+    expectedRevision: number;
+    effectType: string;
+    actor: PipelineGraphVersionActor;
+  },
+): Promise<GraphEffectAttemptAssignmentAuthorizationDecision> {
+  if (input.actor.type !== "agent") {
+    return { authorized: false, code: "graph_assignment_actor_not_agent" };
+  }
+  const row = await db
+    .select({ run: pipelineGraphRuns, graphVersion: pipelineGraphVersions })
+    .from(pipelineGraphRuns)
+    .innerJoin(
+      pipelineGraphVersions,
+      and(
+        eq(pipelineGraphVersions.companyId, pipelineGraphRuns.companyId),
+        eq(pipelineGraphVersions.pipelineId, pipelineGraphRuns.pipelineId),
+        eq(pipelineGraphVersions.id, pipelineGraphRuns.graphVersionId),
+      ),
+    )
+    .where(and(
+      eq(pipelineGraphRuns.companyId, input.companyId),
+      eq(pipelineGraphRuns.id, input.runId),
+    ))
+    .then((rows) => rows[0] ?? null);
+  if (!row) return { authorized: false, code: "graph_run_not_found" };
+  const { run, graphVersion } = row;
+  if (run.status !== "running") return { authorized: false, code: "graph_run_not_running" };
+  if (run.revision !== input.expectedRevision) {
+    return { authorized: false, code: "graph_run_revision_conflict" };
+  }
+  const currentNode = graphVersion.definition.nodes.find((node) => node.key === run.currentNodeKey);
+  if (!currentNode) return { authorized: false, code: "graph_run_node_missing" };
+  const requiredEffectType = typeof currentNode.config.requiredEffectType === "string"
+    ? currentNode.config.requiredEffectType.trim()
+    : "";
+  if (!requiredEffectType || requiredEffectType !== input.effectType) {
+    return { authorized: false, code: "graph_assignment_effect_not_required" };
+  }
+  const assignedAgentId = typeof currentNode.config.targetAgentId === "string"
+    ? currentNode.config.targetAgentId.trim()
+    : "";
+  if (!assignedAgentId || input.actor.agentId !== assignedAgentId) {
+    return { authorized: false, code: "graph_assignment_agent_mismatch" };
+  }
+  const attempt = await db
+    .select({
+      agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+    })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.id, input.actor.runId),
+    ))
+    .then((rows) => rows[0] ?? null);
+  const attemptContext = objectValue(attempt?.contextSnapshot);
+  if (
+    !attempt
+    || !ACTIVE_HEARTBEAT_RUN_STATUSES.has(attempt.status)
+    || attempt.agentId !== input.actor.agentId
+    || attemptContext.graphRunId !== run.id
+    || attemptContext.graphRunRevision !== input.expectedRevision
+    || attemptContext.targetNodeKey !== run.currentNodeKey
+  ) {
+    return { authorized: false, code: "graph_assignment_attempt_mismatch" };
+  }
+  return { authorized: true };
 }
 
 export function pipelineGraphEffectService(db: Db) {

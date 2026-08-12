@@ -251,7 +251,7 @@ function graphWakeRouting(input: {
 }
 
 /** Heartbeat run statuses that still represent a live, in-progress attempt. */
-const ACTIVE_HEARTBEAT_RUN_STATUSES = new Set(["queued", "running", "scheduled_retry"]);
+export const ACTIVE_HEARTBEAT_RUN_STATUSES = new Set(["queued", "running", "scheduled_retry"]);
 
 export type GraphAssignmentAuthorizationDecision =
   | { authorized: true }

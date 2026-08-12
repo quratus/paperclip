@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   createDb,
   heartbeatRunEvents,
@@ -43,6 +44,7 @@ import {
   pipelineGraphExecutorAttestationMessage,
   pipelineGraphEffectSubjectHash,
   pipelineGraphEffectTargetRefHash,
+  resolveGraphEffectAttemptAssignmentAuthorization,
 } from "../services/pipeline-graph-effects.js";
 import { pipelineService } from "../services/pipelines.js";
 import {
@@ -67,6 +69,7 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(pipelineGraphWakeOutbox);
+    await db.delete(approvals);
     await db.delete(pipelineGraphEffectAttempts);
     await db.delete(pipelineGraphRunEvents);
     await db.delete(pipelineGraphRuns);
@@ -2352,6 +2355,108 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
     return app;
   }
 
+  async function seedEffectRouteAuthorityFixture() {
+    const fixture = await seedLinearPipeline();
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId: fixture.companyId,
+      name: "Route-bound effect executor",
+      role: "engineer",
+    });
+    // Kernel-authorized effect policy shape enforced by assertDefinitionTargets
+    // (pipeline-graph-versions.ts) — the only combination createDraft allows
+    // for a `github.merge` effect boundary.
+    const keyId = "botinsky.github-merge.v1";
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    process.env.PAPERCLIP_EFFECT_EXECUTOR_KEYS_JSON = JSON.stringify({
+      [keyId]: {
+        publicKey: publicKey.export({ type: "spki", format: "pem" }).toString(),
+        controllerBuildIds: [`git:${"e".repeat(40)}`],
+      },
+    });
+    await db
+      .update(pipelineStages)
+      .set({
+        config: {
+          targetAgentId,
+          requiredEffectType: "github.merge",
+          requiredEffectOutcomes: ["merged"],
+          requiredAuthorityClass: "merge.exact_sha",
+          effectExecutorType: "agent",
+          effectExecutorId: targetAgentId,
+          effectExecutorKeyId: keyId,
+        },
+      })
+      .where(eq(pipelineStages.id, fixture.stages.find((stage) => stage.key === "work")!.id));
+    const versions = pipelineGraphVersionService(db);
+    const draft = await versions.createDraft({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      entryNodeKey: "work",
+      actor: { type: "user", userId: "board-user" },
+    });
+    await versions.activate({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      versionId: draft.version.id,
+      expectedActiveVersionId: null,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const ingested = await pipelineService(db).ingestCase({
+      companyId: fixture.companyId,
+      pipelineId: fixture.pipeline.id,
+      caseKey: `effect-route-authority-${randomUUID().slice(0, 8)}`,
+      title: "Effect route authority",
+      actor: { type: "user", userId: "board-user" },
+    });
+    const runs = pipelineGraphRunService(db);
+    const started = await runs.start({
+      companyId: fixture.companyId,
+      caseId: ingested.case.id,
+      idempotencyKey: `effect-route-authority:start:${ingested.case.id}`,
+      actor: { type: "user", userId: "board-user" },
+    });
+    const [boundAttempt] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 1,
+        targetNodeKey: "work",
+      },
+    }).returning();
+    const attest = (action: "request", subjectHash: string, actionHash: string) => {
+      const body = { keyId, controllerBuildId: `git:${"e".repeat(40)}`, subjectHash, action, actionHash };
+      return {
+        ...body,
+        signature: sign(
+          null,
+          Buffer.from(pipelineGraphExecutorAttestationMessage(body)),
+          privateKey,
+        ).toString("base64"),
+      };
+    };
+    // `merge.exact_sha` authority requires a decided approval receipt — the
+    // exact-SHA merge decision the fenced executor is unblocking (SQN-5262),
+    // not the `actor`-kind shortcut (which only applies to user actors).
+    const grantApproval = async (subjectHash: string) => {
+      const [approval] = await db.insert(approvals).values({
+        companyId: fixture.companyId,
+        type: "graph_effect",
+        status: "approved",
+        payload: { subjectHash, authorityClass: "merge.exact_sha" },
+        decidedByUserId: "board-user",
+        decidedAt: new Date(0),
+      }).returning();
+      return approval!.id;
+    };
+    return { fixture, targetAgentId, started, boundAttempt: boundAttempt!, attest, grantApproval };
+  }
+
   it("lets a graph-assigned agent commit its exact transition through the route without pipelines:write, while every other binding fails closed", async () => {
     const { fixture, targetAgentId, legacyAgent, started, graphAssignment } =
       await seedRouteAuthorityFixture();
@@ -2727,6 +2832,257 @@ describeEmbeddedPostgres("pipeline graph versions", () => {
       ...baseInput,
       checkpoint: { reviewed: false },
     })).resolves.toMatchObject({ authorized: false, code: "graph_event_idempotency_conflict" });
+  });
+
+  it("lets a graph-assigned agent request its exact required effect through the route without pipelines:write, while every other binding fails closed", async () => {
+    const { fixture, targetAgentId, started, boundAttempt, attest, grantApproval } =
+      await seedEffectRouteAuthorityFixture();
+    const boundApp = buildPipelineRouteApp(db, {
+      type: "agent",
+      agentId: targetAgentId,
+      companyId: fixture.companyId,
+      runId: boundAttempt.id,
+    });
+    const subject = {
+      effectType: "github.merge",
+      targetRef: { repository: "quratus/meteorapp", headSha: "a".repeat(40) },
+      payloadHash: "b".repeat(64),
+    };
+    const subjectHash = pipelineGraphEffectSubjectHash(subject);
+    const approvalId = await grantApproval(subjectHash);
+
+    // A request for an effect type the current node does not require never
+    // gains bypass authority — falls back to the pre-existing broad
+    // pipelines:write gate and is denied exactly as before.
+    const otherSubject = { ...subject, effectType: "some.other.effect" };
+    const otherSubjectHash = pipelineGraphEffectSubjectHash(otherSubject);
+    const wrongEffect = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: 1,
+        effectType: otherSubject.effectType,
+        targetRef: otherSubject.targetRef,
+        payloadHash: otherSubject.payloadHash,
+        authorityReceipt: { kind: "actor", subjectHash: otherSubjectHash, decidedByUserId: "n/a" },
+        executorAttestation: attest(
+          "request",
+          otherSubjectHash,
+          pipelineGraphEffectActionHash({ subjectHash: otherSubjectHash }),
+        ),
+        idempotencyKey: "route-authority-effect:wrong-type",
+        retryPolicy: { maxAttempts: 1 },
+      });
+    expect(wrongEffect.status).toBe(403);
+    expect(wrongEffect.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // A stale/mismatched expectedRevision never gains bypass authority
+    // either, for the same reason.
+    const staleRevision = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: 99,
+        effectType: subject.effectType,
+        targetRef: subject.targetRef,
+        payloadHash: subject.payloadHash,
+        authorityReceipt: { kind: "actor", subjectHash, decidedByUserId: "n/a" },
+        executorAttestation: attest("request", subjectHash, pipelineGraphEffectActionHash({ subjectHash })),
+        idempotencyKey: "route-authority-effect:stale-revision",
+        retryPolicy: { maxAttempts: 1 },
+      });
+    expect(staleRevision.status).toBe(403);
+    expect(staleRevision.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // Exact current agent + exact bound heartbeat + the node's exact
+    // required effect succeeds, despite this agent never holding a
+    // pipelines:write grant. This is the fenced merge executor's actual
+    // path (SQN-5262).
+    const created = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: 1,
+        effectType: subject.effectType,
+        targetRef: subject.targetRef,
+        payloadHash: subject.payloadHash,
+        authorityReceipt: { kind: "approval", subjectHash, approvalId },
+        executorAttestation: attest("request", subjectHash, pipelineGraphEffectActionHash({ subjectHash })),
+        idempotencyKey: "route-authority-effect:request",
+        retryPolicy: { maxAttempts: 2 },
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    expect(created.headers.location).toBe(`/api/effect-attempts/${created.body.effectAttempt.id}`);
+    expect(created.body.effectAttempt).toMatchObject({
+      runId: started.run.id,
+      effectType: "github.merge",
+      requestedByType: "agent",
+      requestedById: targetAgentId,
+    });
+
+    // Duplicate/replayed delivery of the exact same request commits at most
+    // once and returns the prior attempt.
+    const replay = await request(boundApp)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: 1,
+        effectType: subject.effectType,
+        targetRef: subject.targetRef,
+        payloadHash: subject.payloadHash,
+        authorityReceipt: { kind: "approval", subjectHash, approvalId },
+        executorAttestation: attest("request", subjectHash, pipelineGraphEffectActionHash({ subjectHash })),
+        idempotencyKey: "route-authority-effect:request",
+        retryPolicy: { maxAttempts: 2 },
+      });
+    expect(replay.status).toBe(200);
+    expect(replay.body.effectAttempt.id).toBe(created.body.effectAttempt.id);
+
+    // Some other agent, not the graph-pinned target, never gains bypass
+    // authority and is denied exactly as before.
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Unassigned agent",
+      role: "engineer",
+    }).returning();
+    const [otherHeartbeat] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: otherAgent!.id,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 1,
+        targetNodeKey: "work",
+      },
+    }).returning();
+    const otherApp = buildPipelineRouteApp(db, {
+      type: "agent",
+      agentId: otherAgent!.id,
+      companyId: fixture.companyId,
+      runId: otherHeartbeat!.id,
+    });
+    const otherAgentAttempt = await request(otherApp)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: 1,
+        effectType: subject.effectType,
+        targetRef: subject.targetRef,
+        payloadHash: subject.payloadHash,
+        authorityReceipt: { kind: "actor", subjectHash, decidedByUserId: "n/a" },
+        executorAttestation: attest("request", subjectHash, pipelineGraphEffectActionHash({ subjectHash })),
+        idempotencyKey: "route-authority-effect:other-agent",
+        retryPolicy: { maxAttempts: 1 },
+      });
+    expect(otherAgentAttempt.status).toBe(403);
+    expect(otherAgentAttempt.body.details).toMatchObject({ code: "pipeline_write_forbidden" });
+
+    // Human/operator behavior is completely unchanged: the board actor
+    // still goes through (and here satisfies) the pre-existing
+    // pipelines:write gate. A fresh idempotencyKey but the same effect
+    // subject binds to the same already-recorded attempt (same graph
+    // boundary), rather than committing a second one.
+    const boardApp = buildPipelineRouteApp(db, { type: "board", userId: "board-user" });
+    const humanRequest = await request(boardApp)
+      .post(`/api/graph-runs/${started.run.id}/effect-attempts`)
+      .send({
+        schemaVersion: 1,
+        expectedRevision: 1,
+        effectType: subject.effectType,
+        targetRef: subject.targetRef,
+        payloadHash: subject.payloadHash,
+        authorityReceipt: { kind: "approval", subjectHash, approvalId },
+        executorAttestation: attest("request", subjectHash, pipelineGraphEffectActionHash({ subjectHash })),
+        idempotencyKey: "route-authority-effect:human-request",
+        retryPolicy: { maxAttempts: 2 },
+      });
+    expect(humanRequest.status).toBe(200);
+    expect(humanRequest.body.effectAttempt.id).toBe(created.body.effectAttempt.id);
+  });
+
+  it("derives effect assignment_authorized only from durable state and never from the request body", async () => {
+    const { fixture, targetAgentId, started, boundAttempt } = await seedEffectRouteAuthorityFixture();
+    const baseInput = {
+      companyId: fixture.companyId,
+      runId: started.run.id,
+      expectedRevision: 1,
+      effectType: "github.merge",
+      actor: { type: "agent" as const, agentId: targetAgentId, runId: boundAttempt.id },
+    };
+
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, baseInput))
+      .resolves.toEqual({ authorized: true });
+
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      actor: { type: "user", userId: "board-user" },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_actor_not_agent" });
+
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      runId: randomUUID(),
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_not_found" });
+
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      companyId: randomUUID(),
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_not_found" });
+
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      expectedRevision: 99,
+    })).resolves.toMatchObject({ authorized: false, code: "graph_run_revision_conflict" });
+
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      effectType: "some.other.effect",
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_effect_not_required" });
+
+    const [otherAgent] = await db.insert(agents).values({
+      companyId: fixture.companyId,
+      name: "Other effect predicate agent",
+      role: "engineer",
+    }).returning();
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      actor: { type: "agent", agentId: otherAgent!.id, runId: boundAttempt.id },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_agent_mismatch" });
+
+    const [staleHeartbeat] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "running",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 99,
+        targetNodeKey: "work",
+      },
+    }).returning();
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      actor: { type: "agent", agentId: targetAgentId, runId: staleHeartbeat!.id },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_attempt_mismatch" });
+
+    const [cancelledHeartbeat] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: targetAgentId,
+      invocationSource: "automation",
+      status: "cancelled",
+      contextSnapshot: {
+        pipelineGraphWake: true,
+        graphRunId: started.run.id,
+        graphRunRevision: 1,
+        targetNodeKey: "work",
+      },
+    }).returning();
+    await expect(resolveGraphEffectAttemptAssignmentAuthorization(db, {
+      ...baseInput,
+      actor: { type: "agent", agentId: targetAgentId, runId: cancelledHeartbeat!.id },
+    })).resolves.toMatchObject({ authorized: false, code: "graph_assignment_attempt_mismatch" });
   });
 
   it("atomically wakes a configured entry-node owner when a graph run starts", async () => {

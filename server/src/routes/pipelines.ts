@@ -96,7 +96,10 @@ import {
   resolveGraphTransitionAssignmentAuthorization,
 } from "../services/pipeline-graph-runs.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { pipelineGraphEffectService } from "../services/pipeline-graph-effects.js";
+import {
+  pipelineGraphEffectService,
+  resolveGraphEffectAttemptAssignmentAuthorization,
+} from "../services/pipeline-graph-effects.js";
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
 const STAGE_INSTRUCTIONS_PREFIX = "stage-instructions:";
@@ -1970,13 +1973,29 @@ export function pipelineRoutes(db: Db, options: PipelineRouteOptions = {}) {
       const runId = z.string().uuid().safeParse(req.params.runId);
       if (!runId.success) throw badRequest("Invalid graph run id", { code: "validation" });
       const scope = await graphRunAccess(req, runId.data);
-      await assertPipelineWriteAccess(req, {
-        access,
-        companyId: scope.companyId,
-        pipelineId: scope.pipelineId,
-      });
       const actor = actorForMutation(req);
       if (actor.type === "system") throw forbidden("A user or agent actor is required");
+      // A graph-assigned agent may request its one required effect for the
+      // exact current graph assignment on the strength of that assignment
+      // alone. This narrow predicate never trusts the request body as
+      // authority — it is re-derived from durable state and is re-verified
+      // transactionally by graphEffects.request() itself. Anyone who does
+      // not satisfy it falls back to the pre-existing broad pipelines:write
+      // gate, unchanged.
+      const assignmentAuthorization = await resolveGraphEffectAttemptAssignmentAuthorization(db, {
+        companyId: scope.companyId,
+        runId: runId.data,
+        expectedRevision: req.body.expectedRevision,
+        effectType: req.body.effectType,
+        actor,
+      });
+      if (!assignmentAuthorization.authorized) {
+        await assertPipelineWriteAccess(req, {
+          access,
+          companyId: scope.companyId,
+          pipelineId: scope.pipelineId,
+        });
+      }
       const result = await graphEffects.request({
         companyId: scope.companyId,
         runId: runId.data,
