@@ -13,6 +13,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -131,11 +132,14 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     sourceStatus?: "in_progress" | "done" | "cancelled";
     sourceOriginKind?: string;
     sameRunTerminalEvidence?: "activity" | "comment";
+    projectStatus?: "backlog" | "in_progress" | "done" | "cancelled";
+    projectArchivedAt?: Date | null;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
     const issueId = randomUUID();
+    const projectId = randomUUID();
     const runId = randomUUID();
     const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const startedAt = new Date(opts.now.getTime() - opts.ageMs);
@@ -175,9 +179,17 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         permissions: {},
       },
     ]);
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Active watchdog project",
+      status: opts.projectStatus ?? "in_progress",
+      archivedAt: opts.projectArchivedAt ?? null,
+    });
     await db.insert(issues).values({
       id: issueId,
       companyId,
+      projectId,
       title: "Long running implementation",
       status: sourceStatus,
       priority: "medium",
@@ -253,7 +265,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         updatedAt: terminalEvidenceAt,
       });
     }
-    return { companyId, managerId, coderId, issueId, runId, issuePrefix };
+    return { companyId, managerId, coderId, issueId, projectId, runId, issuePrefix };
   }
 
   it("creates one medium-priority evaluation issue for a suspicious silent run", async () => {
@@ -287,6 +299,212 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations[0]?.description).toContain("Decision Checklist");
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
   });
+
+  it("ignores silent runs whose source issues are under completed or archived projects", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const completed = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      projectStatus: "done",
+    });
+    const archived = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      projectArchivedAt: new Date("2026-04-22T19:30:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const completedResult = await heartbeat.scanSilentActiveRuns({ now, companyId: completed.companyId });
+    const archivedResult = await heartbeat.scanSilentActiveRuns({ now, companyId: archived.companyId });
+
+    expect(completedResult.scanned).toBe(0);
+    expect(completedResult.created).toBe(0);
+    expect(archivedResult.scanned).toBe(0);
+    expect(archivedResult.created).toBe(0);
+
+    const evaluations = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originKind, "stale_active_run_evaluation"));
+    expect(evaluations).toHaveLength(0);
+  });
+
+  it("does not create evaluations for runs without a source issue", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const companyId = randomUUID();
+    const coderId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const startedAt = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS - 60_000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "No Source Co",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: coderId,
+      companyId,
+      name: "Coder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      processStartedAt: startedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.scanned).toBe(0);
+    expect(result.created).toBe(0);
+  });
+
+  it("still scans an active-project run when older inactive-project runs exceed the scan limit", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const staleAgeMs = ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Limit Scope Co",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "running",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    for (let index = 0; index < 100; index += 1) {
+      const issueId = randomUUID();
+      const projectId = randomUUID();
+      const runId = randomUUID();
+      const startedAt = new Date(now.getTime() - staleAgeMs - 100_000 - index);
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: `Completed project ${index}`,
+        status: "done",
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        projectId,
+        title: `Completed project run ${index}`,
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: index + 1,
+        identifier: `${issuePrefix}-${index + 1}`,
+        originKind: "manual",
+        updatedAt: startedAt,
+        createdAt: startedAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        processStartedAt: startedAt,
+        lastOutputAt: null,
+        lastOutputSeq: 0,
+        lastOutputStream: null,
+        contextSnapshot: { issueId },
+        logBytes: 0,
+      });
+    }
+    const activeIssueId = randomUUID();
+    const activeProjectId = randomUUID();
+    const activeRunId = randomUUID();
+    const activeStartedAt = new Date(now.getTime() - staleAgeMs);
+    await db.insert(projects).values({
+      id: activeProjectId,
+      companyId,
+      name: "Active project",
+      status: "in_progress",
+    });
+    await db.insert(issues).values({
+      id: activeIssueId,
+      companyId,
+      projectId: activeProjectId,
+      title: "Active project run",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 101,
+      identifier: `${issuePrefix}-101`,
+      originKind: "manual",
+      updatedAt: activeStartedAt,
+      createdAt: activeStartedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId: coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: activeStartedAt,
+      processStartedAt: activeStartedAt,
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      lastOutputStream: null,
+      contextSnapshot: { issueId: activeIssueId },
+      logBytes: 0,
+    });
+    await db.update(issues).set({ executionRunId: activeRunId }).where(eq(issues.id, activeIssueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.scanned).toBe(1);
+    expect(result.created).toBe(1);
+  }, 30_000);
 
   it("redacts sensitive values from actual run-log evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
