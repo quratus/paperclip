@@ -26,6 +26,7 @@ import {
   issues,
   pipelineCaseIssueLinks,
   pipelineGraphRuns,
+  projects,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -2634,7 +2635,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string; issueCreatedAtGte?: Date | null }) {
     const now = opts?.now ?? new Date();
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
-    let candidates = await db
+    const sourceIssueIdFromContext = sql<string>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId')`;
+    const activeProjectSourceIssueExists = sql`exists (
+      select 1
+      from ${issues}
+      inner join ${projects} on ${projects.id} = ${issues.projectId}
+      where ${issues.companyId} = ${heartbeatRuns.companyId}
+        and ${issues.id}::text = ${sourceIssueIdFromContext}
+        and ${projects.status} = 'in_progress'
+        and ${projects.archivedAt} is null
+        ${opts?.issueCreatedAtGte ? sql`and ${issues.createdAt} >= ${opts.issueCreatedAtGte}` : sql``}
+    )`;
+    const candidates = await db
       .select()
       .from(heartbeatRuns)
       .where(
@@ -2642,31 +2654,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
           eq(heartbeatRuns.status, "running"),
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
+          activeProjectSourceIssueExists,
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt))
       .limit(100);
-
-    if (opts?.issueCreatedAtGte) {
-      const issueIds = [...new Set(candidates.flatMap((run) => {
-        const context = parseObject(run.contextSnapshot);
-        const issueId = context.issueId ?? context.taskId;
-        return typeof issueId === "string" && issueId.length > 0 ? [issueId] : [];
-      }))];
-      const eligibleIssueIds = new Set(
-        issueIds.length > 0
-          ? (await db.select({ id: issues.id }).from(issues).where(and(
-              inArray(issues.id, issueIds),
-              gte(issues.createdAt, opts.issueCreatedAtGte),
-            ))).map((issue) => issue.id)
-          : [],
-      );
-      candidates = candidates.filter((run) => {
-        const context = parseObject(run.contextSnapshot);
-        const issueId = context.issueId ?? context.taskId;
-        return typeof issueId === "string" && eligibleIssueIds.has(issueId);
-      });
-    }
 
     const result = {
       scanned: candidates.length,
