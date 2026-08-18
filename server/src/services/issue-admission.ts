@@ -46,6 +46,16 @@ export function evaluateIssueAdmission(input: {
   const workClass = policy?.workClass ?? null;
   if (workClass === "docs_ops") return { kind: "allow" };
   if (input.source === "checkout" && input.issue.originKind === "routine_execution") return { kind: "allow" };
+  // External intake (Showroom, etc.) is refinement work: the assignee writes the
+  // Product Truth Contract. Demanding the contract to start that pickup parks the
+  // item on the board with no owner when the triage agent is the CEO.
+  if (
+    input.source === "checkout" &&
+    typeof input.issue.originKind === "string" &&
+    input.issue.originKind.startsWith("external:")
+  ) {
+    return { kind: "allow" };
+  }
 
   const hasContract = hasProductTruthContract(
     input.nextDescription === undefined

@@ -185,7 +185,7 @@ export function showroomRoutes(db: Db, storage: StorageService) {
     const issue = await issues.create(showroom.companyId!, {
       title: `Showroom feedback: ${cleanedText.replace(/\s+/g, " ").slice(0, 96)}`,
       description: body,
-      status: "todo",
+      status: "backlog",
       priority: "medium",
       projectId: payload.projectId,
       assigneeAgentId: payload.triageAgentId,
