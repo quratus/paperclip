@@ -44,6 +44,19 @@ describe("evaluateIssueAdmission", () => {
     });
   });
 
+  it("allows checkout of external intake so the triage owner can write the contract", () => {
+    expect(evaluateIssueAdmission({
+      issue: {
+        id: "issue-3",
+        description: "## Showroom feedback\nThe chat field is too small.",
+        executionPolicy: null,
+        originKind: "external:showroom:feedback",
+      },
+      source: "checkout",
+      actorType: "agent",
+    })).toEqual({ kind: "allow" });
+  });
+
   it("keeps the board override and docs-only exemption", () => {
     expect(evaluateIssueAdmission({
       issue: { id: "issue-1" },

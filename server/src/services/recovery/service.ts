@@ -1215,7 +1215,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         source: "assignment",
         actorType: "agent",
       });
-      if (disposition.kind !== "redirect") {
+      if (
+        disposition.kind !== "redirect" ||
+        (typeof issue.originKind === "string" && issue.originKind.startsWith("external:"))
+      ) {
         result.skipped += 1;
         continue;
       }

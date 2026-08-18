@@ -72,7 +72,7 @@ describe("showroom feedback routing", () => {
     expect(response.body).toMatchObject({ identifier: "OPS-13" });
     expect(mockIssues.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
       assigneeAgentId: "charles-1",
-      status: "todo",
+      status: "backlog",
       description: expect.stringContaining("- Suggested work item: 17ef2c4b-1ed2-4cf8-9f4d-d7bdb0d33b13"),
     }));
   });
