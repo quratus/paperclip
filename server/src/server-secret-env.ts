@@ -17,6 +17,7 @@ export const SERVER_ONLY_SECRET_ENV_KEYS = [
   "PAPERCLIP_AGENT_JWT_SECRET",
   "BETTER_AUTH_SECRET",
   "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "RESEND_API_KEY",
 ] as const;
 
 export type ServerOnlySecretEnvKey = (typeof SERVER_ONLY_SECRET_ENV_KEYS)[number];
