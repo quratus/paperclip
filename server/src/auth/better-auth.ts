@@ -13,6 +13,9 @@ import {
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 import { readServerOnlySecret } from "../server-secret-env.js";
+import { deliverResetPassword } from "./reset-password-delivery.js";
+
+export const RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS = 60 * 60;
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -116,6 +119,23 @@ function headersFromExpressRequest(req: Request): Headers {
   return headersFromNodeHeaders(req.headers);
 }
 
+export function parseExtraAuthTrustedOrigins(
+  raw = process.env.PAPERCLIP_AUTH_TRUSTED_ORIGINS,
+): string[] {
+  if (!raw) return [];
+  const origins: string[] = [];
+  for (const part of raw.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    try {
+      origins.push(new URL(trimmed).origin);
+    } catch {
+      // Ignore unparseable entries; Better Auth still validates redirectTo.
+    }
+  }
+  return origins;
+}
+
 export function deriveAuthTrustedOrigins(config: Config, opts?: { listenPort?: number }): string[] {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const trustedOrigins = new Set<string>();
@@ -141,8 +161,22 @@ export function deriveAuthTrustedOrigins(config: Config, opts?: { listenPort?: n
       }
     }
   }
+  for (const origin of parseExtraAuthTrustedOrigins()) {
+    trustedOrigins.add(origin);
+  }
 
   return Array.from(trustedOrigins);
+}
+
+export function buildBetterAuthEmailAndPasswordOptions(input: { disableSignUp: boolean }) {
+  return {
+    enabled: true as const,
+    requireEmailVerification: false as const,
+    disableSignUp: input.disableSignUp,
+    revokeSessionsOnPasswordReset: true as const,
+    resetPasswordTokenExpiresIn: RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS,
+    sendResetPassword: deliverResetPassword,
+  };
 }
 
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
@@ -177,11 +211,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
         verification: authVerifications,
       },
     }),
-    emailAndPassword: {
-      enabled: true,
-      requireEmailVerification: false,
+    emailAndPassword: buildBetterAuthEmailAndPasswordOptions({
       disableSignUp: config.authDisableSignUp,
-    },
+    }),
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,

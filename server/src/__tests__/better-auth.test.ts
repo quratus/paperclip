@@ -2,21 +2,28 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
 import {
+  RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS,
   buildBetterAuthAdvancedOptions,
+  buildBetterAuthEmailAndPasswordOptions,
   buildBetterAuthRateLimitOptions,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
+  parseExtraAuthTrustedOrigins,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
+import { deliverResetPassword } from "../auth/reset-password-delivery.js";
 
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
 const ORIGINAL_PUBLIC_URL = process.env.PAPERCLIP_PUBLIC_URL;
+const ORIGINAL_TRUSTED_ORIGINS = process.env.PAPERCLIP_AUTH_TRUSTED_ORIGINS;
 
 afterEach(() => {
   if (ORIGINAL_INSTANCE_ID === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
   else process.env.PAPERCLIP_INSTANCE_ID = ORIGINAL_INSTANCE_ID;
   if (ORIGINAL_PUBLIC_URL === undefined) delete process.env.PAPERCLIP_PUBLIC_URL;
   else process.env.PAPERCLIP_PUBLIC_URL = ORIGINAL_PUBLIC_URL;
+  if (ORIGINAL_TRUSTED_ORIGINS === undefined) delete process.env.PAPERCLIP_AUTH_TRUSTED_ORIGINS;
+  else process.env.PAPERCLIP_AUTH_TRUSTED_ORIGINS = ORIGINAL_TRUSTED_ORIGINS;
 });
 
 describe("Better Auth cookie scoping", () => {
@@ -211,5 +218,36 @@ describe("Better Auth cookie scoping", () => {
     ]));
     expect(trustedOrigins).not.toContain("https://board.example.test:3100");
     expect(trustedOrigins).not.toContain("http://board.example.test:3100");
+  });
+
+  it("adds extra trusted origins for Studio reset callbacks", () => {
+    process.env.PAPERCLIP_AUTH_TRUSTED_ORIGINS = "https://campaign-studio.sqncr.ai, http://127.0.0.1:5173";
+
+    expect(parseExtraAuthTrustedOrigins()).toEqual([
+      "https://campaign-studio.sqncr.ai",
+      "http://127.0.0.1:5173",
+    ]);
+
+    const trustedOrigins = deriveAuthTrustedOrigins({
+      deploymentMode: "authenticated",
+      authBaseUrlMode: "auto",
+      authPublicBaseUrl: undefined,
+      allowedHostnames: ["vps3"],
+      port: 3100,
+    } as Parameters<typeof deriveAuthTrustedOrigins>[0]);
+
+    expect(trustedOrigins).toEqual(expect.arrayContaining([
+      "https://campaign-studio.sqncr.ai",
+      "http://127.0.0.1:5173",
+    ]));
+  });
+
+  it("wires hosted sendResetPassword with one-hour expiry and session revoke", () => {
+    const options = buildBetterAuthEmailAndPasswordOptions({ disableSignUp: false });
+    expect(options.enabled).toBe(true);
+    expect(options.revokeSessionsOnPasswordReset).toBe(true);
+    expect(options.resetPasswordTokenExpiresIn).toBe(RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS);
+    expect(options.resetPasswordTokenExpiresIn).toBe(3600);
+    expect(options.sendResetPassword).toBe(deliverResetPassword);
   });
 });
